@@ -1,10 +1,11 @@
 #pragma once
 
 /// @file
-/// @brief C ABI shared by the plugin library and the worker that loads it.
+/// @brief Entry points shared by plugin libraries, in-process hosts, and workers.
 ///
-/// Export pluginkit_query_v1 using this header. The worker checks the descriptor size, ABI version, and exact
-/// contract identity before calling into the implementation.
+/// The loader resolves pluginkit_query_v1 and checks the descriptor size, ABI version, exact contract
+/// identity, and execution mode before activation. In-process loading also checks the C++ and HuxerUI
+/// application identities before using native interface pointers.
 
 #include <stdint.h>
 #if defined(__APPLE__)
@@ -22,11 +23,16 @@
 #error PluginKit ABI v1 requires Windows x64, Linux x86_64, or macOS arm64.
 #endif
 
-/// @brief Descriptor version expected by the worker.
+/// @brief Descriptor version expected by the host and worker loaders.
 #define HPK_ABI_VERSION 1u
 
 /// @brief Maximum size in bytes of an encoded request or response.
 #define HPK_MAX_PAYLOAD (8u * 1024u * 1024u)
+
+/// @brief Flag for native C++ calls in the host application.
+#define HPK_IN_PROCESS 1u
+/// @brief Flag for encoded calls in a separate worker process.
+#define HPK_WORKER_PROCESS 2u
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,7 +46,7 @@ enum hpk_status_v1 {
   HPK_INVALID_REQUEST = 1,
   /// Plugin code failed during a lifecycle callback, instance creation, or invocation.
   HPK_PLUGIN_FAILED = 2,
-  /// The encoded response exceeds the ABI limit.
+  /// The encoded request or response exceeds a size limit.
   HPK_PAYLOAD_TOO_LARGE = 3,
   /// A plugin request for a host service was denied.
   HPK_SERVICE_DENIED = 4,
@@ -50,10 +56,14 @@ enum hpk_status_v1 {
   HPK_REENTRANT_CALL = 6,
   /// The receiver no longer belongs to the current call.
   HPK_RECEIVER_CLOSED = 7,
-  /// The host and plugin callback contracts differ.
+  /// The host and plugin contracts differ.
   HPK_CONTRACT_MISMATCH = 8,
-  /// The worker is closing the plugin generation.
+  /// The plugin invocation or activation is closing.
   HPK_CLOSED = 9,
+  /// The current call cannot issue the requested host callback.
+  HPK_CALLBACK_UNAVAILABLE = 10,
+  /// The plugin has active work that prevents the requested operation.
+  HPK_BUSY = 11,
 };
 
 /// @brief Borrowed response bytes owned by the side delivering the completion.
@@ -65,6 +75,9 @@ typedef struct hpk_buffer_v1 {
 } hpk_buffer_v1;
 
 /// @brief Completion with a buffer borrowed for the duration of the callback.
+/// @param user Completion state supplied when starting the call.
+/// @param status Status in the domain of the initiating entry point.
+/// @param result Borrowed encoded result or diagnostic. The buffer can be empty.
 typedef void (HPK_CALL *hpk_complete_v1)(void* user, uint32_t status, hpk_buffer_v1 result);
 
 /// @brief Worker callbacks exposed to the plugin during an invocation.
@@ -76,11 +89,11 @@ typedef struct hpk_host_v1 {
   /// @param version Callback contract version.
   /// @param fingerprint Null-terminated callback contract fingerprint.
   /// @param operation Operation number in the callback contract.
-  /// @param data Borrowed encoded request.
+  /// @param data Encoded request bytes borrowed until this function returns.
   /// @param size Request length in bytes.
-  /// @param complete Receives the response or optional diagnostic. It runs on the transport thread.
+  /// @param complete Receives the response or optional diagnostic on the worker's transport thread.
   /// @param user Completion state transferred on success.
-  /// @return Zero on admission or a PluginKit error code. Accepted calls complete once.
+  /// @return Zero on admission or a PluginKit ErrorCode. An admitted call completes once while the worker is running.
   uint32_t (HPK_CALL *call)(uint64_t invocation, uint32_t receiver, const char* service_id, uint32_t version,
                            const char* fingerprint, uint32_t operation, const uint8_t* data,
                            uint32_t size, hpk_complete_v1 complete, void* user);
@@ -102,8 +115,8 @@ typedef struct hpk_plugin_context_v1 {
 
 /// @brief Descriptor and callbacks for one contract.
 ///
-/// Keep the descriptor and its strings valid while the library is loaded. The worker calls these operations
-/// serially. Contain C++ exceptions within the library and report callback failures with hpk_status_v1.
+/// Keep the descriptor and its strings valid while the library is loaded. Lifecycle callbacks run on the
+/// loading process's application thread. Report failures from status-returning callbacks with hpk_status_v1.
 typedef struct hpk_plugin_v1 {
   /// Size of this descriptor in bytes.
   uint32_t struct_size;
@@ -115,6 +128,15 @@ typedef struct hpk_plugin_v1 {
   uint32_t contract_version;
   /// Null-terminated lowercase SHA-256 of the generated schema.
   const char* contract_fingerprint;
+  /// Bitmask of supported execution modes. See HPK_IN_PROCESS and HPK_WORKER_PROCESS.
+  uint32_t execution_modes;
+  /// Null-terminated identity of the shared HuxerUI SDK and C++ build configuration for in-process calls.
+  const char* cpp_abi;
+
+  /// @brief Identifies the active HuxerUI application seen by the plugin on this thread.
+  /// @return Borrowed opaque application address or null when no application is active. The host compares
+  /// this value with its own application address before making in-process calls.
+  const void* (HPK_CALL *runtime_identity)(void);
 
   /// @brief Initializes one plugin activation before creating any instances.
   /// @param context Host-supplied values valid for the duration of the callback.
@@ -124,11 +146,12 @@ typedef struct hpk_plugin_v1 {
 
   /// @brief Creates a plugin-owned instance.
   /// @param activation Token from the successful activate callback.
-  /// @param[out] instance Opaque instance pointer on success. Initialize the output to null on failure.
+  /// @param[out] instance Pointer to the published C++ interface, adjusted by the plugin, or null on failure.
   /// @return HPK_OK with a valid instance or an error from hpk_status_v1.
   int32_t (HPK_CALL *create)(const void* activation, void** instance);
 
   /// @brief Starts a generated operation on the worker's application thread.
+  /// Required for HPK_WORKER_PROCESS.
   /// @param instance Instance created by create.
   /// @param host Borrowed worker callbacks for this invocation.
   /// @param invocation Worker-assigned ID that identifies this call.
@@ -136,12 +159,26 @@ typedef struct hpk_plugin_v1 {
   /// @param operation Operation number from the generated contract.
   /// @param data Encoded request bytes borrowed until this function returns.
   /// @param size Length of the request in bytes.
-  /// @param complete Reports the final result on the application thread.
-  /// @param user Completion state retained by the worker.
-  /// @return HPK_OK on admission or an error from hpk_status_v1.
+  /// @param complete Reports the final hpk_status_v1 and result on the application thread after admission.
+  /// @param user Completion state borrowed from the worker until completion.
+  /// @return HPK_OK on admission or an error from hpk_status_v1. A rejected call has no completion callback.
   int32_t (HPK_CALL *invoke)(void* instance, const hpk_host_v1* host, uint64_t invocation,
                             uint32_t receiver, uint32_t operation, const uint8_t* data, uint32_t size,
                             hpk_complete_v1 complete, void* user);
+
+  /// @brief Sets the plugin library's thread-local context for a synchronous in-process call.
+  /// @param context Borrowed C++ invocation context valid until the previous value is restored. Pass null to clear it.
+  /// @return Previous context. Restore it on the same application thread when the call exits.
+  const void* (HPK_CALL *set_invocation)(const void* context);
+
+  /// @brief Registers an in-process invocation in the plugin library for the owning HuxerUI Task execution.
+  /// @param context Borrowed C++ invocation context valid until detach_invocation is called.
+  /// @return Plugin-owned registration to pass to detach_invocation on the same application thread.
+  void* (HPK_CALL *attach_invocation)(const void* context);
+
+  /// @brief Removes the invocation registration and releases its token.
+  /// @param registration Token returned by attach_invocation. Remove it before destroying the borrowed context.
+  void (HPK_CALL *detach_invocation)(void* registration);
 
   /// @brief Destroys an instance allocated by this library.
   /// @param instance Instance returned by create.

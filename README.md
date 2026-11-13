@@ -1,6 +1,6 @@
 # Lib-PluginKit
 
-Lib-PluginKit is a HuxerUI C++20 library for application plugins. The desktop previews generate typed SDK bindings, install approved local packages, and run plugins on demand in separate worker processes. The [design document](docs/design.md) describes the broader architecture.
+Lib-PluginKit is a HuxerUI C++20 library for application plugins. One desktop host can install approved packages and run each either in its own process or in a separate worker. Both modes expose the same C++ interface. The [design document](docs/design.md) describes the broader architecture.
 
 The library and Preview platform directories follow the HuxerUI library template generated with `--platform all`. The PluginKit runtime and CSV preview target Windows x64 with MSVC, Linux x86_64 with glibc, and macOS arm64.
 
@@ -33,10 +33,9 @@ $CsvProfileDir = '.\build\csv-profile'
 $CsvPackageDir = '.\build\csv-plugin\packages\csv-importer\Release'
 $CsvInfo = & $CsvHostExe $CsvProfileDir inspect $CsvPackageDir | ConvertFrom-Json
 $CsvInfo
-& $CsvHostExe $CsvProfileDir install $CsvPackageDir $CsvInfo.digest
+& $CsvHostExe $CsvProfileDir install $CsvPackageDir $CsvInfo.digest in_process status
 & $CsvHostExe $CsvProfileDir list
 @(
-    "provide-status $($CsvInfo.digest)"
     'import ".\examples\csv_import\sample.csv" example.csv'
     'status'
 ) | & $CsvHostExe $CsvProfileDir
@@ -58,7 +57,8 @@ cmake -S examples/csv_import/plugin -B build/csv-plugin -G Ninja \
   -DCMAKE_BUILD_TYPE=Release -DCSV_IMPORT_SDK="$preview_build/sdk" -DCSV_IMPORT_TEST_FIXTURES=ON
 cmake --build build/csv-plugin
 python3 examples/csv_import/verify.py "$preview_build/example_lib_plugin_kit" \
-  build/csv-plugin/packages/csv-importer/Release build/csv-plugin/packages/csv-faults/Release
+  build/csv-plugin/packages/csv-importer/Release build/csv-plugin/packages/csv-faults/Release \
+  build/csv-plugin/packages/csv-importer-worker/Release
 ```
 
 The Linux host looks for `hpk-worker` beside its executable. Its default profile is `$XDG_DATA_HOME/huxerui/lib-pluginkit/preview`, with `$HOME/.local/share` as the data directory fallback.
@@ -77,17 +77,19 @@ cmake --build build/csv-plugin-macos
 packages=build/csv-plugin-macos/packages
 codesign --force --sign - "$packages/csv-importer/Release/plugin.dylib"
 codesign --force --sign - "$packages/csv-faults/Release/plugin.dylib"
+codesign --force --sign - "$packages/csv-importer-worker/Release/plugin.dylib"
 host="$preview_build/example_lib_plugin_kit.app/Contents/MacOS/example_lib_plugin_kit"
-python3 examples/csv_import/verify.py "$host" "$packages/csv-importer/Release" "$packages/csv-faults/Release"
+python3 examples/csv_import/verify.py "$host" "$packages/csv-importer/Release" "$packages/csv-faults/Release" \
+  "$packages/csv-importer-worker/Release"
 ```
 
 The macOS preview locates `hpk-worker` in `Contents/MacOS` beside the host. Its default profile is `~/Library/Application Support/HuxerUI/Lib-PluginKit/Preview`. Use `huxerui package macos --profile release` to package the app with its helper. For local acceptance, run the same verification script against the packaged app's executable.
 
 ### Host commands
 
-Run the host with just a profile directory for a session that accepts one command per line. Each command produces a JSON response. `list` shows the installed packages, enabled importers, and active worker process IDs. `enable <id>` and `disable <id>` persist across sessions. `import <file> [plugin-id] [timeout-ms]` selects an enabled importer from the manifest suffixes. The CSV plugin uses the first record as the header and reports malformed input with one-based row and column numbers.
+Run the host with just a profile directory for a session that accepts one command per line. Each command produces a JSON response. `list` shows the installed packages, their execution modes, enabled importers, and active worker process IDs. `enable <id>` and `disable <id>` persist across sessions. `import <file> [plugin-id] [timeout-ms]` selects an enabled importer from the manifest suffixes and reports the delimiter, plugin process ID, and parsed rows. The CSV plugin uses the first record as the header and reports malformed input with one-based row and column numbers.
 
-Run `provide-status <approved-digest>` in the same session before opening the CSV plugin. This grants that package access to the preview's `ImportStatus` service. A successful import calls its receiver's `OnRows` and the service's `SetImportedRows` before returning the table. For `sample.csv`, the import reply reports `progress_rows` as 2 and the `status` command reports `last_imported_rows` as 2.
+Use `install <package> <approved-digest> <in_process|worker_process> [status]` to select the mode and grant access to the registered `ImportStatus` service. The approval persists in the profile. For `sample.csv`, the import reply reports `progress_rows` as 2 and the `status` command reports `last_imported_rows` as 2.
 
 ## Package the Windows preview
 
@@ -105,28 +107,44 @@ Build the test fixture in the separate plugin project and run the verification s
 cmake -S examples/csv_import/plugin -B build/csv-plugin -G Ninja -DCMAKE_BUILD_TYPE=Release `
   "-DCSV_IMPORT_SDK=$CsvSdk" -DCSV_IMPORT_TEST_FIXTURES=ON
 cmake --build build/csv-plugin
-python examples/csv_import/verify.py $CsvHostExe $CsvPackageDir .\build\csv-plugin\packages\csv-faults\Release
+python examples/csv_import/verify.py $CsvHostExe $CsvPackageDir .\build\csv-plugin\packages\csv-faults\Release `
+  .\build\csv-plugin\packages\csv-importer-worker\Release
 ```
 
-The script verifies discovery before activation, a shared plugin context across two instances, activation failure and retry, and deactivation on disable and host shutdown. It also checks CSV conversion and diagnostics, worker exit and timeout recovery, profile recovery, and rejection of mismatched contracts and modified packages. Callback checks cover authorization, resumption on the host task's thread, catalog reads during callbacks, rejection of nested state changes, expired receivers, cancellation, and updates applied before the plugin times out. On Linux and macOS the script sends `SIGKILL` to the host while a plugin call is hung and checks that the worker exits before the call deadline.
+The script installs two builds of the same CSV implementation in one profile, checks their process IDs, and calls both through the same synchronous and Task methods. It checks the native path with a request above the IPC size limit. It also covers service approval, receiver lifetime, catalog queries during callbacks, cancellation, activation and deactivation, profile recovery, and worker exit and timeout recovery. On Linux and macOS it checks that the worker exits when the host is killed during a pending call.
 
 ## SDK and runtime
 
-Acquire `HuxerUI::PluginKit` with `huxerui_use_library`. The C++ API is in `huxerui::pluginkit`. Ship `hpk-worker` on Linux and macOS or `hpk-worker.exe` on Windows with the application and its shared HuxerUI runtime. Build the plugin against the same shared HuxerUI SDK as the worker.
+Acquire `HuxerUI::PluginKit` with `huxerui_use_library`. The C++ API is in `huxerui::pluginkit`. Link a mixed-mode host and its plugins to the same shared HuxerUI SDK, and ship `hpk-worker` beside the host executable. With an installed desktop SDK, request `find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared)` before creating the app target. PluginKit validates the in-process build identity and that the library sees the host's active HuxerUI application.
 
 - Hosts include `<huxerui/pluginkit.h>` and the generated `.host.h` for the contracts they call.
 - Plugins include `<huxerui/pluginkit/plugin.h>` and the generated `.bindings.h` for the contracts they implement or call back to the host.
 - Shared contract headers include `<huxerui/pluginkit/contract.h>` for PluginKit types.
 
-`hpk gen` takes a self-contained contract header, a qualified interface name, a contract ID, a positive integer version, and an output directory. Arguments after `--` are passed to Clang. Publish the generated files and the PluginKit include tree, including its `detail` headers, to plugin authors, who build against the HuxerUI SDK. `HPK_BUILD_GENERATOR=OFF` builds the runtime and worker without the developer tool. Set `HPK_LLVM_ROOT` if LLVM is outside `PATH`.
+Mark each IPC-capable interface class with `HPK_REMOTE`. `hpk gen` takes its self-contained header, qualified interface name, contract ID, positive integer version, and output directory. Arguments after `--` are passed to Clang. Publish the generated files and the PluginKit include tree to plugin authors. `HPK_BUILD_GENERATOR=OFF` builds the library and worker without the generator. Set `HPK_LLVM_ROOT` if LLVM is outside `PATH`.
 
-The generator accepts public pure virtual operations with one value or const-reference request and a value or `void` result. An operation declared with `huxerui::Task<T>` takes its request by value and may also take one `huxerui::pluginkit::Receiver<T>` by value. Generate the receiver interface from its own header and publish its bindings at the same relative path as that header. Wire types include `bool`, the 32-bit and 64-bit fixed-width integers, `std::string`, `std::vector`, `std::optional`, and aggregate structs declared in the contract header. The SDK records operation numbers and record fields in `contract.json`. Records use CBOR arrays in field-number order and both ends check the exact contract fingerprint. Encoded payloads use `huxerui::Bytes` for storage.
+The generator preserves synchronous value or `void` results and asynchronous `huxerui::Task<T>` results. Methods may have no request or one value request. Synchronous methods also accept a const-reference request. A Task method may take a second argument of type `Receiver<T>`, an alias of `std::shared_ptr<T>`. Generate its Task-returning receiver interface from a separate header. Wire values include fixed-width integers, `bool`, `std::string`, vectors, optional values, and aggregate records. Both sides check the exact contract fingerprint.
 
-Create `PluginManager` with an application `TaskScope` for reverse callbacks. Register an `ExtensionPoint<T>`, list contributions by manifest metadata, and await `CreateExtension(point, id)` in a HuxerUI task. Generated host calls and `Close()` return `huxerui::Task`. Await `Shutdown()` before retiring the application scope. The worker runs a windowless HuxerUI Runtime on its application thread. It loads the plugin through `pluginkit_query_v1` and uses a separate thread for IPC.
+Register the extension point and its host services with an application-scoped `PluginManager`. Choose the mode and service grants when approving installation. Calls on a single plugin are serialized across instances.
 
-Each worker executes one invocation at a time. A deadline or cancellation while a request waits its turn affects only that request. A worker exit, in-flight timeout, or in-flight cancellation closes the generation. Subsequent instance creation can start a new generation. Canceling a HuxerUI task suppresses its continuation. A caller that is still waiting when the plugin is disabled, exits, or exceeds its deadline receives a PluginKit error.
+```cpp
+plugins.RegisterExtensionPoint(Importers);
+plugins.ProvideService<ImportStatus>(status);
+plugins.InstallPackage(package, digest, {
+    .mode = ExecutionMode::InProcess,
+    .services = {std::string(Contract<ImportStatus>::Info.id)},
+});
 
-Every activation owns one `PluginContext`. `Info()` supplies the manifest ID, release version, and approved digest. Both directory accessors return `const huxerui::File&`. `BundleDirectory()` points to the installed package snapshot, which plugin code should treat as read-only. `DataDirectory()` is writable and stays associated with the plugin ID across activations in that host profile. Extension implementations may be default-constructed or accept `const huxerui::pluginkit::PluginContext&`. All instances receive the same object as the lifecycle hooks. The manager also takes `huxerui::File` for the profile, worker executable, and package directories.
+auto importer = plugins.CreateExtension(Importers, selected_id);
+auto delimiter = importer->Delimiter();
+auto result = co_await importer->Import(request, progress);
+```
+
+The handle releases the instance at scope exit. The first managed method starts the plugin and creates the instance. In-process calls invoke the real C++ object on the host's application thread with typed values. Worker calls encode values over IPC, and the worker calls the same implementation in a windowless Runtime. A synchronous IPC method blocks until it receives a result or reaches its deadline. It reports `Busy` if another business exchange is in progress and `CallbackUnavailable` if the method requests a host callback. Use Task methods for callbacks and work that needs to suspend.
+
+A queued deadline or cancellation affects only that call. Canceling the caller's HuxerUI task suppresses its continuation. In a worker, canceling or timing out an active exchange closes the worker generation. In process, cancellation revokes the callback endpoint, requests cooperative stop, and retires the invocation Task. `RunInvocationWorker()` retains the instance while blocking work that borrows it finishes. Await `Shutdown()` before retiring the application scope.
+
+Every activation owns one `PluginContext`. `Info()` supplies the manifest ID, release version, and approved digest. Both directory accessors return `const huxerui::File&`. `BundleDirectory()` points to the installed package snapshot, which plugin code should treat as read-only. `DataDirectory()` is writable and stays associated with the plugin ID across activations in that host profile. Extension implementations may be default-constructed or accept `const huxerui::pluginkit::PluginContext&`. All instances receive the same object as the lifecycle hooks. The manager takes `huxerui::File` for the profile and package directories. Pass the worker executable as a `File`, or `std::nullopt` for a host that only runs in-process plugins.
 
 ```cpp
 void Activate(const huxerui::pluginkit::PluginContext& context);
@@ -135,18 +153,18 @@ void Deactivate(const huxerui::pluginkit::PluginContext& context);
 HPK_EXPORT_PLUGIN(csv_import::TableImporter, CsvImporter, Activate, Deactivate)
 ```
 
-Supply either hook as needed. Use `nullptr` for an omitted activation hook when supplying only deactivation. `Activate` runs once before the first instance is constructed, and a thrown exception fails instance creation. Closing an instance releases that object. Disabling the plugin or shutting down the manager attempts a bounded teardown that destroys the remaining instances and calls `Deactivate`. The module stays loaded through Runtime shutdown. A crash or forced termination can interrupt teardown.
+Supply either hook as needed. Use `nullptr` for an omitted activation hook when supplying only deactivation. `Activate` runs once before the first instance is constructed. On disable or shutdown, PluginKit stops admitting calls, drains active local work, destroys the instances, and calls `Deactivate`. In-process libraries stay mapped until host exit. Worker teardown has a bounded deadline. Native-only contracts can publish `Contract<T>::Info` and use the same factory without generated code. Their handles borrow the real interface. Release those handles after their own work finishes and before awaiting plugin disable or shutdown.
 
-Generate a host service from a separate C++ interface with `hpk gen`. The host registers its implementation with `ProvideService<T>(implementation, approved_digest)` before activating the package. Each worker receives the authorized services available at startup. During an operation, plugin code can `co_await huxerui::pluginkit::GetService<T>().Method(request)`. An application can expose its own convenience functions around that API.
+Register the service implementation once with `ProvideService<T>(implementation)` before opening plugins. During a plugin Task, `GetService<T>()` synchronously returns a handle whose method resolves the current invocation and its package grants. A synchronous in-process extension method can use a synchronous service method. The application SDK can publish ordinary helpers such as `csv_import::SetImportedRows(rows)` around the handle.
 
-The host passes a `std::shared_ptr<T>` as the receiver argument. The invocation and any running callback retain it for their lifetimes. The plugin awaits the generated proxy's methods. Invoking a receiver saved from an earlier call fails with `ReceiverClosed`. Service and receiver tasks run in the manager's callback scope and share the invocation deadline. Proxy calls check that the awaiting HuxerUI task belongs to the active invocation. `Delay()` and `AwaitCallback<T>()` resume on the owning application thread.
+The host passes a `std::shared_ptr<T>` as the receiver argument. The plugin calls it with `receiver->Method(...)`. PluginKit forwards native callback arguments directly and encodes worker callbacks for IPC. Using a receiver after its invocation ends fails with `ReceiverClosed`. Service and receiver tasks run in the manager's application scope and share the invocation deadline.
 
 `ListPlugins()` and `ListExtensions()` read catalog snapshots during callbacks. Other manager and worker operations are subject to reentry checks and can fail with `ReentrantCall`. Keep handlers bounded. A synchronous handler can run beyond the deadline, and any changes it already applied remain in effect.
 
-A directory package contains `plugin.json` and a platform-specific shared library. Use `plugin.dylib` for `macos-arm64`, `plugin.so` for `linux-x86_64-gnu`, and `plugin.dll` for `windows-x86_64-msvc`. Its digest is the SHA-256 of the concatenated lowercase hexadecimal SHA-256 digests of the raw manifest and library, in that order. The profile stores approved package snapshots and enablement state.
+A directory package contains `plugin.json` and a platform-specific shared library. Use `plugin.dylib` for `macos-arm64`, `plugin.so` for `linux-x86_64-gnu`, and `plugin.dll` for `windows-x86_64-msvc`. The manifest lists `execution_modes` and carries the `cpp_abi` stamp for in-process packages. The SDK produced by the example publishes this stamp in `cpp-abi.txt`. Its digest is the SHA-256 of the concatenated lowercase hexadecimal SHA-256 digests of the raw manifest and library, in that order. The profile stores the approved snapshot, its mode, its service grants, and its enablement state.
 
 On Linux each worker starts in a dedicated process group, receives the verified library file descriptor, and serves requests over a private Unix socket. A thread in the worker watches for host disconnects even during a plugin call. PluginKit owns the worker's exit status and reaps it while the host is running. Workers run under the application's user account and provide process fault isolation for trusted plugins.
 
-On macOS the worker runs in its own process group and loads the approved library from its absolute path in the profile. The worker watches the private Unix socket for host disconnects with `kqueue`. The local preview uses ad hoc signing. A worker distributed with the Hardened Runtime must have a Library Validation policy that permits the plugin's signature.
+On macOS the worker runs in its own process group and watches the private Unix socket for host disconnects with `kqueue`. The local preview uses ad hoc signing. With the Hardened Runtime, the process that loads the plugin needs a Library Validation policy that permits the plugin's signature.
 
 Lib-PluginKit uses the [MIT License](LICENSE).

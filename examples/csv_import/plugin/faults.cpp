@@ -1,13 +1,13 @@
 #include "csv_contract.bindings.h"
-#include "services/import_status.bindings.h"
-
-#include <huxerui/pluginkit/plugin.h>
+#include "csv_sdk.h"
+#include "process_id.h"
 #include <huxerui/app.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <thread>
 
 namespace {
 
@@ -48,6 +48,14 @@ public:
 
   ~FaultImporter() override { --live_instances; }
 
+  std::string Delimiter() const override {
+    if (context_.DataDirectory().Child("sync-service").Exists()) {
+      (void)huxerui::pluginkit::GetService<csv_import::ImportStatus>()->ImportedRows();
+    }
+    return ",";
+  }
+  std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
+
   huxerui::Task<csv_import::ImportResult> Import(csv_import::ImportRequest request,
                                                   csv_import::ImportReceiver receiver) override {
     if (request.source == "exit") std::_Exit(5);
@@ -64,7 +72,9 @@ public:
     }
     if (request.source == "reenter") co_await SetRows(UINT32_MAX);
     if (request.source == "background") {
-      std::async(std::launch::async, [] { huxerui::pluginkit::GetService<csv_import::ImportStatus>(); }).get();
+      std::async(std::launch::async, [] {
+        return huxerui::pluginkit::GetService<csv_import::ImportStatus>()->ImportedRows();
+      }).get();
     }
     if (request.source == "other-task") {
       co_await huxerui::AwaitCallback<void>([](auto completion) {
@@ -81,10 +91,21 @@ public:
     }
     if (request.source == "remember") {
       saved_ = receiver;
-      co_await receiver.OnRows({1});
+      if (receiver) co_await receiver->OnRows({1});
     }
     if (request.source == "stale" && saved_) co_await saved_->OnRows({2});
     if (request.source == "status-wait") co_await SetRows(42);
+    if (request.source == "background-stop") {
+      co_await huxerui::pluginkit::RunInvocationWorker([this](std::stop_token stop) {
+        Record(context_, "background-start");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (!stop.stop_requested() && std::chrono::steady_clock::now() < deadline) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+        Record(context_, stop.stop_requested() ? "background-stopped" : "background-ended");
+      });
+    }
     if (request.source == "wait" || request.source == "status-wait") {
 #if !defined(_WIN32)
       if (const auto* marker = std::getenv("HPK_CSV_WAIT_MARKER")) std::ofstream(marker).put('\n');
@@ -98,13 +119,13 @@ public:
 
 private:
   static huxerui::Task<void> SetRows(std::uint32_t rows) {
-    if (!co_await huxerui::pluginkit::GetService<csv_import::ImportStatus>().SetImportedRows({rows})) {
+    if (!co_await csv_import::SetImportedRows(rows)) {
       throw std::runtime_error("The host declined the fixture row count");
     }
   }
 
   const huxerui::pluginkit::PluginContext& context_;
-  std::optional<csv_import::ImportReceiver> saved_;
+  csv_import::ImportReceiver saved_;
 };
 
 } // namespace

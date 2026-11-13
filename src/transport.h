@@ -21,6 +21,7 @@ struct Frame {
   std::uint32_t call = 0;
   std::uint32_t callback = 0;
   std::uint32_t receiver = 0;
+  bool synchronous = false;
 };
 
 inline constexpr std::uint32_t FrameMagic = 0x314b5048; // HPK1 in little-endian byte order.
@@ -28,7 +29,7 @@ using Deadline = std::chrono::steady_clock::time_point;
 
 inline bool IsErrorCode(std::uint32_t code) {
   return code >= static_cast<std::uint32_t>(ErrorCode::InvalidArgument) &&
-         code <= static_cast<std::uint32_t>(ErrorCode::ReceiverClosed);
+         code <= static_cast<std::uint32_t>(ErrorCode::Busy);
 }
 
 struct PluginStartup {
@@ -57,6 +58,14 @@ struct PluginStartup {
     return startup;
   }
 };
+
+inline void PreparePluginData(const PluginStartup& startup) {
+  const auto& text = startup.data_directory;
+  const auto path = std::filesystem::path(std::u8string(text.begin(), text.end()));
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  if (error) throw Error(ErrorCode::Io, "Cannot create the plugin data directory: " + error.message());
+}
 
 inline Bytes ServicePayload(ContractInfo service, std::span<const std::byte> request) {
   // Keep contract identity ahead of the encoded request so the host can authorize before decoding the arguments.
@@ -96,20 +105,22 @@ inline Frame ErrorReply(const Error& error) {
 template<class Write>
 void WriteFrame(Write&& write, const Frame& frame) {
   if (frame.payload.size() > MaxPayload) throw Error(ErrorCode::PayloadTooLarge, "Worker frame exceeds the byte limit");
-  const std::array<std::uint32_t, 9> header{
+  const std::array<std::uint32_t, 10> header{
       FrameMagic, static_cast<std::uint32_t>(frame.kind), frame.call, frame.callback, frame.code, frame.instance,
-      frame.operation, static_cast<std::uint32_t>(frame.payload.size()), frame.receiver};
+      frame.operation, static_cast<std::uint32_t>(frame.payload.size()), frame.receiver, frame.synchronous};
   write(std::as_bytes(std::span(header)));
   write(std::span<const std::byte>(frame.payload));
 }
 
 template<class Read>
 Frame ReadFrame(Read&& read) {
-  std::array<std::uint32_t, 9> header{};
+  std::array<std::uint32_t, 10> header{};
   read(std::as_writable_bytes(std::span(header)));
-  if (header[0] != FrameMagic || header[7] > MaxPayload) throw Error(ErrorCode::Protocol, "Invalid worker frame header");
+  if (header[0] != FrameMagic || header[7] > MaxPayload || header[9] > 1) {
+    throw Error(ErrorCode::Protocol, "Invalid worker frame header");
+  }
   Frame frame{header[4], header[5], header[6], Bytes(header[7]), static_cast<FrameKind>(header[1]),
-              header[2], header[3], header[8]};
+              header[2], header[3], header[8], header[9] != 0};
   read(std::span(frame.payload));
   return frame;
 }

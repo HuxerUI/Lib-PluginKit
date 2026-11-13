@@ -54,8 +54,8 @@ private:
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               ContractInfo contract, std::vector<Service> services, TaskScope callbacks)
-    : services_(std::move(services)), callbacks_(std::move(callbacks)) {
+               ContractInfo contract, std::vector<Service> services, TaskScope callbacks, PluginStartup plugin)
+    : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(plugin)) {
   auto request = CreateWorkerPipe(true);
   auto response = CreateWorkerPipe(false);
   std::array handles{request.read.get(), response.write.get()};

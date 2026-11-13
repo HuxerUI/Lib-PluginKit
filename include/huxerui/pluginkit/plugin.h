@@ -2,9 +2,14 @@
 
 /// @file
 /// @brief Plugin context, host services, and export bindings for plugin implementations.
+///
+/// Include the generated bindings for the implemented HPK_REMOTE interface and export its implementation
+/// with HPK_EXPORT_PLUGIN. In-process plugins use the host's HuxerUI application. Worker plugins run
+/// in a separate windowless HuxerUI application.
 
 #include <huxerui/file.h>
-#include <huxerui/pluginkit/detail/invocation.h>
+#include <huxerui/app.h>
+#include <huxerui/pluginkit/detail/extension.h>
 
 #include <concepts>
 #include <memory>
@@ -29,23 +34,28 @@ struct PluginIdentity {
 
 /// @brief Read-only context shared by every extension instance in one plugin activation.
 ///
-/// The binding passes the same object to lifecycle hooks and to constructors that accept it.
-/// It remains valid through Deactivate(). Copy individual values if they must outlive the activation.
+/// The binding passes the same object to the optional activation and deactivation hooks and to constructors
+/// that accept it. The object stays valid through instance destruction and the deactivation hook. Copy
+/// individual values if they must outlive the activation. See GetService() for access to host services
+/// during a managed invocation.
 class PluginContext {
 public:
   /// @brief Context identity is shared by reference within its activation.
   PluginContext(const PluginContext&) = delete;
+  /// @brief A context retains the identity and paths of its activation.
   PluginContext& operator=(const PluginContext&) = delete;
 
   /// @brief Returns the identity of the approved plugin package.
+  /// @return Reference valid for the lifetime of this context.
   const PluginIdentity& Info() const noexcept { return info_; }
 
   /// @brief Returns the absolute directory of the installed package snapshot.
-  /// Treat its contents as read-only.
+  /// @return Reference to the directory, valid for the lifetime of this context. Treat its contents as read-only.
   const File& BundleDirectory() const noexcept { return bundle_; }
 
   /// @brief Returns the absolute writable directory reserved for this plugin in the host profile.
-  /// The host creates it before activation and reuses it across worker generations.
+  /// PluginKit creates it before activation and reuses it across activations of this plugin ID.
+  /// @return Reference valid for the lifetime of this context.
   const File& DataDirectory() const noexcept { return data_; }
 
 private:
@@ -58,22 +68,88 @@ private:
   File data_;
 };
 
-/// @brief Obtains a typed host service proxy for the current plugin invocation.
+/// @brief Synchronously obtains a typed handle for a host service.
 ///
-/// Await proxy methods from the invocation's task or a child task awaited by it. The host checks authorization
-/// when the proxy method runs.
-/// @tparam Interface Host service interface with generated bindings.
-/// @return Proxy valid while the current invocation is active.
-/// @throws Error With ServiceUnavailable if the calling thread has no active plugin invocation.
+/// Call service methods through operator->(). The binding resolves the current managed invocation and checks
+/// the package's grant when the method runs. Await Task methods from that invocation or an awaited child Task.
+/// Synchronous service methods require a synchronous managed in-process invocation.
+/// @tparam Interface Host service interface with a Contract specialization. Worker calls require HPK_REMOTE bindings.
+/// @return Typed handle that resolves the current invocation on use.
+/// @see PluginManager::ProvideService(), InstallOptions
 template<class Interface>
 ServiceHandle<Interface> GetService() {
-  if (!detail::current_invocation) {
-    throw Error(ErrorCode::ServiceUnavailable, "Host services require an active plugin invocation");
-  }
-  return ServiceHandle<Interface>(detail::HostEndpoint(*detail::current_invocation));
+  return {};
+}
+
+/// @brief Reads the stop token for the current managed plugin invocation.
+///
+/// Await from the plugin Task or an awaited child Task. In-process cancellation, an active call's deadline,
+/// or shutdown can request cooperative stop. A worker call has an empty token and the host can terminate
+/// its worker on cancellation.
+/// @return Task yielding the invocation's stop token.
+/// @throws Error With ServiceUnavailable if the Task runs outside a managed plugin invocation.
+/// @see RunInvocationWorker()
+inline Task<std::stop_token> GetInvocationStopToken() {
+  co_return detail::FindInvocation(co_await detail::CurrentTaskExecution{}).stop;
+}
+
+/// @brief Runs blocking work tied to a managed plugin Task.
+///
+/// Use this when a background callable borrows the in-process instance or its PluginContext. PluginKit
+/// retains them until the callable finishes, even if the awaiting Task is cancelled. The callable should
+/// check the stop token and exit promptly so teardown can finish. In a worker process the token is empty.
+/// Keep host service and receiver calls on the application Task.
+/// @tparam Work Callable accepting a leading std::stop_token followed by the supplied arguments.
+/// @tparam Args Types of the arguments passed to the callable after the token.
+/// @param work Callable owned by the returned Task.
+/// @param args Arguments copied or moved into the returned Task.
+/// @return Lazy Task yielding the callable's result.
+/// @throws Error With ServiceUnavailable if run outside an invocation, or Closed if it is closing.
+template<class Work, class... Args>
+auto RunInvocationWorker(Work&& work, Args&&... args) {
+  return detail::RunPluginWorker(std::forward<Work>(work), std::forward<Args>(args)...);
 }
 
 namespace detail {
+
+// Host and plugins consume the same published build identifier for the shared SDK.
+#ifndef HPK_SDK_ABI
+#define HPK_SDK_ABI ""
+#endif
+#define HPK_STRINGIFY_VALUE(value) #value
+#define HPK_STRINGIFY(value) HPK_STRINGIFY_VALUE(value)
+
+inline constexpr char CppAbi[] = HPK_SDK_ABI
+#if defined(_MSC_VER)
+    ":msvc=" HPK_STRINGIFY(_MSVC_STL_VERSION) ":iterators=" HPK_STRINGIFY(_ITERATOR_DEBUG_LEVEL)
+#if defined(_DLL)
+    ":dynamic-crt"
+#else
+    ":static-crt"
+#endif
+#if defined(_DEBUG)
+    ":debug"
+#endif
+#elif defined(_LIBCPP_VERSION)
+    ":libc++=" HPK_STRINGIFY(_LIBCPP_ABI_VERSION)
+#elif defined(__GLIBCXX__)
+    ":libstdc++=" HPK_STRINGIFY(_GLIBCXX_USE_CXX11_ABI)
+#if defined(_GLIBCXX_DEBUG)
+    ":debug"
+#endif
+#endif
+    ;
+
+inline const void* RuntimeIdentity() noexcept {
+  try {
+    return &huxerui::detail::CurrentApplication();
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+#undef HPK_STRINGIFY
+#undef HPK_STRINGIFY_VALUE
 
 struct PluginContextAccess {
   static std::unique_ptr<PluginContext> Create(const hpk_plugin_context_v1& context) {
@@ -88,10 +164,14 @@ Task<void> DispatchPlugin(Interface& instance, const hpk_host_v1* host, std::uin
                           std::uint32_t receiver, std::uint32_t operation, Bytes request,
                           hpk_complete_v1 complete, void* user, std::int32_t (*status)(const Error&) noexcept) {
   try {
-    DispatchContext context{{host, invocation, co_await CurrentTaskExecution{}}, receiver};
-    // The worker admits only one plugin invocation. Proxies also check the awaiting task's identity.
-    InvocationScope scope(context.invocation);
-    auto bytes = co_await Contract<Interface>::Dispatch(instance, operation, std::move(request), context);
+    Bytes bytes;
+    {
+      const auto execution = co_await CurrentTaskExecution{};
+      DispatchContext context{{host, invocation, execution}, receiver};
+      const Invocation call{execution, HostEndpoint(context.invocation), nullptr, nullptr, {}};
+      InvocationScope scope(call);
+      bytes = co_await Contract<Interface>::Dispatch(instance, operation, std::move(request), context);
+    }
     complete(user, HPK_OK, {reinterpret_cast<const std::uint8_t*>(bytes.data()),
                             static_cast<std::uint32_t>(bytes.size())});
   } catch (const Error& error) {
@@ -103,18 +183,21 @@ Task<void> DispatchPlugin(Interface& instance, const hpk_host_v1* host, std::uin
 
 } // namespace detail
 
-/// @brief Builds the ABI descriptor for a generated contract and its implementation.
+/// @brief Builds the ABI descriptor for a published contract and its implementation.
 ///
-/// The descriptor creates and destroys instances inside the library and lends response buffers to completion callbacks.
-/// @tparam Interface Interface with a generated Contract specialization.
+/// The descriptor creates and destroys instances inside the library. HPK_REMOTE bindings also publish
+/// worker dispatch and lend encoded result buffers to completion callbacks. Both modes create a single
+/// PluginContext for each activation. If both constructors are available, the context overload is used.
+/// @tparam Interface Interface with a public virtual destructor and a Contract specialization.
 /// @tparam Implementation Public implementation constructible from const PluginContext& or by default.
-/// @tparam Activate Optional plugin-wide initialization hook. A thrown exception fails activation.
-/// @tparam Deactivate Optional cleanup hook called after the worker has destroyed all instances.
-/// @note The hooks run on the worker's HuxerUI application thread. Host service proxies require an active invocation.
+/// @tparam Activate Optional initialization hook called before creating any instances. An exception fails activation.
+/// @tparam Deactivate Optional cleanup hook called during orderly teardown after all instances are destroyed.
+/// @note Hooks run on the loading process's application thread. A terminated worker may skip teardown.
 /// @return Reference to a descriptor that remains valid while the plugin library is loaded.
 template<class Interface, class Implementation,
          void (*Activate)(const PluginContext&) = nullptr, void (*Deactivate)(const PluginContext&) = nullptr>
   requires std::derived_from<Implementation, Interface> &&
+           std::has_virtual_destructor_v<Interface> &&
            (std::constructible_from<Implementation, const PluginContext&> || std::default_initializable<Implementation>)
 const hpk_plugin_v1& Bind() noexcept {
   static constexpr auto status = [](const Error& error) noexcept -> std::int32_t {
@@ -127,18 +210,24 @@ const hpk_plugin_v1& Bind() noexcept {
       case ErrorCode::ReceiverClosed: return HPK_RECEIVER_CLOSED;
       case ErrorCode::ContractMismatch: return HPK_CONTRACT_MISMATCH;
       case ErrorCode::Closed: return HPK_CLOSED;
+      case ErrorCode::CallbackUnavailable: return HPK_CALLBACK_UNAVAILABLE;
+      case ErrorCode::Busy: return HPK_BUSY;
       default: return HPK_PLUGIN_FAILED;
     }
+  };
+  constexpr bool remote = requires(Interface& instance, Bytes request, detail::DispatchContext context) {
+    Contract<Interface>::Dispatch(instance, std::uint32_t{}, std::move(request), context);
   };
   static const hpk_plugin_v1 binding{
       sizeof(hpk_plugin_v1), HPK_ABI_VERSION, Contract<Interface>::Info.id.data(),
       Contract<Interface>::Info.version, Contract<Interface>::Info.fingerprint.data(),
+      HPK_IN_PROCESS | (remote ? HPK_WORKER_PROCESS : 0u), detail::CppAbi, detail::RuntimeIdentity,
       [](const hpk_plugin_context_v1* input, void** activation) noexcept -> std::int32_t {
         *activation = nullptr;
         try {
           auto context = detail::PluginContextAccess::Create(*input);
           if constexpr (Activate != nullptr) Activate(*context);
-          // Transfer context ownership to the worker after the activation hook succeeds.
+          // Publish the context only after the activation hook succeeds.
           *activation = context.release();
           return HPK_OK;
         } catch (const Error& error) {
@@ -151,9 +240,9 @@ const hpk_plugin_v1& Bind() noexcept {
         *instance = nullptr;
         try {
           if constexpr (std::constructible_from<Implementation, const PluginContext&>) {
-            *instance = new Implementation(*static_cast<const PluginContext*>(activation));
+            *instance = static_cast<Interface*>(new Implementation(*static_cast<const PluginContext*>(activation)));
           } else {
-            *instance = new Implementation;
+            *instance = static_cast<Interface*>(new Implementation);
           }
           return HPK_OK;
         } catch (const Error& error) {
@@ -162,28 +251,38 @@ const hpk_plugin_v1& Bind() noexcept {
           return HPK_PLUGIN_FAILED;
         }
       },
-      [](void* instance, const hpk_host_v1* host, std::uint64_t invocation,
+      remote ? +[](void* instance, const hpk_host_v1* host, std::uint64_t invocation,
          std::uint32_t receiver, std::uint32_t operation, const std::uint8_t* data, std::uint32_t size,
          hpk_complete_v1 complete, void* user) noexcept -> std::int32_t {
-        try {
-          if (!instance || !host || !invocation || (size && !data)) return HPK_INVALID_REQUEST;
-          if (size > MaxPayload) return HPK_PAYLOAD_TOO_LARGE;
-          Bytes request;
-          if (size) {
-            const auto bytes = std::as_bytes(std::span(data, size));
-            request.assign(bytes.begin(), bytes.end());
+        if constexpr (remote) {
+          try {
+            if (!instance || !host || !invocation || !complete || (size && !data)) return HPK_INVALID_REQUEST;
+            if (size > MaxPayload) return HPK_PAYLOAD_TOO_LARGE;
+            Bytes request;
+            if (size) {
+              const auto bytes = std::as_bytes(std::span(data, size));
+              request.assign(bytes.begin(), bytes.end());
+            }
+            (void)UseApplicationTaskScope().Launch(detail::DispatchPlugin<Interface>(
+                *static_cast<Interface*>(instance), host, invocation, receiver, operation, std::move(request),
+                complete, user, status));
+            return HPK_OK;
+          } catch (const Error& error) {
+            return status(error);
+          } catch (...) {
+            return HPK_PLUGIN_FAILED;
           }
-          (void)UseApplicationTaskScope().Launch(detail::DispatchPlugin<Interface>(
-              *static_cast<Implementation*>(instance), host, invocation, receiver, operation, std::move(request),
-              complete, user, status));
-          return HPK_OK;
-        } catch (const Error& error) {
-          return status(error);
-        } catch (...) {
-          return HPK_PLUGIN_FAILED;
         }
+        return HPK_INVALID_REQUEST;
+      } : nullptr,
+      [](const void* context) noexcept -> const void* {
+        return std::exchange(detail::synchronous_invocation, static_cast<const detail::Invocation*>(context));
       },
-      [](void* instance) noexcept { delete static_cast<Implementation*>(instance); },
+      [](const void* context) -> void* {
+        return new detail::InvocationScope(*static_cast<const detail::Invocation*>(context));
+      },
+      [](void* registration) noexcept { delete static_cast<detail::InvocationScope*>(registration); },
+      [](void* instance) noexcept { delete static_cast<Interface*>(instance); },
       [](void* activation) noexcept -> std::int32_t {
         const std::unique_ptr<PluginContext> context(static_cast<PluginContext*>(activation));
         try {
@@ -201,7 +300,7 @@ const hpk_plugin_v1& Bind() noexcept {
 
 } // namespace huxerui::pluginkit
 
-/// @brief Platform export annotation for the plugin entry point.
+/// @brief Makes the plugin query symbol visible in the platform's dynamic library.
 #if defined(_WIN32)
 #define HPK_EXPORT __declspec(dllexport)
 #else
@@ -209,9 +308,9 @@ const hpk_plugin_v1& Bind() noexcept {
 #endif
 
 /// @brief Defines pluginkit_query_v1. Use once at global scope in the plugin library.
-/// @param ... Published interface and implementation type, followed by optional Activate and Deactivate
-/// function pointers. The implementation may accept const PluginContext&. Each hook takes const
-/// PluginContext& and returns void.
+/// @param ... Published interface and implementation type, followed by optional activation and deactivation
+/// function pointers. Each hook takes const PluginContext& and returns void.
+/// @see Bind()
 /// @code{.cpp}
 /// HPK_EXPORT_PLUGIN(csv_import::TableImporter, csv_import::CsvImporter)
 /// @endcode

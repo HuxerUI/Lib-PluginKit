@@ -15,6 +15,11 @@
 #include <sstream>
 #include <thread>
 #include <type_traits>
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -34,16 +39,32 @@ static_assert(!std::is_copy_assignable_v<PluginManager>);
 
 constexpr ExtensionPoint<csv_import::TableImporter> Importers{"example.table-importers"};
 constexpr char CommandHelp[] =
-    "inspect <package>, install <package> <digest>, list, enable <id>, disable <id>, "
-    "provide-status <digest>, status, import <file> [plugin-id] [timeout-ms], quit";
+    "inspect <package>, install <package> <digest> <in_process|worker_process> [status], list, "
+    "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], quit";
+
+std::uint32_t ProcessId() {
+#if defined(_WIN32)
+  return static_cast<std::uint32_t>(::_getpid());
+#else
+  return static_cast<std::uint32_t>(::getpid());
+#endif
+}
 
 class PreviewImportStatus final : public csv_import::ImportStatus {
 public:
+  explicit PreviewImportStatus(PluginManager& manager) : manager_(manager) {}
+
+  std::uint32_t ImportedRows() const override { return rows.value_or(0); }
+
   Task<bool> SetImportedRows(csv_import::SetImportedRowsRequest request) override {
     co_await Delay(std::chrono::milliseconds::zero());
     if (std::this_thread::get_id() != owner_) {
       throw Error(ErrorCode::PluginFailed, "Import status must be updated on the preview thread");
     }
+    if (manager_.ListPlugins().empty() || manager_.ListExtensions(Importers).empty()) {
+      throw Error(ErrorCode::PluginFailed, "The host callback could not read the plugin catalog");
+    }
+    if (request.rows == UINT32_MAX) co_await manager_.SetEnabled("example.csv-faults", false);
     rows = request.rows;
     co_return true;
   }
@@ -51,26 +72,8 @@ public:
   std::optional<std::uint32_t> rows;
 
 private:
-  const std::thread::id owner_ = std::this_thread::get_id();
-};
-
-class ReentryStatus final : public csv_import::ImportStatus {
-public:
-  ReentryStatus(PluginManager& manager, std::shared_ptr<PreviewImportStatus> status)
-      : manager_(manager), status_(std::move(status)) {}
-
-  Task<bool> SetImportedRows(csv_import::SetImportedRowsRequest request) override {
-    co_await Delay(std::chrono::milliseconds(1));
-    if (manager_.ListPlugins().empty() || manager_.ListExtensions(Importers).empty()) {
-      throw Error(ErrorCode::PluginFailed, "The host callback could not read the plugin catalog");
-    }
-    if (request.rows == UINT32_MAX) co_await manager_.SetEnabled("example.csv-faults", false);
-    co_return co_await status_->SetImportedRows(request);
-  }
-
-private:
   PluginManager& manager_;
-  std::shared_ptr<PreviewImportStatus> status_;
+  const std::thread::id owner_ = std::this_thread::get_id();
 };
 
 class PreviewProgress final : public csv_import::ImportProgress {
@@ -151,7 +154,8 @@ std::string ReadCsv(const File& path) {
     if (!read.Succeeded()) throw Error(ErrorCode::Io, "Cannot read the CSV file");
     const auto count = read.Value();
     if (!count) break;
-    if (count > MaxPayload - contents.size()) throw Error(ErrorCode::PayloadTooLarge, "CSV input exceeds the payload limit");
+    constexpr std::size_t max_csv = 32 * 1024 * 1024;
+    if (count > max_csv - contents.size()) throw Error(ErrorCode::PayloadTooLarge, "CSV input exceeds the example limit");
     contents.append(reinterpret_cast<const char*>(buffer.data()), count);
   }
   return contents;
@@ -167,6 +171,7 @@ Json List(PluginManager& manager) {
   for (const auto& plugin : manager.ListPlugins()) {
     auto record = Describe(plugin.package);
     record["enabled"] = plugin.enabled;
+    record["mode"] = plugin.mode == ExecutionMode::InProcess ? "in_process" : "worker_process";
     record["worker_pid"] = plugin.worker_pid ? Json(*plugin.worker_pid) : Json(nullptr);
     plugins.push_back(std::move(record));
   }
@@ -204,11 +209,11 @@ Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) 
     timeout = std::chrono::milliseconds(milliseconds);
   }
   auto source = co_await huxerui::RunWorker(ReadCsv, path);
-  auto importer = co_await manager.CreateExtension(Importers, *selected);
+  auto importer = manager.CreateExtension(Importers, *selected, timeout);
   auto progress = std::make_shared<PreviewProgress>();
-  const csv_import::ImportRequest request{std::move(source)};
-  auto imported = co_await importer.Import(request, progress, timeout);
-  co_await importer.Close();
+  const auto delimiter = importer->Delimiter();
+  const auto plugin_pid = importer->ProcessId();
+  auto imported = co_await importer->Import({std::move(source)}, progress);
 
   auto issues = Json::array();
   for (const auto& issue : imported.issues) {
@@ -216,7 +221,8 @@ Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) 
   }
   Json table = nullptr;
   if (imported.table) table = {{"header", imported.table->header}, {"rows", imported.table->rows}};
-  co_return Json{{"table", std::move(table)}, {"issues", std::move(issues)},
+  co_return Json{{"table", std::move(table)}, {"issues", std::move(issues)}, {"delimiter", delimiter},
+          {"plugin_pid", plugin_pid},
           {"progress_rows", progress->rows ? Json(*progress->rows) : Json(nullptr)}};
 }
 
@@ -224,30 +230,31 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
   for (const auto& extension : manager.ListExtensions(Importers)) {
     if (extension.id.plugin != plugin) continue;
     const auto tasks = UseApplicationTaskScope();
-    auto importer = co_await manager.CreateExtension(Importers, extension.id);
+    auto importer = manager.CreateExtension(Importers, extension.id);
     auto first = std::make_shared<PreviewProgress>();
     auto second = std::make_shared<PreviewProgress>();
     const csv_import::ImportRequest remember{"remember"};
     const csv_import::ImportRequest stale{"stale"};
-    (void)co_await importer.Import(remember, first);
+    (void)co_await importer->Import(remember, first);
     try {
-      (void)co_await importer.Import(stale, second);
+      (void)co_await importer->Import(stale, second);
       throw Error(ErrorCode::PluginFailed, "An expired receiver was accepted");
     } catch (const Error& error) {
       if (error.Code() != ErrorCode::ReceiverClosed) throw;
     }
     auto held = std::make_shared<ProgressGate>();
     auto running = std::make_shared<ImportOutcome>();
-    (void)tasks.Launch(ObserveImport(importer.Import(remember, std::make_shared<HeldProgress>(held)), running));
+    (void)tasks.Launch(ObserveImport(importer->Import(remember, std::make_shared<HeldProgress>(held)), running));
     co_await WaitFor([held] { return held->started; });
     // The receiver is still suspended when this independent task reads the catalog.
     auto catalog_during_callback = List(manager);
     auto queued = std::make_shared<ImportOutcome>();
-    const auto queued_task = tasks.Launch(ObserveImport(importer.Import(remember, second), queued));
+    const auto queued_task = tasks.Launch(ObserveImport(importer->Import(remember, second), queued));
     co_await Delay(std::chrono::milliseconds(20));
     queued_task.Cancel();
     try {
-      (void)co_await importer.Import(remember, second, std::chrono::milliseconds(30));
+      auto short_call = manager.CreateExtension(Importers, extension.id, std::chrono::milliseconds(30));
+      (void)co_await short_call->Import(remember, second);
       throw Error(ErrorCode::PluginFailed, "A queued invocation exceeded its deadline without failing");
     } catch (const Error& error) {
       if (error.Code() != ErrorCode::DeadlineExceeded) throw;
@@ -258,9 +265,10 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     if (queued->done) throw Error(ErrorCode::PluginFailed, "A cancelled queued task resumed");
 
     // A lazy call retains its arguments, while closing the instance revokes its call target.
-    auto unused = co_await manager.CreateExtension(Importers, extension.id);
-    auto pending = unused.Import(remember, second);
-    co_await unused.Close();
+    auto pending = [&] {
+      auto unused = manager.CreateExtension(Importers, extension.id);
+      return unused->Import(remember, second);
+    }();
     try {
       (void)co_await std::move(pending);
       throw Error(ErrorCode::PluginFailed, "A closed instance ran a pending task");
@@ -271,18 +279,18 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     auto receiver = std::make_shared<HeldProgress>(cancelled);
     std::weak_ptr<HeldProgress> receiver_lifetime = receiver;
     auto outcome = std::make_shared<ImportOutcome>();
-    const auto task = tasks.Launch(ObserveImport(importer.Import(remember, std::move(receiver)), outcome));
+    const auto task = tasks.Launch(ObserveImport(importer->Import(remember, std::move(receiver)), outcome));
     co_await WaitFor([cancelled] { return cancelled->started; });
     task.Cancel();
     co_await WaitFor([&] { return cancelled->cancelled && receiver_lifetime.expired(); });
     cancelled->complete->Complete(9);
     if (outcome->done) throw Error(ErrorCode::PluginFailed, "A cancelled invocation resumed");
 
-    auto restarted = co_await manager.CreateExtension(Importers, extension.id);
+    auto restarted = manager.CreateExtension(Importers, extension.id, DefaultTimeout * 2);
     auto disabled = std::make_shared<ProgressGate>();
     auto interrupted = std::make_shared<ImportOutcome>();
     (void)tasks.Launch(ObserveImport(
-        restarted.Import(remember, std::make_shared<HeldProgress>(disabled), DefaultTimeout * 2), interrupted));
+        restarted->Import(remember, std::make_shared<HeldProgress>(disabled)), interrupted));
     co_await WaitFor([disabled] { return disabled->started; });
     co_await manager.SetEnabled(plugin, false);
     co_await WaitFor([&] { return interrupted->done && disabled->cancelled; });
@@ -306,24 +314,35 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
 Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool disable) {
   for (const auto& extension : manager.ListExtensions(Importers)) {
     if (extension.id.plugin != plugin) continue;
-    auto first = co_await manager.CreateExtension(Importers, extension.id);
-    auto second = co_await manager.CreateExtension(Importers, extension.id);
+    auto second = manager.CreateExtension(Importers, extension.id);
     const auto context = [](auto& importer) -> Task<std::vector<std::string>> {
       const csv_import::ImportRequest request{"context"};
-      auto result = co_await importer.Import(request, std::make_shared<PreviewProgress>());
+      auto result = co_await importer->Import(request, std::make_shared<PreviewProgress>());
       if (!result.table || result.table->rows.size() != 1) {
         throw Error(ErrorCode::PluginFailed, "Expected the fixture's plugin context");
       }
       co_return std::move(result.table->rows.front());
     };
-    auto first_context = co_await context(first);
-    auto second_context = co_await context(second);
-    co_await first.Close();
+    std::vector<std::string> first_context;
+    std::vector<std::string> second_context;
+    {
+      auto first = manager.CreateExtension(Importers, extension.id);
+      (void)first->Delimiter();
+      (void)second->Delimiter();
+      first_context = co_await context(first);
+      second_context = co_await context(second);
+    }
+    // Remote release is asynchronous. Query the surviving instance until it observes the destructor.
     auto remaining_context = co_await context(second);
+    const auto deadline = std::chrono::steady_clock::now() + DefaultTimeout;
+    while (remaining_context.back() != "1" && std::chrono::steady_clock::now() < deadline) {
+      co_await Delay(std::chrono::milliseconds(1));
+      remaining_context = co_await context(second);
+    }
     if (disable) {
       // Leave the second instance alive so shutdown has to destroy it before calling Deactivate.
       const csv_import::ImportRequest request{"context"};
-      auto pending = second.Import(request, std::make_shared<PreviewProgress>());
+      auto pending = second->Import(request, std::make_shared<PreviewProgress>());
       co_await manager.SetEnabled(plugin, false);
       try {
         (void)co_await std::move(pending);
@@ -338,15 +357,76 @@ Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool d
   throw Error(ErrorCode::NotFound, "The context test plugin is unavailable");
 }
 
+Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
+  const auto tasks = UseApplicationTaskScope();
+  auto manager = std::make_shared<PluginManager>(profile, std::nullopt, tasks);
+  manager->RegisterExtensionPoint(Importers);
+  const auto info = PluginManager::InspectPackage(package);
+  try {
+    manager->InstallPackage(package, info.digest);
+    throw Error(ErrorCode::PluginFailed, "The in-process-only host installed a worker package");
+  } catch (const Error& error) {
+    if (error.Code() != ErrorCode::UnsupportedMode) throw;
+  }
+  manager->InstallPackage(package, info.digest, {.mode = ExecutionMode::InProcess, .services = {}});
+
+  const ExtensionId id{info.id, info.contribution};
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    struct Outcome {
+      std::optional<ExtensionHandle<csv_import::TableImporter>> handle;
+      std::exception_ptr error;
+      bool created = false;
+      bool disabled = false;
+    };
+    const auto outcome = std::make_shared<Outcome>();
+    (void)tasks.Launch([manager, outcome, id]() -> Task<void> {
+      try {
+        co_await manager->SetEnabled(id.plugin, false);
+      } catch (...) {
+        outcome->error = std::current_exception();
+      }
+      outcome->disabled = true;
+    });
+    // The second post lets the disable Task start before this call tries to create the first handle.
+    tasks.Post([tasks, manager, outcome, id] {
+      tasks.Post([manager, outcome, id] {
+        try {
+          outcome->handle.emplace(manager->CreateExtension(Importers, id));
+        } catch (const Error& error) {
+          if (error.Code() != ErrorCode::Disabled) outcome->error = std::current_exception();
+        } catch (...) {
+          outcome->error = std::current_exception();
+        }
+        outcome->created = true;
+      });
+    });
+    co_await WaitFor([outcome] { return outcome->disabled && outcome->created; });
+    if (outcome->error) std::rethrow_exception(outcome->error);
+    if (!manager->ListExtensions(Importers).empty()) {
+      throw Error(ErrorCode::PluginFailed, "The disabled CSV plugin is still listed");
+    }
+    if (outcome->handle) {
+      try {
+        (void)(*outcome->handle)->Delimiter();
+        throw Error(ErrorCode::PluginFailed, "A handle created during disable can still call the CSV plugin");
+      } catch (const Error& error) {
+        if (error.Code() != ErrorCode::Closed) throw;
+      }
+    }
+    co_await manager->SetEnabled(id.plugin, true);
+  }
+  auto importer = manager->CreateExtension(Importers, id);
+  const auto delimiter = importer->Delimiter();
+  co_await manager->Shutdown();
+  co_return Json{{"delimiter", delimiter}};
+}
+
 Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportStatus>& status,
              const std::vector<std::string>& args) {
   const auto& name = args.front();
-  if (name == "provide-status" && args.size() == 2) {
-    manager.ProvideService<csv_import::ImportStatus>(status, args[1]);
-    co_return Json::object();
-  }
-  if (name == "provide-reentry-status" && args.size() == 2) {
-    manager.ProvideService<csv_import::ImportStatus>(std::make_shared<ReentryStatus>(manager, status), args[1]);
+  if (name == "pid" && args.size() == 1) co_return Json{{"pid", ProcessId()}};
+  if (name == "reset-status" && args.size() == 1) {
+    status->rows.reset();
     co_return Json::object();
   }
   if (name == "check-receiver-lifetime" && args.size() == 2) co_return co_await CheckReceiverLifetime(manager, args[1]);
@@ -357,8 +437,12 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
     co_return Json{{"last_imported_rows", status->rows ? Json(*status->rows) : Json(nullptr)}};
   }
   if (name == "inspect" && args.size() == 2) co_return Describe(PluginManager::InspectPackage(File(args[1])));
-  if (name == "install" && args.size() == 3) {
-    manager.InstallPackage(File(args[1]), args[2]);
+  if (name == "install" && (args.size() == 4 || (args.size() == 5 && args[4] == "status"))) {
+    InstallOptions options;
+    if (args[3] == "in_process") options.mode = ExecutionMode::InProcess;
+    else if (args[3] != "worker_process") throw Error(ErrorCode::InvalidArgument, "Invalid execution mode");
+    if (args.size() == 5) options.services.emplace_back(Contract<csv_import::ImportStatus>::Info.id);
+    manager.InstallPackage(File(args[1]), args[2], std::move(options));
     co_return Json::object();
   }
   if ((name == "enable" || name == "disable") && args.size() == 2) {
@@ -400,14 +484,27 @@ std::vector<std::string> Split(const std::string& line) {
 Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtime, int& exit_code) {
   try {
     const auto profile = args.empty() ? csv_import::preview::DefaultProfile() : args.front();
+    if (args.size() == 3 && args[1] == "check-disable-during-create") {
+      auto response = co_await CheckDisableDuringCreate(File(profile.u8string()), File(args[2].u8string()));
+      response["ok"] = true;
+      Print(response);
+      runtime.RequestShutdown();
+      co_return;
+    }
     PluginManager manager(File(profile.u8string()), File(csv_import::preview::WorkerPath().u8string()),
                           UseApplicationTaskScope());
-    auto status = std::make_shared<PreviewImportStatus>();
+    auto status = std::make_shared<PreviewImportStatus>(manager);
+    manager.ProvideService<csv_import::ImportStatus>(status);
     manager.RegisterExtensionPoint(Importers);
     if (args.size() > 1) {
-      std::vector<std::string> command;
-      for (const auto& arg : args.subspan(1)) command.push_back(Utf8(arg));
-      co_await Report(manager, status, command);
+      try {
+        std::vector<std::string> command;
+        for (const auto& arg : args.subspan(1)) command.push_back(Utf8(arg));
+        co_await Report(manager, status, command);
+      } catch (const std::exception& error) {
+        PrintError(error);
+        exit_code = 1;
+      }
     } else {
       if (args.empty()) std::cerr << "Enter one command per line.\n" << CommandHelp << '\n';
       for (;;) {

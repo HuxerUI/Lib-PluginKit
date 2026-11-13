@@ -13,7 +13,7 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
 
-set(kit_sources src/manager.cpp src/worker_request.cpp)
+set(kit_sources src/manager.cpp src/extension.cpp src/worker_request.cpp)
 set(kit_private_includes "${CMAKE_CURRENT_SOURCE_DIR}/src")
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     if (WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -64,20 +64,23 @@ target_include_directories(huxerui_pluginkit PRIVATE ${kit_private_includes} PUB
     "$<INSTALL_INTERFACE:include>"
 )
 target_compile_features(huxerui_pluginkit PUBLIC cxx_std_20)
-_huxerui_select_framework_target(kit_framework)
-target_link_libraries(huxerui_pluginkit
-    PUBLIC ${kit_framework}
-    PRIVATE nlohmann_json::nlohmann_json ${sha256_library}
-)
-set(kit_framework_includes "$<TARGET_PROPERTY:${kit_framework},INTERFACE_INCLUDE_DIRECTORIES>")
-
 if (NOT TARGET HuxerUI::huxerui)
     find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared HINTS "${HUXERUI_HOME}")
 endif ()
+target_link_libraries(huxerui_pluginkit PUBLIC HuxerUI::huxerui PRIVATE nlohmann_json::nlohmann_json ${sha256_library})
+set(kit_framework_includes "$<TARGET_PROPERTY:HuxerUI::huxerui,INTERFACE_INCLUDE_DIRECTORIES>")
 get_target_property(worker_framework_type HuxerUI::huxerui TYPE)
 if (NOT worker_framework_type STREQUAL "SHARED_LIBRARY")
     message(FATAL_ERROR "PluginKit workers and plugins require the shared HuxerUI SDK")
 endif ()
+add_executable(hpk-abi-stamp src/abi_stamp.cpp)
+target_compile_features(hpk-abi-stamp PRIVATE cxx_std_20)
+target_include_directories(hpk-abi-stamp PRIVATE include)
+target_link_libraries(hpk-abi-stamp PRIVATE HuxerUI::huxerui)
+foreach (target IN ITEMS huxerui_pluginkit hpk-abi-stamp)
+    target_compile_definitions(${target} PRIVATE
+        "HPK_SDK_ABI=\"$<IF:$<CONFIG:Debug>,debug,release>-${HuxerUI_VERSION}\"")
+endforeach ()
 add_executable(hpk-worker tools/worker_main.cpp)
 target_include_directories(hpk-worker PRIVATE include ${kit_private_includes} "${kit_framework_includes}")
 target_compile_features(hpk-worker PRIVATE cxx_std_20)
@@ -98,7 +101,7 @@ else ()
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
         set(kit_compile_definitions _GNU_SOURCE)
     endif ()
-    target_link_libraries(huxerui_pluginkit PRIVATE Threads::Threads)
+    target_link_libraries(huxerui_pluginkit PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
     target_link_libraries(hpk-worker PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 endif ()
 

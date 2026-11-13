@@ -17,13 +17,17 @@ struct SetImportedRowsRequest {
 };
 
 /// @brief Host-owned import status exposed to approved CSV plugins.
-class ImportStatus {
+class HPK_REMOTE ImportStatus {
 public:
   virtual ~ImportStatus() = default;
 
+  /// @brief Reads the current count from a synchronous in-process invocation.
+  /// @return Last recorded row count. The preview returns zero before recording a count.
+  virtual std::uint32_t ImportedRows() const = 0;
+
   /// @brief Updates the number of rows recorded by the host.
   /// @param request Row count to record.
-  /// @return Task yielding true if the host applied the update.
+  /// @return Lazy Task yielding true if the host applied the update.
   virtual huxerui::Task<bool> SetImportedRows(SetImportedRowsRequest request) = 0;
 };
 

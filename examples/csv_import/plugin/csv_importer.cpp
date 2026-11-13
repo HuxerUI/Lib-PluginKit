@@ -1,7 +1,6 @@
 #include "csv_contract.bindings.h"
-#include "services/import_status.bindings.h"
-
-#include <huxerui/pluginkit/plugin.h>
+#include "csv_sdk.h"
+#include "process_id.h"
 
 namespace csv_import {
 namespace {
@@ -14,6 +13,9 @@ class CsvImporter final : public TableImporter {
 public:
   explicit CsvImporter(const huxerui::pluginkit::PluginContext& context) : context_(context) {}
 
+  std::string Delimiter() const override { return ","; }
+  std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
+
   huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) override {
     co_await huxerui::Delay(std::chrono::milliseconds(1));
     const auto manifest = co_await context_.BundleDirectory().Child("plugin.json").ReadStringAsync();
@@ -23,8 +25,8 @@ public:
     auto result = Parse(request);
     if (result.table) {
       const auto rows = static_cast<std::uint32_t>(result.table->rows.size());
-      co_await receiver.OnRows({rows});
-      if (!co_await huxerui::pluginkit::GetService<ImportStatus>().SetImportedRows({rows})) {
+      if (receiver) co_await receiver->OnRows({rows});
+      if (!co_await SetImportedRows(rows)) {
         throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::PluginFailed, "The host declined the imported row count");
       }
     }

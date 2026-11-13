@@ -10,18 +10,6 @@ namespace {
 // Callbacks for different workers can interleave on the application thread while awaiting child tasks.
 thread_local std::vector<TaskExecution> active_callbacks;
 
-struct ServiceScope {
-  explicit ServiceScope(TaskExecution execution) : execution(std::move(execution)) {
-    active_callbacks.push_back(this->execution);
-  }
-  ~ServiceScope() {
-    std::erase_if(active_callbacks, [&](const auto& active) {
-      return !active.owner_before(execution) && !execution.owner_before(active);
-    });
-  }
-  TaskExecution execution;
-};
-
 template<class Release>
 struct RequestSlot {
   Release release;
@@ -43,7 +31,7 @@ Task<void> ExecuteCallback(std::shared_ptr<CallbackReply> reply, ServiceDispatch
   std::exception_ptr error;
   try {
     {
-      ServiceScope scope(co_await CurrentTaskExecution{});
+      CallbackScope scope(co_await CurrentTaskExecution{});
       bytes.emplace(co_await dispatch(operation, std::move(request)));
     }
   } catch (...) {
@@ -83,21 +71,19 @@ Bytes RunHostCallback(const TaskScope& tasks, ServiceDispatch dispatch, std::uin
   return std::move(*reply->bytes);
 }
 
-void CloseRemote(const std::shared_ptr<Worker>& worker, std::uint32_t instance) {
-  if (!worker || !worker->Pid()) return;
-  try {
-    worker->Request({static_cast<std::uint32_t>(Command::Close), instance, 0, {}}, DefaultTimeout);
-  } catch (const Error& error) {
-    if (error.Code() == ErrorCode::Closed) return;
-    worker->Stop();
-    throw;
-  } catch (...) {
-    worker->Stop();
-    throw;
-  }
+} // namespace
+
+CallbackScope::CallbackScope(TaskExecution execution) : execution_(std::move(execution)) {
+  active_callbacks.push_back(execution_);
 }
 
-} // namespace
+CallbackScope::~CallbackScope() {
+  const auto same = [&](const auto& active) {
+    return !active.owner_before(execution_) && !execution_.owner_before(active);
+  };
+  const auto match = std::find_if(active_callbacks.rbegin(), active_callbacks.rend(), same);
+  if (match != active_callbacks.rend()) active_callbacks.erase(std::next(match).base());
+}
 
 void RejectServiceReentry() {
   // Guard synchronous management operations conservatively because they have no task identity to compare.
@@ -105,9 +91,21 @@ void RejectServiceReentry() {
 }
 
 void RejectServiceReentry(const TaskExecution& execution) {
-  if (std::ranges::any_of(active_callbacks, [&](const auto& active) { return SameExecution(active, execution); })) {
+  if (std::ranges::any_of(active_callbacks, [&](const auto& active) {
+        return SameExecution(active, execution) || !HasExecutionOwner(active);
+      })) {
     throw Error(ErrorCode::ReentrantCall, "A host callback cannot reenter PluginKit");
   }
+}
+
+Frame Worker::RejectSynchronousCallback(const Frame& frame) {
+  auto reply = ErrorReply(Error(ErrorCode::CallbackUnavailable, "A synchronous call cannot use host callbacks"));
+  reply.kind = FrameKind::ServiceReply;
+  reply.call = frame.call;
+  reply.callback = frame.callback;
+  reply.instance = frame.instance;
+  reply.receiver = frame.receiver;
+  return reply;
 }
 
 void Worker::CheckExchange(Deadline deadline, std::stop_token stop) {
@@ -156,26 +154,27 @@ Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_t
 }
 
 Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver,
-                      std::stop_token stop, std::stop_token lifetime) {
-  RejectServiceReentry();
+                      std::stop_token stop, bool wait_for_slot) {
   if (timeout <= std::chrono::milliseconds::zero() || timeout > std::chrono::hours(24)) {
     throw Error(ErrorCode::InvalidArgument, "Worker timeout must be between 1 ms and 24 hours");
   }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   const bool shutdown = request.code == static_cast<std::uint32_t>(Command::Shutdown);
-  std::stop_source cancellation;
-  std::stop_callback cancel_call(stop, [&] { cancellation.request_stop(); });
-  std::stop_callback cancel_lifetime(lifetime, [&] { cancellation.request_stop(); });
   {
     std::unique_lock lock(requests_);
-    request_ready_.wait_until(lock, cancellation.get_token(), deadline, [&] {
+    if (!wait_for_slot && request_active_ && request_maintenance_) {
+      request_ready_.wait_until(lock, deadline, [&] { return !request_active_ || !request_maintenance_ || !active_; });
+    }
+    if (!wait_for_slot && request_active_) throw Error(ErrorCode::Busy, "The worker has an active invocation");
+    request_ready_.wait_until(lock, stop, deadline, [&] {
       return !request_active_ || !active_ || (shutting_down_ && !shutdown);
     });
     // A queued cancellation releases only this call; the active exchange keeps its worker.
-    if (cancellation.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
+    if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
     if (std::chrono::steady_clock::now() >= deadline) throw Error(ErrorCode::DeadlineExceeded, "The request expired in the worker queue");
     if (!active_ || (shutting_down_ && !shutdown)) throw Error(ErrorCode::Closed, "The plugin generation is closed");
     request_active_ = true;
+    request_maintenance_ = request.code == static_cast<std::uint32_t>(Command::Close) || shutdown;
   }
   RequestSlot slot{[this] {
     std::lock_guard lock(requests_);
@@ -189,9 +188,11 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
   }
 
   Frame reply{};
+  const bool create = request.code == static_cast<std::uint32_t>(Command::Create);
+  if (create && !created_) request.payload = startup_.Encode();
   try {
     // A caller cancellation retires an active exchange. External worker shutdown also wakes any callback wait.
-    std::stop_callback interrupt(cancellation.get_token(), [this] {
+    std::stop_callback interrupt(stop, [this] {
       try {
         PostTransportCancellation([worker = weak_from_this()] {
           if (const auto active = worker.lock()) active->Stop();
@@ -200,7 +201,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
         Stop();
       }
     });
-    CheckExchange(deadline, cancellation.get_token());
+    CheckExchange(deadline, stop);
     CheckExchange(deadline, generation_stop_.get_token());
     if (next_call_ == (std::numeric_limits<std::uint32_t>::max)()) {
       throw Error(ErrorCode::Closed, "The worker has exhausted its invocation IDs");
@@ -213,7 +214,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     // Retire a failed exchange so a late reply cannot be read as the next request's response.
     const bool closed = !active_;
     Stop();
-    if (cancellation.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
+    if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
     if (closed && error.Code() != ErrorCode::DeadlineExceeded) {
       throw Error(ErrorCode::Closed, "The plugin generation is closed");
     }
@@ -222,7 +223,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     Stop();
     throw;
   }
-  if (cancellation.stop_requested()) {
+  if (stop.stop_requested()) {
     Stop();
     throw Error(ErrorCode::Cancelled, "The call was cancelled");
   }
@@ -231,14 +232,17 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     throw Error(ErrorCode::Closed, "The plugin generation is closing");
   }
 
-  if (reply.kind == FrameKind::Reply && reply.call == request.call && !reply.callback && !reply.operation && !reply.receiver) {
+  if (reply.kind == FrameKind::Reply && reply.call == request.call && !reply.callback && !reply.operation &&
+      !reply.receiver && !reply.synchronous) {
     if (reply.code == 0) {
       if (shutdown ? reply.instance == 0 && reply.payload.empty()
                    : reply.instance != 0 && (request.instance == 0 || request.instance == reply.instance)) {
+        if (create) created_ = true;
         return reply;
       }
     } else if (IsErrorCode(reply.code) && reply.instance == 0 &&
                IsUtf8(AsText(reply.payload))) {
+      if (create && !created_) Stop();
       throw Error(static_cast<ErrorCode>(reply.code), std::string(AsText(reply.payload)));
     }
   }
@@ -267,73 +271,6 @@ void Worker::Shutdown(std::chrono::milliseconds timeout) noexcept {
     }
     Stop();
   });
-}
-
-ExtensionInstance::ExtensionInstance(std::shared_ptr<Worker> worker, std::uint32_t instance, std::stop_source lifetime)
-    : worker_(std::move(worker)), instance_(instance), lifetime_(std::move(lifetime)) {}
-
-ExtensionInstance::ExtensionInstance(ExtensionInstance&& other) noexcept
-    : worker_(std::move(other.worker_)), instance_(std::exchange(other.instance_, 0)),
-      lifetime_(std::move(other.lifetime_)) {}
-
-ExtensionInstance& ExtensionInstance::operator=(ExtensionInstance&& other) noexcept {
-  if (this != &other) {
-    Release();
-    worker_ = std::move(other.worker_);
-    instance_ = std::exchange(other.instance_, 0);
-    lifetime_ = std::move(other.lifetime_);
-  }
-  return *this;
-}
-
-ExtensionInstance::~ExtensionInstance() { Release(); }
-
-ExtensionCall ExtensionInstance::Call() const {
-  if (!worker_) throw Error(ErrorCode::Closed, "The extension instance is closed");
-  return ExtensionCall(worker_, instance_, lifetime_.get_token());
-}
-
-Task<Bytes> ExtensionCall::Invoke(std::uint32_t operation, Bytes request, std::chrono::milliseconds timeout,
-                                 std::optional<ReceiverRegistration> receiver) const {
-  RejectServiceReentry(co_await CurrentTaskExecution{});
-  if (lifetime_.stop_requested()) throw Error(ErrorCode::Closed, "The extension instance is closed");
-  if (request.size() > MaxPayload) throw Error(ErrorCode::PayloadTooLarge, "Request exceeds the byte limit");
-  auto work = [worker = worker_, instance = instance_, lifetime = lifetime_, operation,
-               request = std::move(request), timeout, receiver = std::move(receiver)](std::stop_token stop) mutable {
-    return worker->Request({static_cast<std::uint32_t>(Command::Invoke), instance, operation, std::move(request)},
-                           timeout, receiver ? &*receiver : nullptr, stop, lifetime).payload;
-  };
-  co_return co_await RunTransport(std::move(work));
-}
-
-Task<void> ExtensionInstance::Close() {
-  RejectServiceReentry(co_await CurrentTaskExecution{});
-  auto worker = std::exchange(worker_, {});
-  const auto instance = std::exchange(instance_, 0);
-  auto lifetime = std::exchange(lifetime_, std::stop_source(std::nostopstate));
-  auto work = [worker = std::move(worker), instance, lifetime](std::stop_token) mutable {
-    lifetime.request_stop();
-    CloseRemote(worker, instance);
-  };
-  co_await RunTransport(std::move(work));
-}
-
-void ExtensionInstance::Release() noexcept {
-  if (!worker_) return;
-  auto worker = std::exchange(worker_, {});
-  const auto instance = std::exchange(instance_, 0);
-  auto lifetime = std::exchange(lifetime_, std::stop_source(std::nostopstate));
-  try {
-    std::thread([worker, instance, lifetime]() mutable {
-      lifetime.request_stop();
-      try {
-        CloseRemote(worker, instance);
-      } catch (...) {
-      }
-    }).detach();
-  } catch (...) {
-    worker->Stop();
-  }
 }
 
 } // namespace huxerui::pluginkit::detail

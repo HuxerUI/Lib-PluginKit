@@ -24,15 +24,17 @@ public:
   };
 
   Worker(const std::filesystem::path& executable, const std::filesystem::path& module_path,
-         const Handle& verified_module, ContractInfo contract, std::vector<Service> services, TaskScope callbacks);
+         const Handle& verified_module, ContractInfo contract, std::vector<Service> services, TaskScope callbacks,
+         PluginStartup startup);
   ~Worker();
 
   std::optional<std::uint32_t> Pid() const noexcept;
   Frame Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver = nullptr,
-                std::stop_token stop = {}, std::stop_token lifetime = {});
+                std::stop_token stop = {}, bool wait_for_slot = true);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
   void BeginShutdown() noexcept;
   void Stop() noexcept;
+  bool Available() const noexcept { return active_ && !shutting_down_; }
 
 private:
   Frame Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
@@ -50,11 +52,13 @@ private:
       if (frame.kind == FrameKind::Reply) return frame;
       if (frame.kind != FrameKind::ServiceCall || request.code != static_cast<std::uint32_t>(Command::Invoke) ||
           frame.call != request.call || !frame.callback || frame.callback != ++callback ||
-          frame.instance != request.instance || !frame.operation || frame.code) {
+          frame.instance != request.instance || !frame.operation || frame.code || frame.synchronous) {
         throw Error(ErrorCode::Protocol, "Invalid host service request");
       }
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
-      auto reply = DispatchService(frame, deadline, stop, receiver);
+      auto reply = request.synchronous
+          ? RejectSynchronousCallback(frame)
+          : DispatchService(frame, deadline, stop, receiver);
       CheckExchange(deadline, stop);
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
       frame = transact(reply);
@@ -62,15 +66,19 @@ private:
   }
 
   static void CheckExchange(Deadline deadline, std::stop_token stop);
+  static Frame RejectSynchronousCallback(const Frame& frame);
 
   const std::vector<Service> services_;
   const TaskScope callbacks_;
+  const PluginStartup startup_;
+  bool created_ = false;
   std::uint32_t next_call_ = 0;
   std::atomic_bool active_{true};
   std::mutex requests_;
   std::condition_variable_any request_ready_;
   bool request_active_ = false;
-  bool shutting_down_ = false;
+  bool request_maintenance_ = false;
+  std::atomic_bool shutting_down_{false};
   std::once_flag shutdown_;
   std::mutex stop_;
   std::stop_source generation_stop_;

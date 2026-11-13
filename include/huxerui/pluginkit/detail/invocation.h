@@ -7,6 +7,9 @@
 #include <huxerui/pluginkit/detail/wire.h>
 
 #include <memory>
+#include <optional>
+#include <stop_token>
+#include <vector>
 
 namespace huxerui::pluginkit {
 
@@ -28,6 +31,7 @@ struct CurrentTaskExecution {
 
 using TaskExecution = std::weak_ptr<huxerui::detail::TaskExecution>;
 
+/// @brief Worker callback table and identity of the invocation allowed to use it.
 struct HostInvocation {
   const hpk_host_v1* host = nullptr;
   std::uint64_t id = 0;
@@ -38,32 +42,23 @@ inline bool SameExecution(const TaskExecution& left, const TaskExecution& right)
   return !left.expired() && !left.owner_before(right) && !right.owner_before(left);
 }
 
-inline thread_local const HostInvocation* current_invocation = nullptr;
+inline bool HasExecutionOwner(const TaskExecution& execution) noexcept {
+  const TaskExecution empty;
+  return execution.owner_before(empty) || empty.owner_before(execution);
+}
 
-class InvocationScope {
-public:
-  explicit InvocationScope(const HostInvocation& call) noexcept
-      : previous_(std::exchange(current_invocation, &call)) {}
-  ~InvocationScope() { current_invocation = previous_; }
-
-private:
-  const HostInvocation* previous_;
-};
-
-struct DispatchContext {
-  HostInvocation invocation{};
-  std::uint32_t receiver = 0;
-};
-
+/// @brief Worker-side endpoint for an authorized service or an invocation-scoped receiver.
 class HostEndpoint {
 public:
+  /// @brief Binds to the worker invocation and the selected callback target.
+  /// @param invocation Worker invocation that owns the endpoint.
+  /// @param receiver Slot passed to plugin dispatch, or zero to look up a service by contract.
   explicit HostEndpoint(HostInvocation invocation, std::uint32_t receiver = 0)
       : invocation_(invocation), receiver_(receiver) {}
 
   void Start(ContractInfo service, std::uint32_t operation, std::span<const std::byte> request,
              const TaskExecution& execution, CallbackCompletion<Bytes> complete) const {
-    if (!invocation_.host || !current_invocation || current_invocation->id != invocation_.id ||
-        current_invocation->host != invocation_.host || !SameExecution(execution, invocation_.execution)) {
+    if (!invocation_.host || !SameExecution(execution, invocation_.execution)) {
       const auto code = receiver_ ? ErrorCode::ReceiverClosed : ErrorCode::ServiceUnavailable;
       throw Error(code, "The proxy is outside its owning invocation");
     }
@@ -80,23 +75,24 @@ public:
   }
 
 private:
+  static Bytes ReadReply(std::uint32_t status, hpk_buffer_v1 buffer) {
+    if (buffer.size > MaxPayload || (buffer.size && !buffer.data)) {
+      throw Error(ErrorCode::Protocol, "The host returned an invalid buffer");
+    }
+    if (status) {
+      const auto message = buffer.size ? std::string(reinterpret_cast<const char*>(buffer.data), buffer.size)
+                                       : std::string("Host callback failed");
+      throw Error(static_cast<ErrorCode>(status), message);
+    }
+    if (!buffer.size) return {};
+    const auto view = std::as_bytes(std::span(buffer.data, buffer.size));
+    return Bytes(view.begin(), view.end());
+  }
+
   static void HPK_CALL Complete(void* user, std::uint32_t status, hpk_buffer_v1 buffer) noexcept {
     const std::unique_ptr<CallbackCompletion<Bytes>> completion(static_cast<CallbackCompletion<Bytes>*>(user));
     try {
-      if (buffer.size > MaxPayload || (buffer.size && !buffer.data)) {
-        throw Error(ErrorCode::Protocol, "The host returned an invalid buffer");
-      }
-      if (status) {
-        const auto message = buffer.size ? std::string(reinterpret_cast<const char*>(buffer.data), buffer.size)
-                                         : std::string("Host callback failed");
-        throw Error(static_cast<ErrorCode>(status), message);
-      }
-      Bytes bytes;
-      if (buffer.size) {
-        const auto view = std::as_bytes(std::span(buffer.data, buffer.size));
-        bytes.assign(view.begin(), view.end());
-      }
-      completion->Complete(std::move(bytes));
+      completion->Complete(ReadReply(status, buffer));
     } catch (...) {
       completion->Fail(std::current_exception());
     }
@@ -105,6 +101,68 @@ private:
   HostInvocation invocation_;
   std::uint32_t receiver_;
 };
+
+/// @brief Worker invocation information needed by generated dispatch to bind a receiver.
+/// Service and receiver dispatch on the host use an empty context.
+struct DispatchContext {
+  /// Worker callback table and identity, borrowed for the duration of the invocation.
+  HostInvocation invocation{};
+  /// Invocation's receiver slot, or zero if the caller supplied no receiver.
+  std::uint32_t receiver = 0;
+};
+
+// The plugin owns its thread-local storage even when it is loaded into the host process.
+struct Invocation {
+  TaskExecution execution;
+  std::optional<HostEndpoint> worker;
+  void* services = nullptr;
+  std::shared_ptr<void> (*find_service)(void*, ContractInfo) = nullptr;
+  std::stop_token stop;
+};
+
+inline thread_local const Invocation* synchronous_invocation = nullptr;
+inline thread_local std::vector<const Invocation*> task_invocations;
+
+// Registrations can overlap while Tasks suspend. Resolve by execution identity and remove the exact entry.
+class InvocationScope {
+public:
+  explicit InvocationScope(const Invocation& call) : call_(&call) { task_invocations.push_back(call_); }
+  ~InvocationScope() { std::erase(task_invocations, call_); }
+  InvocationScope(const InvocationScope&) = delete;
+  InvocationScope& operator=(const InvocationScope&) = delete;
+
+private:
+  const Invocation* call_;
+};
+
+// Synchronous entry points bind the context only for the duration of their C++ stack call.
+inline const Invocation& FindSynchronousInvocation() {
+  if (synchronous_invocation) return *synchronous_invocation;
+  if (task_invocations.empty()) throw Error(ErrorCode::ServiceUnavailable, "Host services require an active plugin invocation");
+  throw Error(ErrorCode::CallbackUnavailable, "Use a Task host service method from a plugin coroutine");
+}
+
+inline const Invocation& FindInvocation(const TaskExecution& execution) {
+  for (auto i = task_invocations.rbegin(); i != task_invocations.rend(); ++i) {
+    if (SameExecution(execution, (*i)->execution)) return **i;
+  }
+  throw Error(ErrorCode::ServiceUnavailable, "Host services require an active plugin invocation");
+}
+
+template<class Interface>
+struct ServiceTarget {
+  std::shared_ptr<Interface> local;
+  std::optional<HostEndpoint> worker;
+};
+
+template<class Interface>
+ServiceTarget<Interface> ResolveService(const Invocation& invocation) {
+  if (invocation.find_service) {
+    return {std::static_pointer_cast<Interface>(invocation.find_service(invocation.services, Contract<Interface>::Info)), {}};
+  }
+  if (invocation.worker) return {{}, invocation.worker};
+  throw Error(ErrorCode::ServiceUnavailable, "The invocation has no host service endpoint");
+}
 
 template<class Result>
 Result DecodeResult(std::span<const std::byte> payload) {

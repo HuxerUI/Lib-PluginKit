@@ -4,9 +4,23 @@
 /// @brief Contract declarations and errors shared by the host and independently built plugins.
 
 #include <cstdint>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+
+/// @brief Marks an interface for hpk gen to publish in both execution modes.
+///
+/// Place it on the class definition, as in `class HPK_REMOTE Importer`. Declare a public virtual
+/// destructor and public pure virtual operations with unique names. Operations may return a synchronous
+/// value, void, or HuxerUI Task<T>. Use contract-supported types and pass Task requests by value.
+/// A Task operation can take a Receiver as its second argument. Leave operations able to throw so
+/// the binding can report failures. The macro expands to an annotation only when hpk gen parses the header.
+#if defined(HPK_GENERATOR)
+#define HPK_REMOTE [[clang::annotate("hpk.remote")]]
+#else
+#define HPK_REMOTE
+#endif
 
 namespace huxerui::pluginkit {
 
@@ -26,8 +40,11 @@ struct ContractInfo {
   bool operator==(const ContractInfo&) const = default;
 };
 
-/// @brief Specialized by the SDK generator with metadata and a dispatcher.
-/// @tparam Interface C++ interface passed to hpk gen.
+/// @brief Describes the contract published by a C++ interface.
+///
+/// For an HPK_REMOTE interface, hpk gen supplies the exact identity, typed adapter, and worker dispatch.
+/// For an interface used only in process, define a specialization with `static constexpr ContractInfo Info`.
+/// @tparam Interface Published C++ interface.
 template<class Interface>
 struct Contract;
 
@@ -40,21 +57,28 @@ struct ExtensionPoint {
   std::string_view id;
 };
 
-/// @brief Generated move-only handle that invokes operations on one worker instance.
+/// @brief Move-only handle to a plugin instance in either execution mode.
 /// @tparam Interface Interface exposed by the handle.
 /// @see PluginManager::CreateExtension()
 template<class Interface>
 class ExtensionHandle;
 
-/// @brief Generated proxy for calling a typed host service from a plugin.
-/// @tparam Interface Service interface passed to hpk gen.
+/// @brief Typed handle for calling a host service during a plugin invocation.
+/// @tparam Interface Published service interface with a Contract specialization.
+/// @see GetService()
 template<class Interface>
 class ServiceHandle;
 
-/// @brief Generated call-scoped proxy for an interface implemented by the caller.
-/// @tparam Interface Callback interface passed to hpk gen.
+/// @brief Optional host callback object supplied to one managed Task invocation.
+///
+/// Pass an empty pointer to omit callbacks. When supplied, the host object is retained for the call and the
+/// plugin receives an invocation-scoped implementation. Await its methods from the owning invocation or an
+/// awaited child Task. A retained proxy fails with ReceiverClosed after completion, cancellation, or when
+/// called from a different execution.
+/// @tparam Interface HPK_REMOTE callback interface declared in its own header, with Task operations and
+/// at most one request per operation.
 template<class Interface>
-class Receiver;
+using Receiver = std::shared_ptr<Interface>;
 
 /// @brief Machine-readable reason for a failed PluginKit operation.
 enum class ErrorCode : std::uint32_t {
@@ -70,7 +94,7 @@ enum class ErrorCode : std::uint32_t {
   ApprovalMismatch,
   /// The installed package could not be verified against its catalog entry.
   PackageChanged,
-  /// A different package is installed under the same plugin identifier.
+  /// A package is already installed under this identifier with a different digest or approval.
   AlreadyInstalled,
   /// The requested plugin, extension point, or contribution was not found.
   NotFound,
@@ -78,9 +102,9 @@ enum class ErrorCode : std::uint32_t {
   Disabled,
   /// The registered contract, manifest, or exported descriptor did not match.
   ContractMismatch,
-  /// The extension instance or worker generation is closed.
+  /// The manager, extension instance, or plugin activation is closed.
   Closed,
-  /// A request expired in the queue or during a worker exchange.
+  /// A managed call exhausted its time budget, including time in the queue.
   DeadlineExceeded,
   /// The worker process or its transport became unavailable.
   WorkerExited,
@@ -100,6 +124,12 @@ enum class ErrorCode : std::uint32_t {
   Cancelled,
   /// The receiver no longer belongs to an active call.
   ReceiverClosed,
+  /// The selected execution mode is unavailable for this package or contract.
+  UnsupportedMode,
+  /// A synchronous call attempted a host callback that requires an asynchronous call or an in-process caller.
+  CallbackUnavailable,
+  /// A synchronous call could not enter a busy plugin, or a package repair requires an inactive plugin.
+  Busy,
 };
 
 /// @brief A PluginKit failure with an error code and a human-readable diagnostic.

@@ -1,5 +1,4 @@
-#include "platform_files.h"
-#include "transport.h"
+#include "plugin_module.h"
 #include "windowless_runtime.h"
 
 #include <huxerui/pluginkit/contract.h>
@@ -7,7 +6,6 @@
 #if !defined(_WIN32)
 #include "posix_socket.h"
 
-#include <dlfcn.h>
 #include <signal.h>
 #include <thread>
 #endif
@@ -24,22 +22,6 @@ namespace huxerui::pluginkit::detail {
 namespace {
 
 using Instance = std::unique_ptr<void, decltype(hpk_plugin_v1::close)>;
-
-void CheckStatus(std::int32_t status) {
-  switch (status) {
-    case HPK_OK: return;
-    case HPK_INVALID_REQUEST: throw Error(ErrorCode::Protocol, "The plugin rejected the request payload");
-    case HPK_PAYLOAD_TOO_LARGE: throw Error(ErrorCode::PayloadTooLarge, "The plugin response exceeds the payload limit");
-    case HPK_PLUGIN_FAILED: throw Error(ErrorCode::PluginFailed, "The plugin implementation failed");
-    case HPK_SERVICE_DENIED: throw Error(ErrorCode::ServiceDenied, "The package cannot call this host service");
-    case HPK_SERVICE_UNAVAILABLE: throw Error(ErrorCode::ServiceUnavailable, "The host service is unavailable");
-    case HPK_REENTRANT_CALL: throw Error(ErrorCode::ReentrantCall, "A host service attempted to reenter PluginKit");
-    case HPK_RECEIVER_CLOSED: throw Error(ErrorCode::ReceiverClosed, "The receiver is outside its owning invocation");
-    case HPK_CONTRACT_MISMATCH: throw Error(ErrorCode::ContractMismatch, "The host callback contract does not match");
-    case HPK_CLOSED: throw Error(ErrorCode::Closed, "The plugin generation is closing");
-    default: throw Error(ErrorCode::Protocol, "The plugin returned an invalid status");
-  }
-}
 
 struct Outgoing {
   Frame frame;
@@ -78,6 +60,7 @@ private:
 thread_local ServiceChannel* current_service_channel = nullptr;
 
 void Finish(ServiceChannel& channel, Frame reply) {
+  // Publish the final reply after the plugin's dispatch Task releases its invocation context.
   current_service_channel = nullptr;
   reply.kind = FrameKind::Reply;
   reply.call = channel.request.call;
@@ -91,8 +74,9 @@ std::uint32_t HPK_CALL CallHost(std::uint64_t invocation, std::uint32_t receiver
   if (!channel || channel->request.call != invocation) {
     return static_cast<std::uint32_t>(ErrorCode::ServiceUnavailable);
   }
+  if (channel->request.synchronous) return static_cast<std::uint32_t>(ErrorCode::CallbackUnavailable);
   try {
-    if (!id || !fingerprint || !operation || !data || !size || !complete || channel->callback == UINT32_MAX) {
+    if (!id || !fingerprint || !operation || (size && !data) || !complete || channel->callback == UINT32_MAX) {
       throw Error(ErrorCode::InvalidArgument, "Invalid host service call");
     }
     if (receiver && receiver != channel->request.receiver) {
@@ -105,7 +89,7 @@ std::uint32_t HPK_CALL CallHost(std::uint64_t invocation, std::uint32_t receiver
     return 0;
   } catch (const Error& error) {
     return static_cast<std::uint32_t>(error.Code());
-  } catch (...) {
+    } catch (...) {
     return static_cast<std::uint32_t>(ErrorCode::PluginFailed);
   }
 }
@@ -114,7 +98,7 @@ void HPK_CALL FinishInvoke(void* user, std::uint32_t status, hpk_buffer_v1 buffe
   auto& channel = *static_cast<ServiceChannel*>(user);
   Frame reply{};
   try {
-    CheckStatus(static_cast<std::int32_t>(status));
+    CheckPluginStatus(static_cast<std::int32_t>(status));
     if (buffer.size > MaxPayload) throw Error(ErrorCode::PayloadTooLarge, "The plugin response exceeds the payload limit");
     reply.instance = channel.request.instance;
     if (buffer.size) {
@@ -139,13 +123,13 @@ public:
   std::optional<Frame> Dispatch(ServiceChannel& channel) {
     const auto& request = channel.request;
     if (request.code == static_cast<std::uint32_t>(Command::Shutdown)) {
-      if (request.instance || request.operation || request.receiver || !request.payload.empty()) InvalidRequest();
+      if (request.instance || request.operation || request.receiver || request.synchronous || !request.payload.empty()) InvalidRequest();
       Shutdown();
       return Frame{};
     }
     if (request.code == static_cast<std::uint32_t>(Command::Create)) {
       const bool first_creation = !binding_;
-      if (request.instance || request.operation || request.receiver ||
+      if (request.instance || request.operation || request.receiver || request.synchronous ||
           (first_creation ? request.payload.empty() : !request.payload.empty())) {
         InvalidRequest();
       }
@@ -157,7 +141,11 @@ public:
       const auto id = next_instance_++;
       const auto status = binding_->create(activation_, &raw);
       Instance instance(raw, binding_->close);
-      CheckStatus(status);
+      if (status != HPK_OK && first_creation) {
+        instance.reset();
+        Shutdown();
+      }
+      CheckPluginStatus(status);
       if (!instance) throw Error(ErrorCode::Protocol, "The plugin returned an empty instance");
       instances_.emplace(id, std::move(instance));
       return Frame{0, id, 0, {}};
@@ -166,16 +154,17 @@ public:
     const auto instance = instances_.find(request.instance);
     if (instance == instances_.end()) throw Error(ErrorCode::Closed, "The worker instance is closed");
     if (request.code == static_cast<std::uint32_t>(Command::Close)) {
-      if (request.operation || request.receiver || !request.payload.empty()) InvalidRequest();
+      if (request.operation || request.receiver || request.synchronous || !request.payload.empty()) InvalidRequest();
       instances_.erase(instance);
       return Frame{0, request.instance, 0, {}};
     }
-    if (request.code != static_cast<std::uint32_t>(Command::Invoke) || !request.operation || request.receiver > 1) {
+    if (request.code != static_cast<std::uint32_t>(Command::Invoke) || !request.operation || request.receiver > 1 ||
+        (request.synchronous && request.receiver)) {
       InvalidRequest();
     }
 
     current_service_channel = &channel;
-    CheckStatus(binding_->invoke(instance->second.get(), &HostCallbacks, request.call, request.receiver,
+    CheckPluginStatus(binding_->invoke(instance->second.get(), &HostCallbacks, request.call, request.receiver,
                                  request.operation, reinterpret_cast<const std::uint8_t*>(request.payload.data()),
                                  static_cast<std::uint32_t>(request.payload.size()), FinishInvoke, &channel));
     return std::nullopt;
@@ -191,45 +180,14 @@ private:
     const auto status = binding_->deactivate(std::exchange(activation_, nullptr));
     binding_ = nullptr;
 
-    CheckStatus(status);
+    CheckPluginStatus(status);
   }
 
   void Load(const PluginStartup& startup) {
-    // Keep the library mapped until process exit because SDK background I/O may outlive its cancelled task.
-#if defined(_WIN32)
-    const auto module = LoadLibraryExW(path_.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!module) WindowsError(ErrorCode::InvalidPackage, "Cannot load plugin.dll");
-    const auto address = GetProcAddress(module, "pluginkit_query_v1");
-#else
-    int mode = RTLD_NOW | RTLD_LOCAL;
-#if defined(__APPLE__)
-    mode |= RTLD_FIRST;
-#endif
-    const auto module = ::dlopen(path_.c_str(), mode);
-    if (!module) {
-      auto message = std::string("Cannot load ") + ModuleName;
-      if (const auto* detail = ::dlerror(); detail && IsUtf8(detail)) message += ": " + std::string(detail);
-      throw Error(ErrorCode::InvalidPackage, message);
-    }
-    const auto address = ::dlsym(module, "pluginkit_query_v1");
-#endif
-    if (!address) throw Error(ErrorCode::ContractMismatch, "Missing pluginkit_query_v1 export");
-    const auto query = reinterpret_cast<hpk_query_v1>(address);
-    const auto* binding = query();
-    if (!binding || binding->struct_size != sizeof(hpk_plugin_v1) || binding->abi_version != HPK_ABI_VERSION ||
-        !binding->contract_id || !binding->contract_fingerprint || contract_.id != binding->contract_id ||
-        contract_.version != binding->contract_version || contract_.fingerprint != binding->contract_fingerprint ||
-        !binding->activate || !binding->create || !binding->invoke || !binding->close ||
-        !binding->deactivate) {
-      throw Error(ErrorCode::ContractMismatch, "The module descriptor does not match the installed contract");
-    }
-    const hpk_plugin_context_v1 context{startup.id.c_str(), startup.version.c_str(), startup.digest.c_str(),
-                                       startup.bundle_directory.c_str(), startup.data_directory.c_str()};
-    void* activation = nullptr;
-    CheckStatus(binding->activate(&context, &activation));
-    if (!activation) throw Error(ErrorCode::Protocol, "The plugin returned an empty activation");
-    binding_ = binding;
-    activation_ = activation;
+    PreparePluginData(startup);
+    const auto& binding = LoadPluginModule(path_, contract_, HPK_WORKER_PROCESS);
+    activation_ = ActivatePlugin(binding, startup);
+    binding_ = &binding;
   }
 
   std::filesystem::path path_;
@@ -265,7 +223,7 @@ void Exchange(Read& read, Write& write, const TaskScope& tasks, Server& server) 
       const auto& outgoing = message.frame;
       const auto reply = ReadFrame(read);
       if (reply.kind != FrameKind::ServiceReply || reply.call != outgoing.call || reply.callback != outgoing.callback ||
-          reply.instance != outgoing.instance || reply.operation || reply.receiver != outgoing.receiver ||
+          reply.instance != outgoing.instance || reply.operation || reply.receiver != outgoing.receiver || reply.synchronous ||
           (reply.code && (!IsErrorCode(reply.code) || !IsUtf8(AsText(reply.payload))))) {
         throw Error(ErrorCode::Protocol, "Invalid host service response");
       }

@@ -14,9 +14,11 @@ The developer CLI is `hpk` (HuxerUI Plugin Kit). The target application can ship
 
 ## Contracts and generated SDK
 
-The application declares a stable contract ID and version for a C++ interface in its build configuration. A contract header uses ordinary C++ syntax.
+The application declares a stable contract ID and version for a C++ interface in its build configuration. The interface uses ordinary C++ signatures and carries `HPK_REMOTE` when it supports worker execution.
 
 ```cpp
+#include <huxerui/pluginkit/contract.h>
+#include <huxerui/task.h>
 #include <string>
 
 struct ImportRequest {
@@ -27,22 +29,23 @@ struct ImportResult {
   std::string plain_text;
 };
 
-class DocumentImporter {
+class HPK_REMOTE DocumentImporter {
 public:
   virtual ~DocumentImporter() = default;
-  virtual ImportResult Import(const ImportRequest& request) = 0;
+  virtual std::string Format() const = 0;
+  virtual huxerui::Task<ImportResult> Import(ImportRequest request) = 0;
 };
 ```
 
-`hpk gen` parses the selected interface with Clang using its compilation options. It generates the schema, the typed application-side call interface, the implementation binding, and the ABI lock. The published SDK includes the original declarations and generated files. A plugin author uses that SDK and binds a derived implementation with `Bind<Interface, Implementation>()`. Unsupported declarations receive source-located diagnostics. [Clang LibTooling](https://clang.llvm.org/docs/LibTooling.html)
+`hpk gen` parses the marked interface with Clang using its compilation options. It generates the schema, typed forwarding methods, and worker dispatch. The published SDK includes the original declarations and generated files. A plugin author implements the interface and exports its factory with `HPK_EXPORT_PLUGIN`. Unsupported declarations receive source-located diagnostics. [Clang LibTooling](https://clang.llvm.org/docs/LibTooling.html)
 
 Portable signatures use fixed-width scalars, enums, UTF-8 strings, byte sequences, lists, optional values, records composed of those types, and Kit-managed handles. A const reference parameter is encoded as a value and has call-scoped lifetime in the implementation. The generated binding constructs and destroys C++ objects on their owning side. Host services use the same contract model in the reverse direction. [Windows DLL memory ownership guidance](https://learn.microsoft.com/en-us/cpp/c-runtime-library/potential-errors-passing-crt-objects-across-dll-boundaries?view=msvc-170)
 
-A plugin shared library exports the generated `pluginkit_query_v1` C entry point. It provides a versioned descriptor and the operations needed to create an instance, invoke an operation, and close the instance. The calling convention, struct sizes, buffer ownership, and descriptor version are part of the loader ABI. The binding catches C++ exceptions at its boundary and reports structured errors. Built-in plugins expose distinct registration entries referenced by the application. Both paths use the same contract and dispatch model.
+A plugin shared library exports `pluginkit_query_v1`. Its descriptor provides the published interface pointer, paired creation and destruction callbacks, and worker dispatch for remote-capable contracts. An in-process host and the plugin use matching C++ and HuxerUI SDK builds. The library that creates the instance also destroys it.
 
-Operation and record field numbers are stable protocol identifiers. The generated ABI lock records them together with the schema for published revisions. Messages use the same numbered schema across in-process, worker, and Wasm transports. CBOR carries encoded values. Ordinary DTOs are decoded locally, and large payloads use scoped streams. [CBOR specification](https://www.rfc-editor.org/rfc/rfc8949.html)
+The worker protocol uses numbered operations and CBOR values. The in-process path passes typed values to the actual virtual method. Both paths validate the exact published contract fingerprint. [CBOR specification](https://www.rfc-editor.org/rfc/rfc8949.html)
 
-The Kit protocol version, business contract version, and plugin release version evolve independently. An additive optional field or detectable operation can advance a contract minor version. Changes to existing signatures or meaning require a new major version. At open time, both sides choose the highest mutually supported revision with the same schema fingerprint. The application can detect operations added after the negotiated revision. A single contract ID and revision describe the same portable schema on every target.
+The Kit ABI and protocol, application contract version, and plugin release version are independent. The current ABI and protocol use v1. Applications rebuild the host, worker, and plugins together against the published SDK.
 
 ## Domain model and public API
 
@@ -64,21 +67,21 @@ The application owns one `huxerui::pluginkit::PluginManager` for each plugin pro
 
 | Responsibility | API | Behavior |
 | --- | --- | --- |
-| Configuration | `RegisterExtensionPoint(point)`, `ProvideService<T>()`, `RegisterBuiltinPlugin(entry)` | Declare typed extension points, supply host services, and explicitly register built-ins. |
+| Configuration | `RegisterExtensionPoint(point)`, `ProvideService<T>()` | Declare typed extension points and register one implementation per host service. |
 | Manager lifetime | `StartAsync()`, `ShutdownAsync()` | Recover the profile before publishing the catalog. On shutdown, stop new work and release owned runtime resources. |
 | Discovery | `RefreshCatalogAsync()`, `ListPlugins()`, `ListExtensions(point)` | Refresh configured sources and read catalog snapshots. Listing contributions uses manifest metadata. |
-| Invocation | `CreateExtension(point, id)` | Instantiate a selected contribution and return a typed handle. The selection design also allows matching by typed metadata and user preference. |
+| Invocation | `CreateExtension(point, id)` | Synchronously return a typed handle. The first managed method creates the instance. |
 | Changes | `PlanChangesAsync(changes)`, `ApplyPlanAsync(plan, approval)` | Coordinate installation, enablement, disablement, updates, removal, pinning, provider selection, grant changes, and rollback. |
 | Settings | `GetSettings(plugin_id)`, `SetSettingsAsync(plugin_id, values)` | Read a snapshot and validate or persist changes against the plugin settings schema. |
 | Observability | `SubscribeEvents()`, `Diagnostics()` | Report catalog revisions, state transitions, operation progress, and structured failures. Subscription handles release their callbacks. |
 
 Explicit IDs and stored user preferences take precedence over automatic matching. A unique eligible match can be opened directly. An ambiguous query returns the candidates for selection. Disabled contributions leave the available extension list while their package and diagnostic records remain visible in management views.
 
-The generated `ExtensionHandle<DocumentImporter>` exposes an asynchronous `ImportAsync` call. The completion result distinguishes the business value from a Kit failure such as an incompatible contract, deadline expiry, or worker exit. Explicit `CloseAsync()` waits for instance release when the caller needs that boundary. Releasing the handle also schedules cleanup.
+`ExtensionHandle<DocumentImporter>` exposes the published interface through `operator->`. The host calls `importer->Format()` or awaits `importer->Import(request)` using the original signatures. Scope exit releases the handle and retires the instance after active work leaves it.
 
 A plugin activation owns a single `PluginContext`. The SDK passes it by const reference to optional `Activate` and `Deactivate` hooks and to each extension implementation that accepts it in its constructor. `Activate` runs before the first instance is created. Normal shutdown destroys the instances before calling `Deactivate`. The host derives the bundle directory from the approved package snapshot and the writable data directory from the plugin ID in the profile. Both are exposed as `huxerui::File`.
 
-During an invocation, `huxerui::pluginkit::GetService<T>()` creates a typed proxy. The worker checks service access against the package digest authorized by the host. The caller can supply a `Receiver<T>` for a task operation and the plugin can await its methods while that invocation is active. The current desktop SDK shares one deadline across the invocation and its callbacks. See the [CSV example](../README.md#sdk-and-runtime) for the implemented API.
+The host records service grants and execution mode with the approved package digest. During a call, `GetService<T>()` synchronously returns a typed handle. The service implementation resolves the grant from the invocation. The caller supplies a `Receiver<T>` as a shared C++ callback argument, with access scoped to that invocation. See the [CSV example](../README.md#sdk-and-runtime).
 
 The broader lifecycle design includes settings, read-only bundle resources, logging, and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
 
@@ -131,13 +134,12 @@ The manager verifies local packages against application trust policy. Remote sou
 
 ## Execution, permissions, and instance lifetime
 
-Plugin origin and execution backend are separate. `Builtin` and `ExternalPackage` describe how the code is supplied. `InProcess`, `WorkerProcess`, and `Wasm` select an execution backend.
+One desktop profile can contain packages installed for either `InProcess` or `WorkerProcess`. The application chooses the mode during installation, and the package declares its supported modes.
 
 | Backend | Policy and lifetime |
 | --- | --- |
-| `InProcess` | Default for built-in plugins. The application can explicitly approve trusted external artifacts for this backend. External plugin libraries stay mapped until process exit, and an update takes effect at a subsequent startup. |
-| `WorkerProcess` | Default for separately installed desktop plugins. Each active plugin generation has its own `hpk-worker` with a private IPC channel. The worker starts on demand and loads the selected artifact. |
-| `Wasm` | Executes an independent module with configured imports and resource limits. Availability follows the target runtime and distribution policy. |
+| `InProcess` | The host loads an approved library into its own process and calls its C++ interface directly. The library stays mapped until host exit. |
+| `WorkerProcess` | Each active generation has its own `hpk-worker` with a private IPC channel. The worker starts on demand and loads the selected library. |
 
 Process separation contains a plugin process failure. The application selects a sandbox policy for filesystem, network, and other operating system access. Kit checks declared and granted capabilities when dispatching host services and uses an eligible sandboxed backend where policy requires one. Scoped file and object grants carry the plugin identity, permitted operations, and lifetime. Package trust identifies what code is approved to run. The sandbox determines its access. [Windows AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation)
 

@@ -1,24 +1,37 @@
 #pragma once
 
 /// @file
-/// @brief Host API for plugin profiles, package approval, and typed worker instances.
+/// @brief Host API for plugin profiles, package approval, and typed extension instances.
 ///
-/// Link HuxerUI::PluginKit and supply the platform's hpk-worker executable when opening a profile.
-/// Include the generated host header for each interface used with PluginManager.
+/// Link HuxerUI::PluginKit and include the generated host header for each HPK_REMOTE interface.
+/// Supply the platform's hpk-worker executable to enable worker packages. In-process packages
+/// use the same C++ SDK and active HuxerUI application as the host.
 
-#include <huxerui/pluginkit/detail/invocation.h>
+#include <huxerui/pluginkit/detail/extension.h>
 
 #include <huxerui/file.h>
 
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stop_token>
 
 namespace huxerui::pluginkit {
 
-/// @brief Default time budget for a worker request, including time spent queued.
+/// @brief Default time budget for a managed extension call, including time spent queued.
 inline constexpr auto DefaultTimeout = std::chrono::milliseconds(5000);
+
+/// @brief Host approval for the exact installed package snapshot.
+///
+/// InstallPackage() persists the execution mode and service grants together with the approved digest.
+struct InstallOptions {
+  /// Approved execution mode, which must be declared by the package. Defaults to WorkerProcess.
+  ExecutionMode mode = ExecutionMode::WorkerProcess;
+  /// Up to 64 distinct registered service contract IDs. An empty list grants no service access.
+  /// Each service granted to a worker package must have generated bindings.
+  std::vector<std::string> services;
+};
 
 /// @brief Identifies a contribution within an installed plugin.
 struct ExtensionId {
@@ -51,6 +64,10 @@ struct PackageInfo {
   std::string contribution;
   /// Advertised file suffixes, including their leading dots.
   std::vector<std::string> extensions;
+  /// Execution modes advertised by the package for this target. InstallPackage() approves one of them.
+  std::vector<ExecutionMode> execution_modes;
+  /// Shared SDK and C++ build identity checked for in-process execution. Ignored for worker execution.
+  std::string cpp_abi;
 };
 
 /// @brief Snapshot of an installed plugin and its activation status.
@@ -59,7 +76,9 @@ struct PluginInfo {
   PackageInfo package;
   /// Persisted enablement flag.
   bool enabled;
-  /// Process ID of the active worker, if present.
+  /// Execution mode selected at installation.
+  ExecutionMode mode;
+  /// Process ID of the active worker. Empty for an in-process package or while no worker is running.
   std::optional<std::uint32_t> worker_pid;
 };
 
@@ -71,82 +90,84 @@ struct ExtensionInfo {
   std::vector<std::string> extensions;
 };
 
-class PluginManager;
-
-namespace detail {
-
-class Worker;
-using ServiceDispatch = std::function<Task<Bytes>(std::uint32_t, Bytes)>;
-
-struct ReceiverRegistration {
-  ContractInfo contract;
-  ServiceDispatch dispatch;
-};
-
-template<class Interface>
-ServiceDispatch BindCallback(std::shared_ptr<Interface> implementation) {
-  if (!implementation) throw Error(ErrorCode::InvalidArgument, "The callback implementation is empty");
-  return [implementation = std::move(implementation)](std::uint32_t operation, Bytes request) {
-    return Contract<Interface>::Dispatch(*implementation, operation, std::move(request), {});
-  };
-}
-
-template<class Interface>
-ReceiverRegistration BindReceiver(std::shared_ptr<Interface> implementation) {
-  return {Contract<Interface>::Info, BindCallback(std::move(implementation))};
-}
-
-/// @brief Owned invocation target captured before returning a lazy host task.
-class ExtensionCall {
-public:
-  Task<Bytes> Invoke(std::uint32_t operation, Bytes request, std::chrono::milliseconds timeout,
-                     std::optional<ReceiverRegistration> receiver = {}) const;
-
-private:
-  friend class ExtensionInstance;
-  ExtensionCall(std::shared_ptr<Worker> worker, std::uint32_t instance, std::stop_token lifetime)
-      : worker_(std::move(worker)), instance_(instance), lifetime_(lifetime) {}
-  std::shared_ptr<Worker> worker_;
-  std::uint32_t instance_;
-  std::stop_token lifetime_;
-};
-
-template<class Result>
-Task<Result> InvokeExtension(ExtensionCall call, std::uint32_t operation, Bytes request,
-                             std::chrono::milliseconds timeout, std::optional<ReceiverRegistration> receiver = {}) {
-  co_return DecodeResult<Result>(co_await call.Invoke(operation, std::move(request), timeout, std::move(receiver)));
-}
-
-/// @brief Owns a worker instance on behalf of a generated extension handle.
-class ExtensionInstance {
-public:
-  ExtensionInstance(ExtensionInstance&& other) noexcept;
-  ExtensionInstance& operator=(ExtensionInstance&& other) noexcept;
-  ~ExtensionInstance();
-
-  ExtensionCall Call() const;
-  Task<void> Close();
-
-private:
-  friend class huxerui::pluginkit::PluginManager;
-  ExtensionInstance(std::shared_ptr<Worker> worker, std::uint32_t instance, std::stop_source lifetime);
-  void Release() noexcept;
-
-  std::shared_ptr<Worker> worker_;
-  std::uint32_t instance_;
-  std::stop_source lifetime_;
-};
-
-} // namespace detail
-
-/// @brief Owns a plugin profile and starts a worker on demand for each active plugin.
+/// @brief Move-only owner of one extension instance in the package's approved execution mode.
 ///
-/// Register each extension point before installing or opening its contributions. Installed packages and enablement
-/// persist in the profile. Register the points again when opening a new manager.
+/// Call published methods through operator->() on the owning application thread. Generated bindings keep the
+/// interface's synchronous and Task signatures. In-process calls invoke the implementation through C++ and
+/// worker calls use IPC.
+///
+/// Destroying the handle releases the instance automatically. A managed call already in progress can retain
+/// the instance until it finishes. A lazy call started after the handle is released fails with Closed.
+/// For an interface published only in process, keep the handle alive until all uses of the borrowed object,
+/// including Tasks that access it, have finished. Release these handles before awaiting disable or shutdown.
+/// @tparam Interface Published C++ interface of the instance.
+/// @see PluginManager::CreateExtension()
+template<class Interface>
+class ExtensionHandle {
+public:
+  /// @brief Transfers ownership from another handle, leaving the source empty.
+  ExtensionHandle(ExtensionHandle&&) noexcept = default;
+
+  /// @brief Releases this instance and takes ownership from another handle.
+  /// @param other Source handle, left empty after the transfer unless it is this handle.
+  /// @return This handle.
+  ExtensionHandle& operator=(ExtensionHandle&& other) noexcept {
+    if (this != &other) {
+      if (target_) target_->Release();
+      adapter_ = std::move(other.adapter_);
+      target_ = std::move(other.target_);
+    }
+    return *this;
+  }
+
+  /// @brief Releases the instance when the handle leaves scope.
+  ~ExtensionHandle() { if (target_) target_->Release(); }
+
+  /// @brief Borrows the interface for normal C++ method calls.
+  /// @return Pointer to the generated interface adapter or to the in-process object for an unmarked contract.
+  /// Use it while this handle owns the instance and the plugin is active.
+  /// @throws Error With Closed if the handle has moved or its instance has been retired.
+  Interface* operator->() const {
+    if (!target_) throw Error(ErrorCode::Closed, "The extension handle is closed");
+    target_->Check();
+    return adapter_ ? adapter_.get() : static_cast<Interface*>(target_->BorrowLocal());
+  }
+
+private:
+  friend class PluginManager;
+  explicit ExtensionHandle(std::shared_ptr<detail::ExtensionTarget> target) : target_(std::move(target)) {
+    if constexpr (requires { typename Contract<Interface>::Extension; }) {
+      try {
+        adapter_ = std::make_unique<typename Contract<Interface>::Extension>(target_);
+      } catch (...) {
+        target_->Release();
+        throw;
+      }
+    } else {
+      // A native-only interface exposes the real object, so acquire it with the handle.
+      try {
+        (void)target_->BorrowLocal();
+      } catch (...) {
+        target_->Release();
+        throw;
+      }
+    }
+  }
+
+  std::shared_ptr<detail::ExtensionTarget> target_;
+  std::unique_ptr<Interface> adapter_;
+};
+
+/// @brief Owns a plugin profile and activates approved packages in their selected execution modes.
+///
+/// Register extension points and provide host services before installing or creating their contributions.
+/// Installed packages, enablement, and approvals persist in the profile. Register points and provide services
+/// again when opening a new manager.
 ///
 /// Each profile has a single owning manager. Coordinate its destruction with callers.
-/// Catalog queries remain available during host service and receiver callbacks. Calls on one plugin worker
-/// are serialized even when they use different extension handles.
+/// Use the owning HuxerUI application thread for extension handles and manager operations. Catalog queries remain
+/// available during host service and receiver callbacks. Managed calls on one plugin are serialized. A
+/// synchronous call can report Busy while the plugin is handling another call.
 /// Workers run under the host's user account and provide process fault isolation for trusted plugins.
 ///
 /// The CSV example assumes the point is registered and its package is approved and installed.
@@ -154,12 +175,12 @@ private:
 /// #include "csv_contract.host.h"
 ///
 /// huxerui::Task<csv_import::ImportResult> ReadTable(huxerui::pluginkit::PluginManager& plugins,
-///                                    const huxerui::pluginkit::ExtensionId& id,
-///                                    std::shared_ptr<csv_import::ImportProgress> progress,
-///                                    const std::string& csv) {
+///                                                const huxerui::pluginkit::ExtensionId& id,
+///                                                std::shared_ptr<csv_import::ImportProgress> progress,
+///                                                const std::string& csv) {
 ///   constexpr huxerui::pluginkit::ExtensionPoint<csv_import::TableImporter> importers{"example.table-importers"};
-///   auto importer = co_await plugins.CreateExtension(importers, id);
-///   co_return co_await importer.Import({csv}, std::move(progress));
+///   auto importer = plugins.CreateExtension(importers, id);
+///   co_return co_await importer->Import({csv}, std::move(progress));
 /// }
 /// @endcode
 /// @see ExtensionPoint, ExtensionHandle
@@ -167,32 +188,39 @@ class PluginManager {
 public:
   /// @brief Creates or opens the profile and takes its exclusive lock.
   /// @param profile_directory Directory for the catalog and approved package snapshots.
-  /// @param worker_executable Path to the platform's hpk-worker executable. Workers start on first instance creation.
-  /// @param callbacks Application task scope used to deliver reverse RPC and receiver callbacks.
+  /// @param worker_executable Path to the platform's hpk-worker executable, started on demand. Pass
+  /// std::nullopt to allow only in-process packages.
+  /// @param callbacks Owning HuxerUI application task scope used for managed in-process calls and for host
+  /// service and receiver callbacks. Keep it running until Shutdown() completes.
   /// @throws Error With ProfileBusy if another manager holds the lock, or Io if the profile cannot be read.
   /// @throws std::filesystem::filesystem_error If path resolution or profile directory creation fails.
-  PluginManager(const File& profile_directory, const File& worker_executable, TaskScope callbacks);
+  PluginManager(const File& profile_directory, const std::optional<File>& worker_executable, TaskScope callbacks);
 
+  /// @brief Each profile lock belongs to one manager.
   PluginManager(const PluginManager&) = delete;
+  /// @brief A manager retains ownership of the profile it opened.
   PluginManager& operator=(const PluginManager&) = delete;
 
-  /// @brief Shuts down active plugins and closes their extension handles.
-  /// Await Shutdown() first to keep the application thread responsive during teardown.
+  /// @brief Stops plugin admission and closes extension handles.
+  /// Await Shutdown() before destruction to drain in-process work while the application scope can still run.
   /// Pending tasks can retain the profile lock until their transport work finishes.
   ~PluginManager();
 
-  /// @brief Stops worker admission and awaits bounded teardown on the transport thread.
+  /// @brief Stops admission and waits for active plugin generations to finish teardown.
+  /// Release handles to unmarked in-process interfaces before awaiting shutdown. Teardown waits for managed
+  /// in-process work to finish and gives each worker a bounded shutdown budget.
   /// @return Lazy task to await before retiring the application task scope.
   /// @throws Error With ReentrantCall when awaited from a host callback.
   Task<void> Shutdown();
 
   /// @brief Registers a point and copies the generated contract identity into this manager.
-  /// @tparam Interface Interface with a generated Contract specialization.
+  /// @tparam Interface Published interface with a Contract specialization. Worker packages require HPK_REMOTE bindings.
   /// @param point Identifier that contributions use in their manifests.
   /// @throws Error With InvalidArgument for invalid contract metadata or an invalid or duplicate point identifier.
+  /// @throws Error With Closed after shutdown or ReentrantCall while a host callback is active on this thread.
   template<class Interface>
   void RegisterExtensionPoint(ExtensionPoint<Interface> point) {
-    Register(point.id, Contract<Interface>::Info);
+    Register(point.id, Contract<Interface>::Info, requires { typename Contract<Interface>::Extension; });
   }
 
   /// @brief Inspects a package before any plugin code runs.
@@ -202,38 +230,56 @@ public:
   /// or PayloadTooLarge if the manifest exceeds 64 KiB or the library exceeds 64 MiB.
   static PackageInfo InspectPackage(const File& directory);
 
-  /// @brief Provides a typed host service to one approved package.
+  /// @brief Registers a host service once. InstallOptions authorizes its use per package.
   ///
-  /// Register before activating the package. A worker keeps the services available at its startup.
-  /// Service calls run in the manager's application task scope and may interleave for different workers.
-  /// Keep handlers bounded. Use ListPlugins() or ListExtensions() for catalog reads in a handler.
-  /// Other manager and worker operations are subject to reentry checks.
-  /// Registrations last for this manager. Changes the handler applies remain in effect if the outer call fails.
-  /// @tparam Interface Interface with generated contract bindings.
-  /// @param implementation Service object retained by the manager and authorized worker generations.
-  /// @param approved_digest Exact package digest authorized to use this service.
+  /// Register before approving a new package or creating handles for an installed package. A plugin activation
+  /// uses the registrations selected from its saved service grants. Registrations last for this manager.
+  ///
+  /// Managed Task service calls run in the manager's application task scope and may interleave for different
+  /// plugins. Synchronous service calls from synchronous in-process invocations run on the caller's stack.
+  /// ListPlugins() and ListExtensions() can be called inside a handler. Management and managed invocations
+  /// are subject to reentry checks. A change applied by the handler persists if the outer call fails.
+  /// @tparam Interface Service interface with a Contract specialization. Worker service contracts require
+  /// HPK_REMOTE bindings and accept no receiver parameters.
+  /// @param implementation Service object retained by the manager and by activations that can call it.
   /// @throws Error With InvalidArgument for an empty implementation, invalid metadata, or duplicate registration.
+  /// @throws Error With Closed after shutdown or ReentrantCall while a host callback is active on this thread.
+  /// @see InstallOptions, GetService()
   template<class Interface>
-  void ProvideService(std::shared_ptr<Interface> implementation, std::string_view approved_digest) {
-    Provide(Contract<Interface>::Info, approved_digest, detail::BindCallback(std::move(implementation)));
+  void ProvideService(std::shared_ptr<Interface> implementation) {
+    if constexpr (requires { typename Contract<Interface>::Extension; }) {
+      static_assert(requires { Contract<Interface>::HostService; },
+                    "A remote host service cannot take a receiver parameter");
+    }
+    auto dispatch = detail::BindCallback(implementation);
+    Provide(Contract<Interface>::Info, std::move(implementation), std::move(dispatch));
   }
 
   /// @brief Installs the approved snapshot for a registered extension point.
   ///
-  /// A new installation starts enabled. Reinstalling the same approved package preserves its enablement and
-  /// can repair a changed or missing snapshot. A conflicting package under the same plugin ID is rejected.
+  /// A new installation starts enabled. The mode and service grants apply to future activations of this snapshot.
+  /// Reinstalling with the same digest and approval can repair the stored files and preserves enablement.
   /// @param directory Source directory containing the package files.
   /// @param approved_digest Digest from InspectPackage() that the caller approved.
-  /// @throws Error With ApprovalMismatch for a different digest, ContractMismatch for an unregistered
-  /// or incompatible contract, or AlreadyInstalled for a conflicting package under the same ID.
-  void InstallPackage(const File& directory, std::string_view approved_digest);
+  /// @param options Execution mode and host services included in the approval.
+  /// @throws Error With ApprovalMismatch if the source digest changed, ContractMismatch if the contract or
+  /// in-process SDK identity differs, or UnsupportedMode if the package or host cannot use the approved mode.
+  /// @throws Error With InvalidArgument if a service grant is invalid or unavailable in the selected mode.
+  /// @throws Error With AlreadyInstalled if the installed digest or approval differs, or Busy if the active
+  /// plugin's snapshot needs repair. Disable the plugin before repairing it.
+  /// @throws Error With Closed after shutdown or ReentrantCall while a host callback is active on this thread.
+  /// @see InspectPackage(), ProvideService()
+  void InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options = {});
 
-  /// @brief Persists enablement. Disabling a plugin stops new work on its active worker generation.
-  /// Allows up to DefaultTimeout for the running exchange and plugin teardown before terminating the worker.
+  /// @brief Persists enablement and retires the active plugin when disabling it.
+  ///
+  /// Disabling stops admission. In-process teardown cancels managed calls, waits for tracked blocking work,
+  /// and waits for handles that expose a native interface directly. Release those handles before disabling.
+  /// Worker teardown allows up to DefaultTimeout for the running exchange and shutdown before termination.
   /// @param plugin_id Installed plugin identifier.
   /// @param enabled True to make the contribution available for subsequent creation, false to disable it.
-  /// @return Lazy task that completes after the change and any worker teardown.
-  /// @throws Error With NotFound if the plugin identifier is absent from the profile.
+  /// @return Lazy task that completes after persisting the change and finishing any teardown.
+  /// @throws Error With NotFound if the plugin is absent, Closed after shutdown, or ReentrantCall from a host callback.
   Task<void> SetEnabled(std::string_view plugin_id, bool enabled);
 
   /// @brief Reads the installed catalog without activating plugins.
@@ -242,9 +288,9 @@ public:
   std::vector<PluginInfo> ListPlugins() const;
 
   /// @brief Lists enabled contributions matching the point's exact registered contract.
-  /// @tparam Interface Interface with a generated Contract specialization.
+  /// @tparam Interface Published interface with a Contract specialization.
   /// @param point Previously registered extension point.
-  /// @return Manifest metadata for matching contributions, including those whose workers have yet to start.
+  /// @return Manifest metadata for matching contributions, including those that have yet to activate.
   /// @throws Error With NotFound for an unregistered point or ContractMismatch for a different contract.
   /// @see ListPlugins()
   template<class Interface>
@@ -252,43 +298,35 @@ public:
     return List(point.id, Contract<Interface>::Info);
   }
 
-  /// @brief Creates an extension instance, activating its plugin on first use.
+  /// @brief Synchronously creates a handle to one contribution in its approved execution mode.
   ///
-  /// Starting a worker verifies the installed snapshot. The timeout starts with the worker request, after
-  /// profile access, package verification, and process startup. Activation and creation share that deadline.
-  /// @tparam Interface Interface with generated Contract and ExtensionHandle specializations.
+  /// With generated bindings, instance creation is deferred until the first synchronous method call or
+  /// until the first Task method is awaited. For an unmarked in-process interface, this function creates
+  /// the instance immediately so operator->() can expose the implementation directly.
+  /// @tparam Interface Interface with contract metadata.
   /// @param point Previously registered extension point.
   /// @param id Contribution to instantiate, as returned by ListExtensions().
-  /// @param timeout Time budget for the worker request, from 1 ms through 24 hours.
-  /// @return A move-only handle to the newly created instance.
-  /// @throws Error With NotFound, Disabled, or ContractMismatch if the contribution is unavailable for this point.
-  /// @throws Error With PackageChanged if the installed snapshot fails verification, DeadlineExceeded if the
-  /// worker request expires, WorkerExited if the worker exits, or PluginFailed if activation or creation fails.
+  /// @param timeout Time budget for each managed call, from 1 ms through 24 hours, including time in the queue.
+  /// An unmarked in-process interface runs under the caller's ordinary C++ lifetime and timing rules.
+  /// @return A move-only handle exposing Interface through operator->.
+  /// @throws Error With NotFound, Disabled, or ContractMismatch if the contribution is unavailable for this point,
+  /// InvalidArgument for an invalid timeout, Closed after shutdown, or UnsupportedMode if a worker is unavailable
+  /// for the approved mode. Unmarked interfaces can also report activation or construction failures here.
   template<class Interface>
-  Task<ExtensionHandle<Interface>> CreateExtension(ExtensionPoint<Interface> point, ExtensionId id,
-                                                    std::chrono::milliseconds timeout = DefaultTimeout) {
-    return CreateTyped<Interface>(impl_, std::string(point.id), std::move(id), timeout);
+  ExtensionHandle<Interface> CreateExtension(ExtensionPoint<Interface> point, const ExtensionId& id,
+                                             std::chrono::milliseconds timeout = DefaultTimeout) {
+    return ExtensionHandle<Interface>(Create(point.id, Contract<Interface>::Info, id, timeout));
   }
 
 private:
-  void Provide(ContractInfo contract, std::string_view approved_digest, detail::ServiceDispatch dispatch);
-  void Register(std::string_view point, ContractInfo contract);
+  void Provide(ContractInfo contract, std::shared_ptr<void> implementation, detail::ServiceDispatch dispatch);
+  void Register(std::string_view point, ContractInfo contract, bool remote);
   std::vector<ExtensionInfo> List(std::string_view point, ContractInfo contract) const;
   struct Impl;
   static Task<void> ShutdownManager(std::shared_ptr<Impl> impl);
   static Task<void> ChangeEnabled(std::shared_ptr<Impl> impl, std::string id, bool enabled);
-  static detail::ExtensionInstance CreateWorkerInstance(Impl& impl, std::string_view point, ContractInfo contract,
-                                                        const ExtensionId& id, std::chrono::milliseconds timeout,
-                                                        std::stop_token stop);
-  static Task<detail::ExtensionInstance> Create(std::shared_ptr<Impl> impl, std::string point, ContractInfo contract,
-                                               ExtensionId id, std::chrono::milliseconds timeout);
-
-  template<class Interface>
-  static Task<ExtensionHandle<Interface>> CreateTyped(std::shared_ptr<Impl> impl, std::string point, ExtensionId id,
-                                                      std::chrono::milliseconds timeout) {
-    co_return ExtensionHandle<Interface>(
-        co_await Create(std::move(impl), std::move(point), Contract<Interface>::Info, std::move(id), timeout));
-  }
+  std::shared_ptr<detail::ExtensionTarget> Create(std::string_view point, ContractInfo contract,
+                                                  const ExtensionId& id, std::chrono::milliseconds timeout);
 
   // A pending task can retain the implementation until its transport work finishes.
   std::shared_ptr<Impl> impl_;

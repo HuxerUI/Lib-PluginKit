@@ -3,6 +3,8 @@
   "id": "@plugin_id@",
   "version": "0.1.0",
   "target": "@package_target@",
+  "execution_modes": ["in_process", "worker_process"],
+  "cpp_abi": "@cpp_abi@",
   "contract": {
     "id": "@contract_id@",
     "version": @contract_version@,

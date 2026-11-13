@@ -43,24 +43,25 @@ if (NOT TARGET hpk)
 endif ()
 
 set(sdk_dir "${CMAKE_CURRENT_BINARY_DIR}/sdk")
-_huxerui_select_framework_target(csv_framework)
-set(csv_framework_includes "$<TARGET_PROPERTY:${csv_framework},INTERFACE_INCLUDE_DIRECTORIES>")
+set(csv_framework_includes "$<TARGET_PROPERTY:HuxerUI::huxerui,INTERFACE_INCLUDE_DIRECTORIES>")
 set(contract_header "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_contract.h")
 set(status_header "${CMAKE_CURRENT_SOURCE_DIR}/src/import_status.h")
 set(progress_header "${CMAKE_CURRENT_SOURCE_DIR}/src/receivers/import_progress.h")
-set(sdk_inputs "${contract_header}" "${status_header}" "${progress_header}")
+set(sdk_inputs "${contract_header}" "${status_header}" "${progress_header}" "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_sdk.h")
 set(sdk_outputs "${sdk_dir}/csv_contract.h" "${sdk_dir}/csv_contract.bindings.h"
     "${sdk_dir}/csv_contract.host.h" "${sdk_dir}/contract.json"
     "${sdk_dir}/receivers/import_progress.h" "${sdk_dir}/receivers/import_progress.bindings.h"
     "${sdk_dir}/receivers/import_progress.host.h" "${sdk_dir}/receivers/contract.json"
     "${sdk_dir}/services/import_status.h" "${sdk_dir}/services/import_status.bindings.h"
-    "${sdk_dir}/services/import_status.host.h" "${sdk_dir}/services/contract.json")
+    "${sdk_dir}/services/import_status.host.h" "${sdk_dir}/services/contract.json" "${sdk_dir}/csv_sdk.h")
+list(APPEND sdk_outputs "${sdk_dir}/cpp-abi.txt")
 foreach (header IN ITEMS
         huxerui/pluginkit.h
         huxerui/pluginkit/contract.h
         huxerui/pluginkit/plugin.h
         huxerui/pluginkit/detail/abi.h
         huxerui/pluginkit/detail/invocation.h
+        huxerui/pluginkit/detail/extension.h
         huxerui/pluginkit/detail/wire.h)
     list(APPEND sdk_inputs "${kit_root}/include/${header}")
     list(APPEND sdk_outputs "${sdk_dir}/${header}")
@@ -76,9 +77,10 @@ add_custom_command(OUTPUT ${sdk_outputs}
     COMMAND "$<TARGET_FILE:hpk>" gen "${status_header}"
         csv_import::ImportStatus example.import-status 1 "${sdk_dir}/services" -- "-I${kit_root}/include"
         "-I$<JOIN:${csv_framework_includes},;-I>"
-    COMMAND "${CMAKE_COMMAND}" -E rm -f "${sdk_dir}/huxerui/pluginkit/detail/task.h"
+    COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_sdk.h" "${sdk_dir}/csv_sdk.h"
+    COMMAND "$<TARGET_FILE:hpk-abi-stamp>" "${sdk_dir}/cpp-abi.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory "${kit_root}/include/huxerui" "${sdk_dir}/huxerui"
-    DEPENDS hpk ${sdk_inputs}
+    DEPENDS hpk hpk-abi-stamp ${sdk_inputs}
     COMMAND_EXPAND_LISTS VERBATIM
 )
 add_custom_target(csv-import-sdk DEPENDS ${sdk_outputs})
@@ -101,6 +103,9 @@ set_target_properties(example_lib_plugin_kit PROPERTIES
 set_target_properties(hpk-worker PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "$<TARGET_FILE_DIR:example_lib_plugin_kit>"
 )
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_target_properties(example_lib_plugin_kit PROPERTIES BUILD_RPATH "$ORIGIN")
+endif ()
 if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_custom_target(csv-worker-runtime
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -109,7 +114,8 @@ if (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_dependencies(example_lib_plugin_kit csv-worker-runtime)
 endif ()
 huxerui_add_runtime_dependencies(example_lib_plugin_kit
-    FILES "$<TARGET_FILE:hpk-worker>" "$<TARGET_FILE:HuxerUI::huxerui>"
+    FILES "$<TARGET_FILE:hpk-worker>"
     DESTINATION "${worker_destination}"
 )
+huxerui_add_runtime_dependencies(example_lib_plugin_kit TARGETS HuxerUI::huxerui)
 huxerui_configure_project_app(example_lib_plugin_kit)

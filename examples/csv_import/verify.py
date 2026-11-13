@@ -136,12 +136,12 @@ def verify_host_exit(host, profile, valid, hang_worker, fault_id, scratch):
     assert run(host, profile, "import", valid, fault_id)["ok"]
 
 
-def verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch):
-    profile = scratch / "插件 profile"
+def verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch, mode):
+    profile = scratch / f"插件 profile {mode}"
     data = profile / "data" / f"plugin-{fault_id}.data"
     log = data / "lifecycle.log"
-    assert run(host, profile, "install", faults, fault_digest)["ok"]
-    data.mkdir(parents=True)
+    assert run(host, profile, "install", faults, fault_digest, mode)["ok"]
+    data.mkdir(parents=True, exist_ok=True)
     fail_activation = data / "fail-activation"
     fail_activation.touch()
     failed, inactive = run(host, profile, commands=[("import", valid, fault_id), ("list",)])
@@ -165,7 +165,94 @@ def verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch):
     assert log.read_text().splitlines() == ["activate", "deactivate"] * 2
 
 
-def verify(host, package, faults, scratch):
+def verify_mixed(host, package, worker_csv, faults, scratch, sample):
+    profile = scratch / "mixed profile"
+    local_id = "example.csv"
+    worker_id = "example.csv-worker"
+    fault_id = "example.csv-faults"
+    local_digest = run(host, profile, "inspect", package)["digest"]
+    worker_digest = run(host, profile, "inspect", worker_csv)["digest"]
+    fault_digest = run(host, profile, "inspect", faults)["digest"]
+    big_csv = scratch / "large field.csv"
+    big_csv.write_bytes(b"field\n" + b"x" * (8 * 1024 * 1024) + b"\n")
+    installs = [
+        ("install", package, local_digest, "in_process", "status"),
+        ("install", worker_csv, worker_digest, "worker_process", "status"),
+        ("install", faults, fault_digest, "worker_process"),
+    ]
+    data = profile / "data" / f"plugin-{fault_id}.data"
+    data.mkdir(parents=True)
+    (data / "sync-service").touch()
+    replies = run(host, profile, commands=installs + [
+        ("pid",), ("list",),
+        ("import", sample, local_id), ("status",), ("reset-status",),
+        ("import", sample, worker_id), ("status",), ("list",),
+        ("import", big_csv, local_id), ("import", big_csv, worker_id),
+        ("import", sample, fault_id),
+    ])
+    assert all(reply["ok"] for reply in replies[:3]), replies[:3]
+    host_pid, discovered, local, local_status, _, worker, worker_status, active, big_local, big_worker, sync_callback = replies[3:]
+    assert {item["plugin"] for item in discovered["importers"]} == {local_id, worker_id, fault_id}, discovered
+    assert all(item["worker_pid"] is None for item in discovered["plugins"]), discovered
+    assert local["ok"] and worker["ok"], (local, worker)
+    assert local["table"] == worker["table"] and local["delimiter"] == worker["delimiter"] == ","
+    assert local["progress_rows"] == worker["progress_rows"] == 2
+    assert local_status["last_imported_rows"] == worker_status["last_imported_rows"] == 2
+    assert local["plugin_pid"] == host_pid["pid"] != worker["plugin_pid"]
+    assert plugin(active, local_id)["mode"] == "in_process"
+    assert plugin(active, worker_id)["mode"] == "worker_process"
+    assert plugin(active, worker_id)["worker_pid"] == worker["plugin_pid"], active
+    assert big_local["ok"] and len(big_local["table"]["rows"][0][0]) == 8 * 1024 * 1024
+    check_error(big_worker, "payload_too_large")
+    check_error(sync_callback, "callback_unavailable")
+    assert run(host, profile, "import", sample, local_id)["table"] == local["table"]
+    assert run(host, profile, "import", sample, worker_id)["table"] == worker["table"]
+    check_error(run(host, profile, "install", package, local_digest, "worker_process", "status"), "already_installed")
+    denied_profile = scratch / "denied profile"
+    assert run(host, denied_profile, "install", package, local_digest, "in_process")["ok"]
+    check_error(run(host, denied_profile, "import", sample, local_id), "service_denied")
+    assert run(host, denied_profile, "install", worker_csv, worker_digest, "worker_process")["ok"]
+    check_error(run(host, denied_profile, "import", sample, worker_id), "service_denied")
+
+    wrong_abi = scratch / "wrong ABI"
+    shutil.copytree(package, wrong_abi)
+    manifest_path = wrong_abi / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cpp_abi"] = "incompatible-build"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    wrong_digest = run(host, denied_profile, "inspect", wrong_abi)["digest"]
+    check_error(run(host, denied_profile, "install", wrong_abi, wrong_digest, "in_process"), "contract_mismatch")
+
+
+def verify_local_lifetime(host, faults, digest, fault_id, scratch, valid):
+    profile = scratch / "local lifetime"
+    assert run(host, profile, "install", faults, digest, "in_process", "status")["ok"]
+    lifetime, recovered = run(host, profile, commands=[
+        ("check-receiver-lifetime", fault_id),
+        ("import", valid, fault_id),
+    ])
+    assert lifetime["ok"] and recovered["ok"], (lifetime, recovered)
+    assert lifetime["cancelled_released"] and lifetime["late_rows"] == 0, lifetime
+    assert any(item["plugin"] == fault_id for item in lifetime["catalog_during_callback"]["importers"]), lifetime
+    waiting = scratch / "background stop.csv"
+    waiting.write_bytes(b"background-stop")
+    log = profile / "data" / f"plugin-{fault_id}.data" / "lifecycle.log"
+    replies = run(host, profile, commands=[
+        ("import", waiting, fault_id, 200),
+        ("disable", fault_id),
+        ("list",),
+    ])
+    check_error(replies[0], "deadline_exceeded")
+    assert replies[1]["ok"] and not replies[2]["importers"], replies[1:]
+    assert log.read_text().splitlines()[-4:] == [
+        "activate", "background-start", "background-stopped", "deactivate",
+    ], log.read_text()
+
+    enabled, recovered = run(host, profile, commands=[("enable", fault_id), ("import", valid, fault_id)])
+    assert enabled["ok"] and recovered["ok"], (enabled, recovered)
+
+
+def verify(host, package, faults, worker_csv, scratch):
     verify_default_profile(host, scratch)
     profile = scratch / "profile"
     valid = scratch / "quoted cells.csv"
@@ -195,8 +282,9 @@ def verify(host, package, faults, scratch):
     module_name = {"linux": "plugin.so", "darwin": "plugin.dylib", "win32": "plugin.dll"}[sys.platform]
     digest = run(host, profile, "inspect", package)["digest"]
     fault_digest = run(host, profile, "inspect", faults)["digest"]
-    verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch)
-    check_error(run(host, profile, "install", package, "0" * 64), "approval_mismatch")
+    for mode in ("worker_process", "in_process"):
+        verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch, mode)
+    check_error(run(host, profile, "install", package, "0" * 64, "worker_process"), "approval_mismatch")
     wrong_contract = scratch / "wrong contract"
     wrong_contract.mkdir()
     shutil.copyfile(package / module_name, wrong_contract / module_name)
@@ -204,12 +292,11 @@ def verify(host, package, faults, scratch):
     manifest["contract"]["fingerprint"] = "0" * 64
     (wrong_contract / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
     wrong_digest = run(host, profile, "inspect", wrong_contract)["digest"]
-    check_error(run(host, profile, "install", wrong_contract, wrong_digest), "contract_mismatch")
+    check_error(run(host, profile, "install", wrong_contract, wrong_digest, "worker_process"), "contract_mismatch")
 
     replies = run(host, profile, commands=[
-        ("install", package, digest),
-        ("install", faults, fault_digest),
-        ("provide-status", digest),
+        ("install", package, digest, "worker_process", "status"),
+        ("install", faults, fault_digest, "worker_process", "status"),
         ("list",),
         ("import", valid, csv_id),
         ("list",),
@@ -224,11 +311,11 @@ def verify(host, package, faults, scratch):
         ("disable", csv_id),
         ("list",),
     ])
-    assert all(reply["ok"] for reply in replies[:3]), replies[:3]
+    assert all(reply["ok"] for reply in replies[:2]), replies[:2]
     (
         discovered, imported, active, invalid_result, exited, after_exit,
         restarted, expired, after_timeout, recovered, failure, disabled, after_disable,
-    ) = replies[3:]
+    ) = replies[2:]
     assert {item["plugin"] for item in discovered["importers"]} == {csv_id, fault_id}, discovered
     assert all(item["worker_pid"] is None for item in discovered["plugins"]), discovered
     expected = {"header": ["name", "city", "note"], "rows": [["Chen, Lin", "上海", 'first\r\nsecond "line"']]}
@@ -256,19 +343,11 @@ def verify(host, package, faults, scratch):
     assert not plugin(persisted, csv_id)["enabled"] and plugin(persisted, fault_id)["enabled"], persisted
     assert all(item["worker_pid"] is None for item in persisted["plugins"]), persisted
     assert run(host, profile, "enable", csv_id)["ok"]
-    registered, reopened = run(host, profile, commands=[("provide-status", digest), ("import", valid, csv_id)])
-    assert registered["ok"] and reopened["table"] == expected
+    assert run(host, profile, "import", valid, csv_id)["table"] == expected
     replies = run(host, profile, commands=[
-        ("provide-status", digest),
         ("import", sample, csv_id),
         ("status",),
         ("list",),
-        ("import", service, fault_id),
-        ("status",),
-        ("provide-reentry-status", fault_digest),
-        ("import", service, fault_id),
-        ("disable", fault_id),
-        ("enable", fault_id),
         ("import", reenter, fault_id),
         ("import", background, fault_id),
         ("import", other_task, fault_id),
@@ -280,18 +359,14 @@ def verify(host, package, faults, scratch):
         ("status",),
     ])
     (
-        registered, imported, status, active, denied, denied_status, granted, still_denied, disabled, enabled,
-        reentered, unavailable, other_unavailable, before_timeout, expired, after_timeout, after_workers, restarted, after_restart,
+        imported, status, active, reentered, unavailable, other_unavailable,
+        before_timeout, expired, after_timeout, after_workers, restarted, after_restart,
     ) = replies
-    assert registered["ok"] and imported["table"] == {
+    assert imported["table"] == {
         "header": ["name", "city"], "rows": [["Chen, Lin", "Shanghai"], ["Noah", "New York"]],
     }
     assert status["last_imported_rows"] == 2, status
-    assert imported["progress_rows"] == 2, imported
-    check_error(denied, "service_denied")
-    assert denied_status["last_imported_rows"] == 2, denied_status
-    assert granted["ok"] and disabled["ok"] and enabled["ok"]
-    check_error(still_denied, "service_denied")
+    assert imported["progress_rows"] == 2 and imported["delimiter"] == ",", imported
     check_error(reentered, "reentrant_call")
     check_error(unavailable, "service_unavailable")
     check_error(other_unavailable, "service_unavailable")
@@ -318,16 +393,20 @@ def verify(host, package, faults, scratch):
     assert restarted["ok"] and after_restart["last_imported_rows"] == 41, after_restart
 
     modified_profile = scratch / "modified profile"
-    assert run(host, modified_profile, "install", package, digest)["ok"]
+    assert run(host, modified_profile, "install", package, digest, "worker_process", "status")["ok"]
     installed = modified_profile / "packages" / digest / module_name
     with installed.open("ab") as module:
         module.write(b"changed")
     check_error(run(host, modified_profile, "import", valid, csv_id), "package_changed")
-    assert run(host, modified_profile, "install", package, digest)["ok"]
-    registered, repaired = run(
-        host, modified_profile, commands=[("provide-status", digest), ("import", valid, csv_id)],
-    )
-    assert registered["ok"] and repaired["table"] == expected
+    assert run(host, modified_profile, "install", package, digest, "worker_process", "status")["ok"]
+    repaired = run(host, modified_profile, "import", valid, csv_id)
+    assert repaired["ok"] and repaired["table"] == expected
+
+    verify_mixed(host, package, worker_csv, faults, scratch, sample)
+    verify_local_lifetime(host, faults, fault_digest, fault_id, scratch, valid)
+    assert run(host, scratch / "in-process-only profile", "check-disable-during-create", package) == {
+        "ok": True, "delimiter": ",",
+    }
 
     if sys.platform in ("linux", "darwin"):
         verify_host_exit(host, profile, valid, hang_worker, fault_id, scratch)
@@ -338,7 +417,9 @@ if __name__ == "__main__":
     parser.add_argument("host", type=Path)
     parser.add_argument("package", type=Path)
     parser.add_argument("faults", type=Path)
+    parser.add_argument("worker_csv", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="pluginkit csv ") as directory:
-        verify(args.host.resolve(), args.package.resolve(), args.faults.resolve(), Path(directory))
+        verify(args.host.resolve(), args.package.resolve(), args.faults.resolve(),
+               args.worker_csv.resolve(), Path(directory))
     print("CSV example passed")

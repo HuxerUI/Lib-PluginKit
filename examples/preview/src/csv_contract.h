@@ -15,10 +15,10 @@
 
 namespace csv_import {
 
-/// @brief Proxy for progress notifications during an import invocation.
+/// @brief Optional progress callback scoped to one import invocation.
 using ImportReceiver = huxerui::pluginkit::Receiver<ImportProgress>;
 
-/// @brief Input passed by value across the worker boundary.
+/// @brief Input owned by the import Task in either execution mode.
 struct ImportRequest {
   /// UTF-8 CSV contents supplied by the host.
   std::string source;
@@ -53,14 +53,23 @@ struct ImportResult {
 };
 
 /// @brief CSV import contract published to independently built plugins.
-class TableImporter {
+class HPK_REMOTE TableImporter {
 public:
   virtual ~TableImporter() = default;
 
+  /// @brief Queries the CSV field separator synchronously.
+  /// @return Delimiter used by this importer, such as a comma.
+  virtual std::string Delimiter() const = 0;
+
+  /// @brief Queries the importer process ID synchronously for preview diagnostics.
+  /// @return Host process ID for in-process execution or the worker process ID for worker execution.
+  virtual std::uint32_t ProcessId() const = 0;
+
   /// @brief Parses the supplied CSV.
-  /// @param request CSV input for this call.
-  /// @param receiver Receives progress for this invocation.
-  /// @return Task producing parsed data or input diagnostics.
+  /// @param request UTF-8 CSV input, moved or copied into the Task.
+  /// @param receiver Optional host object that receives progress before the import returns.
+  /// @return Lazy Task yielding a parsed table or input diagnostics.
+  /// @throws huxerui::pluginkit::Error If activation or execution fails, including failure to update the host status.
   virtual huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) = 0;
 };
 
