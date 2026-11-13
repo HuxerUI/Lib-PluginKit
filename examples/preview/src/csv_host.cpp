@@ -40,6 +40,7 @@ static_assert(!std::is_copy_assignable_v<PluginManager>);
 constexpr ExtensionPoint<csv_import::TableImporter> Importers{"example.table-importers"};
 constexpr char CommandHelp[] =
     "inspect <package>, install <package> <digest> <in_process|worker_process> [status], list, "
+    "upgrade <package> <installed-digest> <approved-digest> [status], uninstall <id> <digest> [delete-data], "
     "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], quit";
 
 std::uint32_t ProcessId() {
@@ -173,6 +174,7 @@ Json List(PluginManager& manager) {
     record["enabled"] = plugin.enabled;
     record["mode"] = plugin.mode == ExecutionMode::InProcess ? "in_process" : "worker_process";
     record["worker_pid"] = plugin.worker_pid ? Json(*plugin.worker_pid) : Json(nullptr);
+    record["pending_upgrade"] = plugin.pending_upgrade ? Describe(*plugin.pending_upgrade) : Json(nullptr);
     plugins.push_back(std::move(record));
   }
   auto importers = Json::array();
@@ -340,7 +342,7 @@ Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool d
       remaining_context = co_await context(second);
     }
     if (disable) {
-      // Leave the second instance alive so shutdown has to destroy it before calling Deactivate.
+      // Leave the second instance alive so shutdown has to destroy it before calling OnDeactivate.
       const csv_import::ImportRequest request{"context"};
       auto pending = second->Import(request, std::make_shared<PreviewProgress>());
       co_await manager.SetEnabled(plugin, false);
@@ -421,6 +423,69 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
   co_return Json{{"delimiter", delimiter}};
 }
 
+Task<UpgradeStatus> Upgrade(PluginManager& manager, const std::vector<std::string>& args) {
+  UpgradeApproval approval{args[2], args[3], {}};
+  if (args.size() == 5 && args[4] == "status") approval.services.emplace_back(Contract<csv_import::ImportStatus>::Info.id);
+  else if (args.size() != 4) throw Error(ErrorCode::InvalidArgument, CommandHelp);
+  return manager.UpgradePackage(File(args[1]), std::move(approval));
+}
+
+Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::string>& args) {
+  const auto package = PluginManager::InspectPackage(File(args[1]));
+  const ExtensionId id{package.id, package.contribution};
+  auto previous = manager.CreateExtension(Importers, id);
+  auto pending = manager.CreateExtension(Importers, id);
+  const auto old_pid = previous->ProcessId();
+  if (co_await Upgrade(manager, args) != UpgradeStatus::Applied) {
+    throw Error(ErrorCode::PluginFailed, "The worker upgrade requires a restart");
+  }
+  for (auto* old : {&previous, &pending}) {
+    try {
+      (void)(*old)->Delimiter();
+      throw Error(ErrorCode::PluginFailed, "An old handle followed the worker upgrade");
+    } catch (const Error& error) {
+      if (error.Code() != ErrorCode::Closed) throw;
+    }
+  }
+  auto next = manager.CreateExtension(Importers, id);
+  const auto new_pid = next->ProcessId();
+  co_return Json{{"old_pid", old_pid}, {"new_pid", new_pid}};
+}
+
+Task<Json> CheckInProcessUpgrade(const File& profile, const std::vector<std::string>& args) {
+  const auto package = PluginManager::InspectPackage(File(args[1]));
+  const ExtensionId id{package.id, package.contribution};
+  const auto tasks = UseApplicationTaskScope();
+  {
+    PluginManager manager(profile, std::nullopt, tasks);
+    manager.RegisterExtensionPoint(Importers);
+    auto handle = manager.CreateExtension(Importers, id);
+    (void)handle->Delimiter();
+    if (co_await Upgrade(manager, args) != UpgradeStatus::RestartRequired) {
+      throw Error(ErrorCode::PluginFailed, "The in-process upgrade applied without a restart");
+    }
+    (void)handle->Delimiter();
+    co_await manager.Shutdown();
+  }
+  PluginManager reopened(profile, std::nullopt, tasks);
+  reopened.RegisterExtensionPoint(Importers);
+  const auto changes = co_await reopened.ApplyPendingChanges();
+  if (!changes.empty()) throw Error(ErrorCode::PluginFailed, "Reopening the manager applied the in-process upgrade");
+  const auto installed = reopened.ListPlugins();
+  const auto plugin = std::ranges::find_if(installed, [&](const auto& entry) { return entry.package.id == package.id; });
+  if (plugin == installed.end() || !plugin->pending_upgrade || plugin->pending_upgrade->digest != package.digest) {
+    throw Error(ErrorCode::PluginFailed, "The approved in-process upgrade was lost");
+  }
+  auto handle = reopened.CreateExtension(Importers, id);
+  const csv_import::ImportRequest request{"context"};
+  const auto context = co_await handle->Import(request, nullptr);
+  if (!context.table || context.table->rows.at(0).at(2) != args[2]) {
+    throw Error(ErrorCode::PluginFailed, "The reopened manager selected the replacement too early");
+  }
+  co_await reopened.Shutdown();
+  co_return Json{{"result", "restart_required"}, {"current_digest", args[2]}, {"pending_digest", package.digest}};
+}
+
 Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportStatus>& status,
              const std::vector<std::string>& args) {
   const auto& name = args.front();
@@ -430,6 +495,9 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
     co_return Json::object();
   }
   if (name == "check-receiver-lifetime" && args.size() == 2) co_return co_await CheckReceiverLifetime(manager, args[1]);
+  if (name == "check-worker-upgrade" && (args.size() == 4 || args.size() == 5)) {
+    co_return co_await CheckWorkerUpgrade(manager, args);
+  }
   if (name == "check-plugin-context" && (args.size() == 2 || (args.size() == 3 && args[2] == "disable"))) {
     co_return co_await CheckPluginContext(manager, args[1], args.size() == 3);
   }
@@ -444,6 +512,15 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
     if (args.size() == 5) options.services.emplace_back(Contract<csv_import::ImportStatus>::Info.id);
     manager.InstallPackage(File(args[1]), args[2], std::move(options));
     co_return Json::object();
+  }
+  if (name == "upgrade" && (args.size() == 4 || args.size() == 5)) {
+    const auto result = co_await Upgrade(manager, args);
+    co_return Json{{"result", result == UpgradeStatus::Applied ? "applied" : "restart_required"}};
+  }
+  if (name == "uninstall" && (args.size() == 3 || (args.size() == 4 && args[3] == "delete-data"))) {
+    const auto policy = args.size() == 4 ? PluginDataPolicy::Delete : PluginDataPolicy::Keep;
+    const auto result = co_await manager.UninstallPackage(args[1], args[2], policy);
+    co_return Json{{"result", result == UninstallStatus::Removed ? "removed" : "cleanup_pending"}};
   }
   if ((name == "enable" || name == "disable") && args.size() == 2) {
     co_await manager.SetEnabled(args[1], name == "enable");
@@ -491,11 +568,25 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
       runtime.RequestShutdown();
       co_return;
     }
+    if (args.size() == 5 && args[1] == "check-in-process-upgrade") {
+      const std::vector<std::string> command{Utf8(args[1]), Utf8(args[2]), Utf8(args[3]), Utf8(args[4])};
+      auto response = co_await CheckInProcessUpgrade(File(profile.u8string()), command);
+      response["ok"] = true;
+      Print(response);
+      runtime.RequestShutdown();
+      co_return;
+    }
     PluginManager manager(File(profile.u8string()), File(csv_import::preview::WorkerPath().u8string()),
                           UseApplicationTaskScope());
     auto status = std::make_shared<PreviewImportStatus>(manager);
     manager.ProvideService<csv_import::ImportStatus>(status);
     manager.RegisterExtensionPoint(Importers);
+    for (const auto& change : co_await manager.ApplyPendingChanges()) {
+      if (!change.error) continue;
+      std::cerr << "Plugin upgrade failed for " << change.plugin_id << " (" << ErrorName(*change.error) << ") "
+                << change.message << '\n';
+      if (change.restart_required) std::cerr << "Restart the host to load the previous plugin version.\n";
+    }
     if (args.size() > 1) {
       try {
         std::vector<std::string> command;

@@ -42,6 +42,13 @@ void Worker::Stop() noexcept {
   if (pid > 0) ::kill(-pid, SIGKILL);
 }
 
+void Worker::WaitForExit(std::chrono::milliseconds timeout) {
+  std::unique_lock lock(stop_);
+  if (!exited_.wait_for(lock, timeout, [this] { return pid_ == 0; })) {
+    throw Error(ErrorCode::DeadlineExceeded, "The retired plugin worker has not exited");
+  }
+}
+
 void Worker::Reap(pid_t child) noexcept {
   siginfo_t info{};
   int result;
@@ -55,6 +62,7 @@ void Worker::Reap(pid_t child) noexcept {
     while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
   }
   pid_ = 0;
+  exited_.notify_all();
   ::shutdown(socket_.get(), SHUT_RDWR);
 }
 

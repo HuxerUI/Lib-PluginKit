@@ -119,6 +119,12 @@ void Worker::Stop() noexcept {
   job_.reset();
 }
 
+void Worker::WaitForExit(std::chrono::milliseconds timeout) {
+  const auto result = WaitForSingleObject(process_.get(), static_cast<DWORD>(timeout.count()));
+  if (result == WAIT_TIMEOUT) throw Error(ErrorCode::DeadlineExceeded, "The retired plugin worker has not exited");
+  if (result != WAIT_OBJECT_0) WindowsError(ErrorCode::Io, "Cannot wait for the retired plugin worker");
+}
+
 Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
                        const ReceiverRegistration* receiver) {
   // A separate pipe helper lets the request thread enforce the I/O deadline.

@@ -33,6 +33,52 @@ struct InstallOptions {
   std::vector<std::string> services;
 };
 
+/// @brief Host approval to replace the installed snapshot with a specific local package.
+struct UpgradeApproval {
+  /// Digest of the installed snapshot shown to the user.
+  std::string expected_digest;
+  /// Digest from InspectPackage() for the approved replacement.
+  std::string approved_digest;
+  /// Complete list of service grants for the replacement. An empty list grants no services.
+  std::vector<std::string> services;
+};
+
+/// @brief Whether an approved package upgrade has taken effect.
+enum class UpgradeStatus {
+  /// The replacement is committed in this host process.
+  Applied,
+  /// The replacement is staged for ApplyPendingChanges() in a new host process.
+  RestartRequired,
+};
+
+/// @brief Result of applying one pending in-process upgrade at startup.
+struct PendingChangeResult {
+  /// Identifier of the plugin affected by the upgrade.
+  std::string plugin_id;
+  /// Failure category, if the previous snapshot was kept.
+  std::optional<ErrorCode> error;
+  /// Diagnostic for a failed upgrade.
+  std::string message;
+  /// True if this process must exit before it can load the selected snapshot.
+  bool restart_required = false;
+};
+
+/// @brief What to do with the current plugin data when uninstalling a package.
+enum class PluginDataPolicy {
+  /// Reuse the current data on a later installation with the same plugin identifier.
+  Keep,
+  /// Delete the current data after the plugin has been uninstalled.
+  Delete,
+};
+
+/// @brief Outcome after the installed package has been removed from the profile.
+enum class UninstallStatus {
+  /// The uninstall and requested file cleanup completed.
+  Removed,
+  /// Files remain in use or could not be removed. Opening the profile again retries cleanup.
+  CleanupPending,
+};
+
 /// @brief Identifies a contribution within an installed plugin.
 struct ExtensionId {
   /// Plugin identifier from the manifest.
@@ -80,6 +126,8 @@ struct PluginInfo {
   ExecutionMode mode;
   /// Process ID of the active worker. Empty for an in-process package or while no worker is running.
   std::optional<std::uint32_t> worker_pid;
+  /// Approved replacement waiting for a new host process, if any.
+  std::optional<PackageInfo> pending_upgrade;
 };
 
 /// @brief Manifest metadata for an enabled contribution that matches a registered contract.
@@ -271,6 +319,43 @@ public:
   /// @see InspectPackage(), ProvideService()
   void InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options = {});
 
+  /// @brief Replaces an installed plugin with an approved package from a local directory.
+  ///
+  /// Use the same plugin identifier, a different release version, and the installed execution mode.
+  /// An enabled worker is retired before the candidate is validated on a copy of the plugin data. The
+  /// package, grants, and data are selected together at commit. Disabled plugins stay disabled and
+  /// activate when next used. The data copy accepts regular files and directories. An in-process upgrade
+  /// is applied after a host process restart.
+  /// @param directory Local package directory. The Task reads it when it runs.
+  /// @param approval Installed and replacement digests and the replacement's approved services.
+  /// @return Lazy Task yielding the status of the approved upgrade. Cancelling the wait after admission
+  /// lets the manager finish the transaction.
+  /// @throws Error With ApprovalMismatch for a changed digest, NotFound for an uninstalled plugin,
+  /// Busy for a concurrent change, or the validation or I/O failure that prevented commit.
+  Task<UpgradeStatus> UpgradePackage(File directory, UpgradeApproval approval);
+
+  /// @brief Removes an installed plugin, its service grants, and any pending upgrade.
+  ///
+  /// Release handles that borrow native interfaces before awaiting uninstall. Loaded in-process libraries
+  /// can remain mapped until host exit. The default policy preserves the current data for a later install.
+  /// @param plugin_id Installed plugin identifier.
+  /// @param expected_digest Digest of the installed snapshot being removed.
+  /// @param data Policy for the plugin's current data directory.
+  /// @return Lazy Task that completes after uninstall and the first attempt to clean up files.
+  /// @throws Error With ApprovalMismatch for a changed digest, NotFound for an uninstalled plugin,
+  /// Busy for a concurrent change, or Io if the profile cannot be committed.
+  Task<UninstallStatus> UninstallPackage(std::string_view plugin_id, std::string_view expected_digest,
+                                         PluginDataPolicy data = PluginDataPolicy::Keep);
+
+  /// @brief Applies upgrades staged in an earlier host process.
+  ///
+  /// Await after registering extension points and host services and before creating extensions. A failed
+  /// candidate leaves the previous snapshot selected. If the candidate was loaded in process, its
+  /// library stays mapped and loading the previous snapshot requires another host process.
+  /// @return Lazy Task yielding one result for each eligible pending change it attempted.
+  /// @throws Error With Closed after shutdown or ReentrantCall from a host callback.
+  Task<std::vector<PendingChangeResult>> ApplyPendingChanges();
+
   /// @brief Persists enablement and retires the active plugin when disabling it.
   ///
   /// Disabling stops admission. In-process teardown cancels managed calls, waits for tracked blocking work,
@@ -324,7 +409,6 @@ private:
   std::vector<ExtensionInfo> List(std::string_view point, ContractInfo contract) const;
   struct Impl;
   static Task<void> ShutdownManager(std::shared_ptr<Impl> impl);
-  static Task<void> ChangeEnabled(std::shared_ptr<Impl> impl, std::string id, bool enabled);
   std::shared_ptr<detail::ExtensionTarget> Create(std::string_view point, ContractInfo contract,
                                                   const ExtensionId& id, std::chrono::milliseconds timeout);
 

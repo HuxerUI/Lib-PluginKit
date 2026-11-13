@@ -53,7 +53,7 @@ The Kit ABI and protocol, application contract version, and plugin release versi
 | --- | --- |
 | `PluginId` | Stable logical identity of a plugin across releases. |
 | `PluginPackage` and `PluginManifest` | The installable artifacts and the declarations that describe them. |
-| `PluginInfo` | A catalog snapshot containing the selected and available versions, enabled state, and execution status. |
+| `PluginInfo` | A catalog snapshot containing the installed package, any pending upgrade, enabled state, and execution status. |
 | `Contract` | The versioned callable schema derived from an interface. |
 | `ExtensionPoint<T>` | A named application extension point for a contract. Several points can use the same interface with different metadata and selection rules. |
 | `ExtensionId` | The plugin ID and a stable contribution ID within that plugin. |
@@ -68,10 +68,10 @@ The application owns one `huxerui::pluginkit::PluginManager` for each plugin pro
 | Responsibility | API | Behavior |
 | --- | --- | --- |
 | Configuration | `RegisterExtensionPoint(point)`, `ProvideService<T>()` | Declare typed extension points and register one implementation per host service. |
-| Manager lifetime | `StartAsync()`, `ShutdownAsync()` | Recover the profile before publishing the catalog. On shutdown, stop new work and release owned runtime resources. |
+| Manager lifetime | `PluginManager`, `ApplyPendingChanges()`, `Shutdown()` | Recover the profile at construction, apply pending upgrades after registration, and release runtime resources on shutdown. |
 | Discovery | `RefreshCatalogAsync()`, `ListPlugins()`, `ListExtensions(point)` | Refresh configured sources and read catalog snapshots. Listing contributions uses manifest metadata. |
 | Invocation | `CreateExtension(point, id)` | Synchronously return a typed handle. The first managed method creates the instance. |
-| Changes | `PlanChangesAsync(changes)`, `ApplyPlanAsync(plan, approval)` | Coordinate installation, enablement, disablement, updates, removal, pinning, provider selection, grant changes, and rollback. |
+| Local package changes | `InstallPackage()`, `SetEnabled()`, `UpgradePackage()`, `UninstallPackage()` | Install an approved snapshot, persist enablement, upgrade to another local release, and uninstall with a data retention policy. |
 | Settings | `GetSettings(plugin_id)`, `SetSettingsAsync(plugin_id, values)` | Read a snapshot and validate or persist changes against the plugin settings schema. |
 | Observability | `SubscribeEvents()`, `Diagnostics()` | Report catalog revisions, state transitions, operation progress, and structured failures. Subscription handles release their callbacks. |
 
@@ -79,7 +79,7 @@ Explicit IDs and stored user preferences take precedence over automatic matching
 
 `ExtensionHandle<DocumentImporter>` exposes the published interface through `operator->`. The host calls `importer->Format()` or awaits `importer->Import(request)` using the original signatures. Scope exit releases the handle and retires the instance after active work leaves it.
 
-A plugin activation owns a single `PluginContext`. The SDK passes it by const reference to optional `Activate` and `Deactivate` hooks and to each extension implementation that accepts it in its constructor. `Activate` runs before the first instance is created. Normal shutdown destroys the instances before calling `Deactivate`. The host derives the bundle directory from the approved package snapshot and the writable data directory from the plugin ID in the profile. Both are exposed as `huxerui::File`.
+A plugin activation owns a single `PluginContext`. The SDK passes it by const reference to optional `OnActivate` and `OnDeactivate` hooks and to each extension implementation that accepts it in its constructor. `OnActivate` runs before the first instance is created. Orderly teardown destroys the instances before calling `OnDeactivate`. The bundle directory identifies the approved snapshot and the writable data directory is selected by the committed profile. Both are exposed as `huxerui::File`.
 
 The host records service grants and execution mode with the approved package digest. During a call, `GetService<T>()` synchronously returns a typed handle. The service implementation resolves the grant from the invocation. The caller supplies a `Receiver<T>` as a shared C++ callback argument, with access scoped to that invocation. See the [CSV example](../README.md#sdk-and-runtime).
 
@@ -130,7 +130,7 @@ Discovery reads manifests from explicit local sources and configured repositorie
 
 The resolver selects one release per plugin ID in a profile. It honors version pins and required version ranges, verifies required host services, rejects required dependency cycles, and reports the dependency chain for conflicts. Optional dependencies become available features when a compatible provider exists. Required dependencies activate before dependents, and teardown follows the reverse order. The committed resolution is persisted for reproducible startup.
 
-The manager verifies local packages against application trust policy. Remote sources use authenticated update metadata with expiry and rollback checks. Installed and previously verified packages can remain available offline under the active policy. An explicit rollback can select a retained trusted package and still applies current grants and trust decisions. [The Update Framework specification](https://theupdateframework.github.io/specification/latest/)
+The manager verifies local packages against application trust policy. Remote sources use authenticated update metadata with expiry and rollback checks. Installed and previously verified packages can remain available offline under the active policy. [The Update Framework specification](https://theupdateframework.github.io/specification/latest/)
 
 ## Execution, permissions, and instance lifetime
 
@@ -151,15 +151,15 @@ Worker exit completes pending calls with a failure and marks the generation faul
 
 ## Management transactions and persisted state
 
-A profile records the selected releases, dependency resolution, enabled flags, provider preferences, grants, and settings. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.
+A profile records the selected local package, enabled flag, granted services, and data directory per installed plugin. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.
 
-`PlanChangesAsync` computes a proposed change against a specific profile revision and package digests. The plan lists installs and removals, affected dependents, version selections, required approvals, and restart requirements. An approval binds to the exact plan and its requested grants. `ApplyPlanAsync` rechecks the revision, package identity, and trust policy before changing state. A stale plan requires planning again.
+`UpgradePackage` checks the installed and candidate digests and the complete approved grant list. The package keeps the plugin identifier, declares a different release version, and matches the registered contract and installed execution mode. `UninstallPackage` checks the installed digest and removes its catalog entry, grants, and pending upgrade. Current plugin data is retained by default and reused on reinstall. `PluginDataPolicy::Delete` records that the data can be removed after uninstall commits.
 
-The manager stages verified package files and candidate profile data, then commits a durable revision. Startup recovers an interrupted operation before exposing the catalog. Candidate activation and settings migration use staged Kit-owned state. A failed change preserves the last committed version selection, settings, and dependency resolution. Business data migration and recovery follow the application's contracts.
+The manager stages the verified package and records when validation begins. It stops the old generation before copying the current data. The plugin owns data format migration in `OnActivate` and can write to the candidate copy. One atomic profile replacement selects the package, the grants, and the migrated data. Opening the profile discards interrupted candidates and retries cleanup of files discarded by a committed change. Host side effects and files outside the plugin data directory follow the application's contracts.
 
-An enabled worker or Wasm plugin can be upgraded by validating the candidate generation and its resolved dependencies, committing the new selection, and draining the old generation. New calls go to newly opened handles. Updates to in-process plugin libraries are recorded as pending restart and validated at startup. Built-in code versions follow the application release. Old packages are retained while a running generation, a pin, or a rollback record references them.
+An enabled worker upgrade waits for the old worker to exit and validates the candidate in a new worker before committing. The host obtains new handles after commit. In-process upgrades wait for a new host process and are applied by `ApplyPendingChanges` after registration. If a failed candidate was mapped, the selected old version can be loaded in a subsequent process. Disabled packages keep their enablement state and activate on first use. The old package and data can be cleaned up once their references are released.
 
-Settings are versioned, validated against the declared schema, and persisted by plugin ID within the profile. The manager stages settings migrations with the candidate release. Private plugin data has its own lifetime and follows an explicit retention choice on removal. Grants are tied to plugin and publisher identity. A change that expands access requires approval before the new grant takes effect. Revocation invalidates the corresponding scoped handles. The manager restarts affected workers when the new policy requires a different sandbox.
+The broader management design can use `PlanChangesAsync` and `ApplyPlanAsync` for coordinated package and dependency changes against a profile revision. It includes versioned settings validated against a schema, provider preferences, and scoped grant revocation. Local upgrades commit explicit grants for the approved target digest.
 
 ## Toolchain and HuxerUI integration
 
@@ -182,4 +182,5 @@ An optional HuxerUI adapter provides `PluginCenter(manager)`, schema-driven sett
 - Crash or stall one worker during a call. Verify that unrelated plugins remain available, that the pending call reports a useful error, and that recovery can open a new generation.
 - Disable an extension while an application retains its handle and another call is in flight. Verify that new calls are refused and that resources are released after draining.
 - Exercise a compatible contract minor revision, an incompatible contract, a dependency conflict, a denied grant, and a changed package digest. Verify that each diagnostic identifies the failing condition.
-- Interrupt an update and fail a candidate activation. Verify that startup recovers the last committed profile and that explicit rollback restores a retained release subject to current policy.
+- Interrupt a local upgrade and fail a candidate activation after it writes to its data copy. Verify that startup selects the last committed package, grants, and data and finishes pending file cleanup.
+- Upgrade a worker in the running host and an in-process plugin after restart. Uninstall with each data policy and verify that reinstall only reuses retained data.

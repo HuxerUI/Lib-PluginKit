@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <map>
+#include <random>
+#include <set>
 
 namespace huxerui::pluginkit {
 namespace {
@@ -127,11 +129,77 @@ struct Installed {
   Json manifest;
   bool enabled;
   InstallOptions approval;
+  std::string data;
+};
+
+struct PendingUpgrade {
+  Installed target;
+  std::string expected_digest;
+  std::string process;
+  bool applying;
 };
 
 using Catalog = std::map<std::string, Installed, std::less<>>;
 
-Catalog ReadCatalog(const fs::path& file) {
+struct Profile {
+  Catalog plugins;
+  std::map<std::string, PendingUpgrade, std::less<>> upgrades;
+  std::map<std::string, std::string, std::less<>> retained_data;
+  std::set<std::string, std::less<>> discarded_data;
+};
+
+std::string DefaultDataName(std::string_view id) { return "plugin-" + std::string(id) + ".data"; }
+
+bool IsDataName(std::string_view id, std::string_view name) {
+  const auto base = DefaultDataName(id);
+  return name == base || (name.starts_with(base + ".") && IsDigest(name.substr(base.size() + 1)));
+}
+
+bool IsManagedDataName(std::string_view name) {
+  const auto suffix = name.rfind(".data");
+  if (!name.starts_with("plugin-") || suffix == std::string_view::npos || suffix <= 7) return false;
+  const auto id = name.substr(7, suffix - 7);
+  return IsId(id) && IsDataName(id, name);
+}
+
+void RequireManagedDirectory(const fs::path& directory) {
+  // Keep package and data operations inside the profile, including when deleting an abandoned snapshot.
+  const auto status = fs::symlink_status(directory);
+  if (status.type() == fs::file_type::not_found) return;
+  if (!fs::is_directory(status)) throw Error(ErrorCode::Io, "Expected a managed directory at " + PathText(directory));
+#if defined(_WIN32)
+  const auto attributes = GetFileAttributesW(directory.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) WindowsError(ErrorCode::Io, "Cannot inspect a managed directory");
+  if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    throw Error(ErrorCode::Io, "A managed directory cannot redirect outside the profile");
+  }
+#endif
+}
+
+Installed ReadInstalled(const Json& entry) {
+  const auto digest = entry.at("digest").get<std::string>();
+  if (!IsDigest(digest)) throw Error(ErrorCode::Io, "Invalid package digest in the profile");
+  auto manifest = entry.at("manifest");
+  auto info = ParseManifest(manifest, digest);
+  InstallOptions approval{ParseMode(entry.at("mode").get<std::string>(), ErrorCode::Io),
+                          entry.at("services").get<std::vector<std::string>>()};
+  auto data = entry.at("data").get<std::string>();
+  if (!IsDataName(info.id, data) ||
+      std::ranges::find(info.execution_modes, approval.mode) == info.execution_modes.end() ||
+      approval.services.size() > 64 || !std::ranges::is_sorted(approval.services) ||
+      std::ranges::adjacent_find(approval.services) != approval.services.end() ||
+      !std::ranges::all_of(approval.services, [](const auto& service) { return IsId(service); })) {
+    throw Error(ErrorCode::Io, "Invalid plugin data or approval in the profile");
+  }
+  return {std::move(info), std::move(manifest), entry.at("enabled").get<bool>(), std::move(approval), std::move(data)};
+}
+
+Json DescribeInstalled(const Installed& plugin) {
+  return {{"digest", plugin.info.digest}, {"manifest", plugin.manifest}, {"enabled", plugin.enabled},
+          {"mode", ModeName(plugin.approval.mode)}, {"services", plugin.approval.services}, {"data", plugin.data}};
+}
+
+Profile ReadProfile(const fs::path& file) {
   std::error_code error;
   const auto status = fs::symlink_status(file, error);
   if (status.type() == fs::file_type::not_found) return {};
@@ -140,44 +208,133 @@ Catalog ReadCatalog(const fs::path& file) {
     const auto bytes = ReadFileBytes(file, MaxProfile);
     const auto profile = ParseJson(bytes, MaxManifestDepth + 4, ErrorCode::Io);
     const auto& plugins = profile.at("plugins");
-    if (profile.at("schema_version") != 1 || !plugins.is_array()) {
+    const auto& upgrades = profile.at("upgrades");
+    const auto& retained = profile.at("retained_data");
+    const auto& discarded = profile.at("discarded_data");
+    if (profile.at("schema_version") != 1 || !plugins.is_array() || !upgrades.is_array() ||
+        !retained.is_object() || !discarded.is_array()) {
       throw Error(ErrorCode::Io, "Invalid plugin profile format");
     }
-    Catalog catalog;
+    Profile result;
     for (const auto& plugin : plugins) {
-      const auto digest = plugin.at("digest").get<std::string>();
-      if (!IsDigest(digest)) throw Error(ErrorCode::Io, "Invalid package digest in the profile");
-      auto manifest = plugin.at("manifest");
-      auto info = ParseManifest(manifest, digest);
-      const auto id = info.id;
-      InstallOptions approval{ParseMode(plugin.at("mode").get<std::string>(), ErrorCode::Io),
-                              plugin.at("services").get<std::vector<std::string>>()};
-      if (std::ranges::find(info.execution_modes, approval.mode) == info.execution_modes.end() ||
-          approval.services.size() > 64 || !std::ranges::is_sorted(approval.services) ||
-          std::ranges::adjacent_find(approval.services) != approval.services.end() ||
-          !std::ranges::all_of(approval.services, [](const auto& service) { return IsId(service); })) {
-        throw Error(ErrorCode::Io, "Invalid plugin approval in the profile");
-      }
-      if (!catalog.emplace(id, Installed{std::move(info), std::move(manifest), plugin.at("enabled").get<bool>(),
-                                         std::move(approval)}).second) {
+      auto installed = ReadInstalled(plugin);
+      const auto id = installed.info.id;
+      if (!result.plugins.emplace(id, std::move(installed)).second) {
         throw Error(ErrorCode::Io, "Duplicate plugin ID in the profile");
       }
     }
-    return catalog;
+    for (const auto& entry : upgrades) {
+      PendingUpgrade upgrade{ReadInstalled(entry.at("target")), entry.at("expected_digest").get<std::string>(),
+                             entry.at("process").get<std::string>(), entry.at("applying").get<bool>()};
+      const auto id = upgrade.target.info.id;
+      const auto current = result.plugins.find(id);
+      if (current == result.plugins.end() || current->second.info.digest != upgrade.expected_digest ||
+          current->second.approval.mode != upgrade.target.approval.mode ||
+          current->second.info.version == upgrade.target.info.version ||
+          current->second.info.digest == upgrade.target.info.digest || !IsDigest(upgrade.process) ||
+          (!upgrade.applying && upgrade.target.approval.mode != ExecutionMode::InProcess) ||
+          upgrade.target.data == current->second.data ||
+          !result.upgrades.emplace(id, std::move(upgrade)).second) {
+        throw Error(ErrorCode::Io, "Invalid pending upgrade in the profile");
+      }
+    }
+    for (const auto& [id, value] : retained.items()) {
+      auto data = value.get<std::string>();
+      if (!IsId(id) || !IsDataName(id, data) || result.plugins.contains(id)) {
+        throw Error(ErrorCode::Io, "Invalid retained data in the profile");
+      }
+      result.retained_data.emplace(id, std::move(data));
+    }
+    for (const auto& entry : discarded) {
+      auto name = entry.get<std::string>();
+      if (!IsManagedDataName(name)) throw Error(ErrorCode::Io, "Invalid data cleanup entry in the profile");
+      result.discarded_data.insert(std::move(name));
+    }
+    return result;
   } catch (const Json::exception& error) {
     throw Error(ErrorCode::Io, "Cannot parse the plugin profile: " + std::string(error.what()));
   }
 }
 
-void SaveCatalog(const fs::path& file, const Catalog& catalog) {
+void SaveProfile(const fs::path& file, const Profile& profile) {
   auto plugins = Json::array();
-  for (const auto& [id, installed] : catalog) {
-    plugins.push_back({{"digest", installed.info.digest}, {"manifest", installed.manifest}, {"enabled", installed.enabled},
-                       {"mode", ModeName(installed.approval.mode)}, {"services", installed.approval.services}});
+  for (const auto& [id, installed] : profile.plugins) plugins.push_back(DescribeInstalled(installed));
+  auto upgrades = Json::array();
+  for (const auto& [id, upgrade] : profile.upgrades) {
+    upgrades.push_back({{"target", DescribeInstalled(upgrade.target)}, {"expected_digest", upgrade.expected_digest},
+                        {"process", upgrade.process}, {"applying", upgrade.applying}});
   }
-  const auto text = Json{{"schema_version", 1}, {"plugins", std::move(plugins)}}.dump(2);
+  const auto text = Json{{"schema_version", 1}, {"plugins", std::move(plugins)}, {"upgrades", std::move(upgrades)},
+                         {"retained_data", profile.retained_data}, {"discarded_data", profile.discarded_data}}.dump(2);
   if (text.size() > MaxProfile) throw Error(ErrorCode::PayloadTooLarge, "The plugin profile exceeds the byte limit");
   WriteAtomicFile(file, AsBytes(text));
+}
+
+std::string NewToken() {
+  std::random_device random;
+  std::array<std::uint32_t, 8> values;
+  for (auto& value : values) value = random();
+  return Sha256(std::as_bytes(std::span(values)));
+}
+
+const std::string& HostProcessToken() {
+  static const auto token = NewToken();
+  return token;
+}
+
+void CopyPluginData(const fs::path& source, const fs::path& destination) {
+  if (!fs::create_directory(destination)) throw Error(ErrorCode::Io, "The candidate data directory already exists");
+  const auto status = fs::symlink_status(source);
+  if (status.type() == fs::file_type::not_found) return;
+  RequireManagedDirectory(source);
+  for (const auto& entry : fs::recursive_directory_iterator(source)) {
+    const auto target = destination / entry.path().lexically_relative(source);
+    const auto type = entry.symlink_status();
+    if (fs::is_directory(type)) {
+      RequireManagedDirectory(entry.path());
+      fs::create_directory(target);
+    } else if (fs::is_regular_file(type)) {
+      fs::copy_file(entry.path(), target);
+    } else {
+      throw Error(ErrorCode::Io, "Unsupported entry in plugin data: " + PathText(entry.path()));
+    }
+  }
+}
+
+void RemoveUnusedDirectories(const fs::path& root, const std::set<std::string, std::less<>>& retained,
+                             const auto& eligible) {
+  std::error_code error;
+  auto entries = fs::directory_iterator(root, error);
+  const fs::directory_iterator end;
+  for (; !error && entries != end; entries.increment(error)) {
+    const auto path = entries->path();
+    const auto name = PathText(path.filename());
+    if (!retained.contains(name) && eligible(path, name)) {
+      std::error_code removal;
+      fs::remove_all(path, removal);
+    }
+  }
+}
+
+template<class Result, class Impl, class Work>
+Task<Result> RunManagement(std::shared_ptr<Impl> impl, Work work) {
+  RejectServiceReentry(co_await CurrentTaskExecution{});
+  auto start = [impl, work = std::move(work)](auto complete) mutable {
+    (void)impl->callbacks.Launch([impl, work = std::move(work), complete]() mutable -> Task<void> {
+      try {
+        if constexpr (std::is_void_v<Result>) {
+          co_await work(*impl);
+          complete.Complete();
+        } else {
+          complete.Complete(co_await work(*impl));
+        }
+      } catch (...) {
+        complete.Fail(std::current_exception());
+      }
+    });
+    return std::function<void()>{};
+  };
+  co_return co_await AwaitCallback<Result>(std::move(start));
 }
 
 struct RegisteredContract {
@@ -191,29 +348,41 @@ struct RegisteredContract {
 
 } // namespace
 
-struct PluginManager::Impl {
+struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   Impl(const File& directory, const std::optional<File>& executable, TaskScope callbacks)
       : profile(fs::absolute(NativePath(directory))),
         worker_executable(executable ? std::optional(fs::absolute(NativePath(*executable))) : std::nullopt),
         callbacks(std::move(callbacks)) {
     fs::create_directories(profile);
+    profile = fs::canonical(profile);
     ownership = LockProfile(profile);
-    catalog = ReadCatalog(profile / "profile.json");
-  }
-
-  ~Impl() {
-    for (const auto& [id, worker] : workers) worker->Shutdown();
+    RequireManagedDirectory(profile / "packages");
+    RequireManagedDirectory(profile / "data");
+    profile_state = ReadProfile(profile / "profile.json");
+    if (std::ranges::any_of(profile_state.upgrades, [](const auto& entry) { return entry.second.applying; })) {
+      auto recovered = profile_state;
+      std::erase_if(recovered.upgrades, [&](const auto& entry) {
+        if (!entry.second.applying) return false;
+        recovered.discarded_data.insert(entry.second.target.data);
+        return true;
+      });
+      Commit(std::move(recovered));
+    }
+    CleanupFilesAfterCommit();
   }
 
   void ShutdownWorkers() {
     std::call_once(shutdown, [&] {
       decltype(workers) running;
+      decltype(retired_workers) retired;
       {
         std::lock_guard lock(mutex);
         running.swap(workers);
+        retired.swap(retired_workers);
       }
       for (const auto& [id, worker] : running) worker->BeginShutdown();
       for (const auto& [id, worker] : running) worker->Shutdown();
+      for (const auto& [digest, entry] : retired) entry.worker->Shutdown();
     });
   }
 
@@ -226,32 +395,78 @@ struct PluginManager::Impl {
   }
 
   Package VerifyPackage(const Installed& installed) const;
-  PluginStartup Startup(const PackageInfo& info) const;
+  void ValidatePackage(const PackageInfo& info, InstallOptions& approval) const;
+  void StorePackage(const Package& package);
+  PluginStartup Startup(const Installed& installed) const;
+  std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed);
+  std::shared_ptr<Worker> MakeWorker(const Installed& installed, const Package& package,
+                                     std::vector<Worker::Service> granted);
+  std::vector<Worker::Service> WorkerServices(const Installed& installed) const;
+  std::vector<std::shared_ptr<Worker>> ActiveAndRetiredWorkers(std::string_view id) const;
   std::shared_ptr<Worker> StartWorker(const std::string& id, const std::stop_token& admission,
                                      Deadline deadline, std::stop_token stop);
   Task<void> ChangeLocalEnabled(const std::string& id, bool enabled);
   void ChangeWorkerEnabled(const std::string& id, bool enabled, std::stop_token stop);
+  Task<void> SetEnabled(std::string id, bool enabled);
+  Task<UpgradeStatus> Upgrade(File directory, UpgradeApproval approval);
+  Task<UninstallStatus> Uninstall(std::string id, std::string expected_digest, PluginDataPolicy data);
+  Task<std::vector<PendingChangeResult>> ApplyPending();
+  Task<UpgradeStatus> ApplyUpgrade(std::string id, std::optional<Package> source, UpgradeApproval approval = {});
+  Task<void> RetirePlugin(const std::string& id);
+  void CleanupFiles();
+  bool IsPluginBusy(std::string_view id, const Installed& installed) const;
+  void CleanupFilesAfterCommit() noexcept;
+  void PruneExitedWorkers();
 
-  void Commit(Catalog candidate) {
+  void Commit(Profile candidate) {
     // Publish the candidate in memory after the profile file is committed.
-    SaveCatalog(profile / "profile.json", candidate);
-    catalog.swap(candidate);
+    SaveProfile(profile / "profile.json", candidate);
+    std::swap(profile_state, candidate);
   }
 
   const Installed& RequireInstalled(std::string_view id) const {
     if (closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
-    const auto found = catalog.find(id);
-    if (found == catalog.end()) throw Error(ErrorCode::NotFound, "The plugin is not installed");
+    const auto found = profile_state.plugins.find(id);
+    if (found == profile_state.plugins.end()) throw Error(ErrorCode::NotFound, "The plugin is not installed");
     return found->second;
   }
 
   void CommitEnabled(std::string_view id, bool enabled) {
-    auto candidate = catalog;
-    candidate.find(id)->second.enabled = enabled;
+    auto candidate = profile_state;
+    candidate.plugins.find(id)->second.enabled = enabled;
     Commit(std::move(candidate));
   }
 
+  void RequireIdle(std::string_view id) const {
+    if (changes.contains(id)) throw Error(ErrorCode::Busy, "The plugin has a management operation in progress");
+  }
+
+  struct Change {
+    Impl& manager;
+    const std::string& id;
+    bool exclusive;
+
+    // The caller holds the manager mutex until admission has been reserved.
+    Change(Impl& manager, const std::string& id, bool exclusive = true)
+        : manager(manager), id(id), exclusive(exclusive) {
+      const auto current = manager.changes.find(id);
+      if (current != manager.changes.end() && (exclusive || current->second == 0)) {
+        throw Error(ErrorCode::Busy, "The plugin has a management operation in progress");
+      }
+      if (exclusive) manager.changes.emplace(id, 0);
+      else ++manager.changes[id];
+    }
+    ~Change() {
+      std::lock_guard lock(manager.mutex);
+      const auto current = manager.changes.find(id);
+      if (exclusive || --current->second == 0) manager.changes.erase(current);
+    }
+    Change(const Change&) = delete;
+    Change& operator=(const Change&) = delete;
+  };
+
   fs::path PackageDirectory(std::string_view digest) const { return profile / "packages" / std::string(digest); }
+  fs::path DataDirectory(std::string_view name) const { return profile / "data" / std::string(name); }
 
   const RegisteredContract& RequirePoint(std::string_view point, ContractInfo expected) const {
     const auto found = points.find(point);
@@ -267,7 +482,15 @@ struct PluginManager::Impl {
   TaskScope callbacks;
   Handle ownership;
   mutable std::mutex mutex;
-  Catalog catalog;
+  Profile profile_state;
+  // Zero is an exclusive package change. A positive value counts in-flight enablement changes.
+  std::map<std::string, std::size_t, std::less<>> changes;
+  struct RetiredWorker {
+    std::string id;
+    std::shared_ptr<Worker> worker;
+    std::string data;
+  };
+  std::map<std::string, RetiredWorker, std::less<>> retired_workers;
   std::map<std::string, RegisteredContract, std::less<>> points;
   std::map<std::string, RegisteredService, std::less<>> services;
   std::map<std::string, std::shared_ptr<Worker>, std::less<>> workers;
@@ -276,6 +499,70 @@ struct PluginManager::Impl {
   bool closed = false;
   std::once_flag shutdown;
 };
+
+void PluginManager::Impl::CleanupFiles() {
+  RequireManagedDirectory(profile / "packages");
+  RequireManagedDirectory(profile / "data");
+  std::set<std::string, std::less<>> packages;
+  std::set<std::string, std::less<>> data;
+  for (const auto& [id, plugin] : profile_state.plugins) {
+    packages.insert(plugin.info.digest);
+    data.insert(plugin.data);
+  }
+  for (const auto& [id, upgrade] : profile_state.upgrades) {
+    packages.insert(upgrade.target.info.digest);
+    data.insert(upgrade.target.data);
+  }
+  for (const auto& [id, directory] : profile_state.retained_data) data.insert(directory);
+
+  // A mapped library may still be referenced by C++ code. Its directory can be cleaned in a later process.
+  RemoveUnusedDirectories(profile / "packages", packages,
+      [&](const fs::path& path, std::string_view name) {
+        return IsDigest(name) && !retired_workers.contains(name) && !IsInProcessModuleMapped(path / ModuleName);
+      });
+  auto remaining = profile_state.discarded_data;
+  std::erase_if(remaining, [&](const auto& name) {
+    if (data.contains(name) || std::ranges::any_of(retired_workers, [&](const auto& retired) {
+          return retired.second.data == name;
+        })) return false;
+    std::error_code removal;
+    fs::remove_all(DataDirectory(name), removal);
+    return !removal;
+  });
+  if (remaining.size() != profile_state.discarded_data.size()) {
+    auto next = profile_state;
+    next.discarded_data = std::move(remaining);
+    Commit(std::move(next));
+  }
+}
+
+void PluginManager::Impl::CleanupFilesAfterCommit() noexcept {
+  try {
+    CleanupFiles();
+  } catch (...) {
+    // The committed profile remains authoritative. Opening it again retries file cleanup.
+  }
+}
+
+void PluginManager::Impl::PruneExitedWorkers() {
+  std::erase_if(retired_workers, [](const auto& entry) {
+    try {
+      entry.second.worker->WaitForExit(std::chrono::milliseconds::zero());
+      return true;
+    } catch (const Error&) {
+      return false;
+    }
+  });
+}
+
+bool PluginManager::Impl::IsPluginBusy(std::string_view id, const Installed& installed) const {
+  if (const auto change = changes.find(id); change != changes.end() && change->second == 0) return true;
+  const auto pending = profile_state.upgrades.find(id);
+  if (pending != profile_state.upgrades.end() && pending->second.applying) return true;
+  if (installed.approval.mode != ExecutionMode::InProcess) return false;
+  if (InProcessVersionRequiresRestart(profile, id, installed.info.digest)) return true;
+  return pending != profile_state.upgrades.end() && pending->second.process != HostProcessToken();
+}
 
 std::string_view ErrorName(ErrorCode code) noexcept {
   switch (code) {
@@ -332,6 +619,13 @@ Task<void> PluginManager::ShutdownManager(std::shared_ptr<Impl> impl) {
     for (auto& [id, admission] : impl->admissions) admission.request_stop();
   }
   for (const auto& [id, local] : impl->local_plugins) BeginLocalShutdown(local);
+  for (;;) {
+    {
+      std::lock_guard lock(impl->mutex);
+      if (impl->changes.empty()) break;
+    }
+    co_await Delay(std::chrono::milliseconds(1));
+  }
   co_await RunTransport([impl](std::stop_token) { impl->ShutdownWorkers(); });
   std::vector<std::shared_ptr<LocalPlugin>> locals;
   for (const auto& [id, local] : impl->local_plugins) locals.push_back(local);
@@ -370,24 +664,16 @@ void PluginManager::Provide(ContractInfo contract, std::shared_ptr<void> impleme
   }
 }
 
-void PluginManager::InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options) {
-  RejectServiceReentry();
-  auto package = ReadPackage(NativePath(directory));
-  if (package.info.digest != approved_digest) {
-    throw Error(ErrorCode::ApprovalMismatch, "The package contents differ from the approved digest");
-  }
-  package.module_file.reset();
-  std::lock_guard lock(impl_->mutex);
-  const auto point = impl_->points.find(package.info.point);
-  if (point == impl_->points.end() || !Matches(package.info, point->second.Info())) {
+void PluginManager::Impl::ValidatePackage(const PackageInfo& info, InstallOptions& options) const {
+  const auto point = points.find(info.point);
+  if (point == points.end() || !Matches(info, point->second.Info())) {
     throw Error(ErrorCode::ContractMismatch, "The package does not match a registered extension point");
   }
-  if (impl_->closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
-  if (std::ranges::find(package.info.execution_modes, options.mode) == package.info.execution_modes.end() ||
-      (options.mode == ExecutionMode::WorkerProcess && (!point->second.remote || !impl_->worker_executable))) {
+  if (std::ranges::find(info.execution_modes, options.mode) == info.execution_modes.end() ||
+      (options.mode == ExecutionMode::WorkerProcess && (!point->second.remote || !worker_executable))) {
     throw Error(ErrorCode::UnsupportedMode, "The package or extension point cannot use the selected execution mode");
   }
-  if (options.mode == ExecutionMode::InProcess && package.info.cpp_abi != CppAbi) {
+  if (options.mode == ExecutionMode::InProcess && info.cpp_abi != CppAbi) {
     throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
   }
   std::ranges::sort(options.services);
@@ -396,74 +682,383 @@ void PluginManager::InstallPackage(const File& directory, std::string_view appro
     throw Error(ErrorCode::InvalidArgument, "Invalid approved service list");
   }
   for (const auto& service : options.services) {
-    const auto found = impl_->services.find(service);
-    if (found == impl_->services.end() || (options.mode == ExecutionMode::WorkerProcess && !found->second.dispatch)) {
+    const auto found = services.find(service);
+    if (found == services.end() || (options.mode == ExecutionMode::WorkerProcess && !found->second.dispatch)) {
       throw Error(ErrorCode::InvalidArgument, "The approved service is unavailable in the selected mode: " + service);
     }
   }
+}
 
-  const auto current = impl_->catalog.find(package.info.id);
-  if (current != impl_->catalog.end() && current->second.info.digest != package.info.digest) {
+void PluginManager::Impl::StorePackage(const Package& package) {
+  const auto destination = PackageDirectory(package.info.digest);
+  RequireManagedDirectory(destination.parent_path());
+  RequireManagedDirectory(destination);
+  try {
+    if (ReadPackage(destination).info.digest == package.info.digest) return;
+  } catch (const Error&) {
+    // Restore the approved bytes if a previous write left an incomplete snapshot.
+  }
+  if (IsInProcessModuleMapped(destination / ModuleName)) {
+    throw Error(ErrorCode::Busy, "Restart the host before replacing a mapped plugin library");
+  }
+  fs::create_directories(destination);
+  // Both files must be in place before the profile can reference the package.
+  WriteAtomicFile(destination / "plugin.json", package.manifest_bytes);
+  WriteAtomicFile(destination / ModuleName, package.module_bytes);
+}
+
+void PluginManager::InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options) {
+  RejectServiceReentry();
+  auto package = ReadPackage(NativePath(directory));
+  if (package.info.digest != approved_digest) {
+    throw Error(ErrorCode::ApprovalMismatch, "The package contents differ from the approved digest");
+  }
+  package.module_file.reset();
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
+  impl_->RequireIdle(package.info.id);
+  impl_->PruneExitedWorkers();
+  impl_->ValidatePackage(package.info, options);
+  const auto& installed = impl_->profile_state.plugins;
+  const auto current = installed.find(package.info.id);
+  if (current != installed.end() && current->second.info.digest != package.info.digest) {
     throw Error(ErrorCode::AlreadyInstalled, "A different package is installed for this plugin ID");
   }
-  if (current != impl_->catalog.end() &&
+  if (current != installed.end() &&
       (current->second.approval.mode != options.mode || current->second.approval.services != options.services)) {
     throw Error(ErrorCode::AlreadyInstalled, "The installed package already has a different approval");
   }
   const auto destination = impl_->PackageDirectory(package.info.digest);
-  if (current != impl_->catalog.end()) {
+  if (current != installed.end()) {
     try {
       if (ReadPackage(destination).info.digest == approved_digest) return;
     } catch (const Error&) {
       // Reinstall the approved bytes if the stored copy is unreadable.
     }
-    if (impl_->workers.contains(package.info.id) || impl_->local_plugins.contains(package.info.id)) {
+    if (impl_->workers.contains(package.info.id) || impl_->local_plugins.contains(package.info.id) ||
+        impl_->retired_workers.contains(package.info.digest)) {
       throw Error(ErrorCode::Busy, "Disable the plugin before repairing its package");
     }
   }
 
-  fs::create_directories(destination);
-  // Put both package files in place before publishing a new catalog entry.
-  WriteAtomicFile(destination / "plugin.json", package.manifest_bytes);
-  WriteAtomicFile(destination / ModuleName, package.module_bytes);
-  if (current == impl_->catalog.end()) {
-    auto candidate = impl_->catalog;
+  impl_->StorePackage(package);
+  if (current == installed.end()) {
+    auto candidate = impl_->profile_state;
     const auto id = package.info.id;
-    candidate.emplace(id, Installed{std::move(package.info), std::move(package.manifest), true, std::move(options)});
+    auto retained = candidate.retained_data.extract(id);
+    auto data = retained.empty() ? DefaultDataName(id) : std::move(retained.mapped());
+    if (retained.empty() && candidate.discarded_data.contains(data)) {
+      // A previous delete can still be awaiting cleanup. A new installation gets fresh data.
+      data += "." + NewToken();
+    }
+    candidate.plugins.emplace(id, Installed{std::move(package.info), std::move(package.manifest), true,
+                                           std::move(options), std::move(data)});
     impl_->Commit(std::move(candidate));
+    impl_->CleanupFilesAfterCommit();
   }
 }
 
-Task<void> PluginManager::SetEnabled(std::string_view id, bool enabled) {
-  return ChangeEnabled(impl_, std::string(id), enabled);
+Task<UpgradeStatus> PluginManager::UpgradePackage(File directory, UpgradeApproval approval) {
+  return RunManagement<UpgradeStatus>(impl_, [directory = std::move(directory), approval = std::move(approval)]
+                                       (Impl& impl) mutable {
+    return impl.Upgrade(std::move(directory), std::move(approval));
+  });
 }
 
-Task<void> PluginManager::ChangeEnabled(std::shared_ptr<Impl> impl, std::string id, bool enabled) {
-  RejectServiceReentry(co_await CurrentTaskExecution{});
-  // This Task owns a committed disable even if its caller cancels the wait.
-  auto start = [impl, id = std::move(id), enabled](auto complete) mutable {
-    (void)impl->callbacks.Launch([impl, id = std::move(id), enabled, complete]() -> Task<void> {
-      try {
-        ExecutionMode mode;
-        {
-          std::lock_guard lock(impl->mutex);
-          mode = impl->RequireInstalled(id).approval.mode;
-        }
-        if (mode == ExecutionMode::InProcess) {
-          co_await impl->ChangeLocalEnabled(id, enabled);
-        } else {
-          co_await RunTransport([impl, id, enabled](std::stop_token stop) {
-            impl->ChangeWorkerEnabled(id, enabled, stop);
-          });
-        }
-        complete.Complete();
-      } catch (...) {
-        complete.Fail(std::current_exception());
-      }
-    });
-    return std::function<void()>{};
+Task<UninstallStatus> PluginManager::UninstallPackage(std::string_view id, std::string_view expected_digest,
+                                                      PluginDataPolicy data) {
+  return RunManagement<UninstallStatus>(impl_, [id = std::string(id), digest = std::string(expected_digest), data]
+                                         (Impl& impl) mutable {
+    return impl.Uninstall(std::move(id), std::move(digest), data);
+  });
+}
+
+Task<std::vector<PendingChangeResult>> PluginManager::ApplyPendingChanges() {
+  return RunManagement<std::vector<PendingChangeResult>>(impl_, [](Impl& impl) { return impl.ApplyPending(); });
+}
+
+std::vector<std::shared_ptr<Worker>> PluginManager::Impl::ActiveAndRetiredWorkers(std::string_view id) const {
+  std::vector<std::shared_ptr<Worker>> result;
+  if (const auto active = workers.find(id); active != workers.end()) result.push_back(active->second);
+  for (const auto& [digest, retired] : retired_workers) {
+    if (retired.id == id) result.push_back(retired.worker);
+  }
+  return result;
+}
+
+Task<void> PluginManager::Impl::RetirePlugin(const std::string& id) {
+  if (const auto running = local_plugins.find(id); running != local_plugins.end()) {
+    const auto local = running->second;
+    BeginLocalShutdown(local);
+    co_await FinishLocalShutdown(local);
+    local_plugins.erase(id);
+  }
+
+  std::vector<std::shared_ptr<Worker>> retiring;
+  {
+    std::lock_guard lock(mutex);
+    if (const auto admission = admissions.find(id); admission != admissions.end()) {
+      admission->second.request_stop();
+      admissions.erase(admission);
+    }
+    retiring = ActiveAndRetiredWorkers(id);
+    for (const auto& worker : retiring) worker->BeginShutdown();
+  }
+  if (retiring.empty()) co_return;
+  co_await RunTransport([retiring = std::move(retiring)](std::stop_token) {
+    for (const auto& worker : retiring) {
+      worker->Shutdown();
+      worker->WaitForExit();
+    }
+  });
+  std::lock_guard lock(mutex);
+  workers.erase(id);
+  std::erase_if(retired_workers, [&](const auto& entry) { return entry.second.id == id; });
+}
+
+Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string expected_digest,
+                                                    PluginDataPolicy data) {
+  if (data != PluginDataPolicy::Keep && data != PluginDataPolicy::Delete) {
+    throw Error(ErrorCode::InvalidArgument, "Invalid plugin data policy");
+  }
+  std::optional<Change> change;
+  {
+    std::lock_guard lock(mutex);
+    const auto& current = RequireInstalled(id);
+    if (current.info.digest != expected_digest) throw Error(ErrorCode::ApprovalMismatch, "The installed digest changed");
+    change.emplace(*this, id);
+  }
+  co_await RetirePlugin(id);
+  std::lock_guard lock(mutex);
+  (void)RequireInstalled(id);
+  auto next = profile_state;
+  const auto current = next.plugins.extract(id);
+  const auto pending = next.upgrades.extract(id);
+  const auto package_path = PackageDirectory(current.mapped().info.digest);
+  const auto data_path = DataDirectory(current.mapped().data);
+  fs::path pending_package;
+  fs::path pending_data;
+  if (!pending.empty()) pending_package = PackageDirectory(pending.mapped().target.info.digest);
+  if (!pending.empty() && pending.mapped().applying) {
+    next.discarded_data.insert(pending.mapped().target.data);
+    pending_data = DataDirectory(pending.mapped().target.data);
+  }
+  if (data == PluginDataPolicy::Keep) next.retained_data.emplace(id, current.mapped().data);
+  else next.discarded_data.insert(current.mapped().data);
+  Commit(std::move(next));
+  CleanupFilesAfterCommit();
+  std::error_code error;
+  const auto remains = [&](const fs::path& path) {
+    const auto status = fs::symlink_status(path, error);
+    return status.type() != fs::file_type::not_found;
   };
-  co_await AwaitCallback<void>(std::move(start));
+  const auto cleanup_pending = remains(package_path) || (!pending_package.empty() && remains(pending_package)) ||
+      (!pending_data.empty() && remains(pending_data)) || (data == PluginDataPolicy::Delete && remains(data_path));
+  co_return cleanup_pending ? UninstallStatus::CleanupPending : UninstallStatus::Removed;
+}
+
+Task<UpgradeStatus> PluginManager::Impl::Upgrade(File directory, UpgradeApproval approval) {
+  auto source = co_await RunTransport([directory = std::move(directory)](std::stop_token) {
+    return ReadPackage(NativePath(directory));
+  });
+  auto id = source.info.id;
+  co_return co_await ApplyUpgrade(std::move(id), std::move(source), std::move(approval));
+}
+
+Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optional<Package> source,
+                                                      UpgradeApproval approval) {
+  std::optional<Change> change;
+  std::optional<Installed> replacement;
+  std::string current_data;
+  std::string candidate_data;
+  {
+    std::lock_guard lock(mutex);
+    const auto& current = RequireInstalled(id);
+    change.emplace(*this, id);
+    PruneExitedWorkers();
+    if (source) {
+      if (current.info.digest != approval.expected_digest || source->info.digest != approval.approved_digest) {
+        throw Error(ErrorCode::ApprovalMismatch, "The installed or replacement package digest changed");
+      }
+      if (current.info.version == source->info.version) {
+        throw Error(ErrorCode::InvalidArgument, "An upgrade requires a different plugin release version");
+      }
+      if (const auto existing = profile_state.upgrades.find(id); existing != profile_state.upgrades.end()) {
+        throw Error(ErrorCode::Busy, existing->second.applying
+            ? "Reopen the profile to recover the interrupted upgrade"
+            : "This plugin already has an approved upgrade");
+      }
+      InstallOptions options{current.approval.mode, std::move(approval.services)};
+      ValidatePackage(source->info, options);
+      if (retired_workers.contains(source->info.digest)) {
+        throw Error(ErrorCode::Busy, "A previous candidate worker is still retiring");
+      }
+      source->module_file.reset();
+      StorePackage(*source);
+      replacement.emplace(Installed{std::move(source->info), std::move(source->manifest), current.enabled,
+                                     std::move(options), current.data});
+    } else {
+      const auto found = profile_state.upgrades.find(id);
+      if (found == profile_state.upgrades.end() || found->second.process == HostProcessToken() || found->second.applying) {
+        throw Error(ErrorCode::Busy, "This pending upgrade is not ready to apply");
+      }
+      replacement.emplace(found->second.target);
+    }
+
+    current_data = current.data;
+    if (source) replacement->data = DefaultDataName(id) + "." + NewToken();
+    candidate_data = replacement->data;
+    replacement->enabled = current.enabled;
+    auto next = profile_state;
+    if (source && current.approval.mode == ExecutionMode::InProcess) {
+      next.upgrades.emplace(id, PendingUpgrade{std::move(*replacement), current.info.digest, HostProcessToken(), false});
+      Commit(std::move(next));
+      co_return UpgradeStatus::RestartRequired;
+    }
+
+    // Publish the validation record before starting the candidate so a fresh host can recover the old snapshot.
+    next.upgrades.insert_or_assign(id, PendingUpgrade{*replacement, current.info.digest, HostProcessToken(), true});
+    Commit(std::move(next));
+  }
+
+  std::shared_ptr<Worker> worker;
+  std::shared_ptr<LocalPlugin> local;
+  std::exception_ptr failure;
+  try {
+    std::vector<Worker::Service> granted;
+    {
+      std::lock_guard lock(mutex);
+      ValidatePackage(replacement->info, replacement->approval);
+      if (replacement->approval.mode == ExecutionMode::WorkerProcess) granted = WorkerServices(*replacement);
+    }
+    co_await RetirePlugin(id);
+    const auto prepare = [self = shared_from_this(), target = *replacement, source_data = DataDirectory(current_data),
+                          target_data = DataDirectory(candidate_data)](std::stop_token) {
+      auto package = self->VerifyPackage(target);
+      RequireManagedDirectory(target_data.parent_path());
+      fs::create_directories(target_data.parent_path());
+      CopyPluginData(source_data, target_data);
+      return package;
+    };
+    auto package = co_await RunTransport(prepare);
+    if (replacement->enabled && replacement->approval.mode == ExecutionMode::WorkerProcess) {
+      worker = MakeWorker(*replacement, package, std::move(granted));
+      co_await RunTransport([worker](std::stop_token stop) {
+        const auto instance = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, {}}, DefaultTimeout,
+                                              nullptr, stop).instance;
+        worker->Request({static_cast<std::uint32_t>(Command::Close), instance, 0, {}}, DefaultTimeout, nullptr, stop);
+      });
+    } else if (replacement->enabled) {
+      local = MakeLocal(*replacement);
+      ValidateLocalPlugin(local);
+    }
+
+    std::lock_guard lock(mutex);
+    (void)RequireInstalled(id);
+    auto next = profile_state;
+    next.plugins.at(id) = std::move(*replacement);
+    next.upgrades.erase(id);
+    next.discarded_data.insert(current_data);
+    if (worker) workers.emplace(id, worker);
+    if (local) local_plugins.emplace(id, local);
+    Commit(std::move(next));
+    CleanupFilesAfterCommit();
+  } catch (const fs::filesystem_error& error) {
+    failure = std::make_exception_ptr(Error(ErrorCode::Io, error.what()));
+  } catch (...) {
+    failure = std::current_exception();
+  }
+  if (!failure) co_return UpgradeStatus::Applied;
+
+  if (worker) {
+    try {
+      co_await RunTransport([worker](std::stop_token) {
+        worker->Shutdown();
+        worker->WaitForExit();
+      });
+    } catch (...) {
+      std::lock_guard lock(mutex);
+      const auto& pending = profile_state.upgrades.at(id);
+      // Retain files while an unconfirmed worker exit can still leave them open.
+      retired_workers.emplace(pending.target.info.digest, RetiredWorker{id, worker, candidate_data});
+    }
+  }
+  if (local) {
+    BeginLocalShutdown(local);
+    co_await FinishLocalShutdown(local);
+    local_plugins.erase(id);
+  }
+  {
+    std::lock_guard lock(mutex);
+    if (worker) {
+      if (const auto running = workers.find(id); running != workers.end() && running->second == worker) {
+        workers.erase(running);
+      }
+    }
+    auto next = profile_state;
+    next.upgrades.erase(id);
+    next.discarded_data.insert(candidate_data);
+    Commit(std::move(next));
+    CleanupFilesAfterCommit();
+  }
+  std::rethrow_exception(failure);
+}
+
+Task<std::vector<PendingChangeResult>> PluginManager::Impl::ApplyPending() {
+  std::vector<std::string> pending;
+  {
+    std::lock_guard lock(mutex);
+    if (closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
+    for (const auto& [id, upgrade] : profile_state.upgrades) {
+      if (!upgrade.applying && upgrade.process != HostProcessToken()) pending.push_back(id);
+    }
+  }
+
+  std::vector<PendingChangeResult> results;
+  for (const auto& id : pending) {
+    PendingChangeResult result{id, std::nullopt, {}, false};
+    try {
+      co_await ApplyUpgrade(id, std::nullopt);
+    } catch (const Error& error) {
+      result.error = error.Code();
+      result.message = error.what();
+    } catch (const std::exception& error) {
+      result.error = ErrorCode::Io;
+      result.message = error.what();
+    }
+    if (result.error) {
+      std::lock_guard lock(mutex);
+      const auto& installed = profile_state.plugins;
+      if (const auto current = installed.find(id); current != installed.end()) {
+        result.restart_required = InProcessVersionRequiresRestart(profile, id, current->second.info.digest);
+      }
+    }
+    results.push_back(std::move(result));
+  }
+  co_return results;
+}
+
+Task<void> PluginManager::SetEnabled(std::string_view id, bool enabled) {
+  return RunManagement<void>(impl_, [id = std::string(id), enabled](Impl& impl) mutable {
+    return impl.SetEnabled(std::move(id), enabled);
+  });
+}
+
+Task<void> PluginManager::Impl::SetEnabled(std::string id, bool enabled) {
+  ExecutionMode mode;
+  std::optional<Change> change;
+  {
+    std::lock_guard lock(mutex);
+    mode = RequireInstalled(id).approval.mode;
+    change.emplace(*this, id, false);
+  }
+  if (mode == ExecutionMode::InProcess) {
+    co_await ChangeLocalEnabled(id, enabled);
+  } else {
+    co_await RunTransport([self = shared_from_this(), id, enabled](std::stop_token stop) {
+      self->ChangeWorkerEnabled(id, enabled, stop);
+    });
+  }
 }
 
 Task<void> PluginManager::Impl::ChangeLocalEnabled(const std::string& id, bool enabled) {
@@ -507,6 +1102,7 @@ void PluginManager::Impl::ChangeWorkerEnabled(const std::string& id, bool enable
   }
   if (!worker) return;
   worker->Shutdown();
+  worker->WaitForExit();
   std::lock_guard lock(mutex);
   const auto running = workers.find(id);
   if (running != workers.end() && running->second == worker) workers.erase(running);
@@ -516,10 +1112,13 @@ std::vector<PluginInfo> PluginManager::ListPlugins() const {
   // Read the snapshot without entering the worker's request queue, including during a host callback.
   std::lock_guard lock(impl_->mutex);
   std::vector<PluginInfo> result;
-  for (const auto& [id, plugin] : impl_->catalog) {
+  for (const auto& [id, plugin] : impl_->profile_state.plugins) {
     const auto worker = impl_->workers.find(id);
+    const auto upgrade = impl_->profile_state.upgrades.find(id);
     result.push_back({plugin.info, plugin.enabled, plugin.approval.mode,
-                      worker == impl_->workers.end() ? std::nullopt : worker->second->Pid()});
+                      worker == impl_->workers.end() ? std::nullopt : worker->second->Pid(),
+                      upgrade == impl_->profile_state.upgrades.end()
+                          ? std::nullopt : std::optional(upgrade->second.target.info)});
   }
   return result;
 }
@@ -528,8 +1127,9 @@ std::vector<ExtensionInfo> PluginManager::List(std::string_view point, ContractI
   std::lock_guard lock(impl_->mutex);
   impl_->RequirePoint(point, contract);
   std::vector<ExtensionInfo> result;
-  for (const auto& [id, plugin] : impl_->catalog) {
-    if (plugin.enabled && plugin.info.point == point && Matches(plugin.info, contract)) {
+  for (const auto& [id, plugin] : impl_->profile_state.plugins) {
+    if (plugin.enabled && plugin.info.point == point && Matches(plugin.info, contract) &&
+        !impl_->IsPluginBusy(id, plugin)) {
       result.push_back({{id, plugin.info.contribution}, plugin.info.extensions});
     }
   }
@@ -544,14 +1144,18 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
   std::lock_guard lock(impl_->mutex);
   if (impl_->closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
   const auto& registered = impl_->RequirePoint(point, contract);
-  const auto plugin = impl_->catalog.find(id.plugin);
-  if (plugin == impl_->catalog.end() || plugin->second.info.point != point ||
+  const auto& plugins = impl_->profile_state.plugins;
+  const auto plugin = plugins.find(id.plugin);
+  if (plugin == plugins.end() || plugin->second.info.point != point ||
       plugin->second.info.contribution != id.contribution) {
     throw Error(ErrorCode::NotFound, "The extension is not installed at this point");
   }
   const auto& installed = plugin->second;
   if (!installed.enabled) throw Error(ErrorCode::Disabled, "The plugin is disabled");
   if (!Matches(installed.info, contract)) throw Error(ErrorCode::ContractMismatch, "The installed contract differs");
+  if (impl_->IsPluginBusy(id.plugin, installed)) {
+    throw Error(ErrorCode::Busy, "The plugin has a pending version change, restart, or uninstall");
+  }
 
   if (installed.approval.mode == ExecutionMode::WorkerProcess) {
     if (!registered.remote || !impl_->worker_executable) {
@@ -565,8 +1169,13 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
 
   const auto running = impl_->local_plugins.find(id.plugin);
   if (running != impl_->local_plugins.end()) return MakeLocalExtension(running->second, timeout);
-  auto startup = impl_->Startup(installed.info);
-  auto local = CreateLocalPlugin(impl_->callbacks, [manager = std::weak_ptr<Impl>(impl_), installed]() -> const hpk_plugin_v1& {
+  auto local = impl_->MakeLocal(installed);
+  impl_->local_plugins.emplace(id.plugin, local);
+  return MakeLocalExtension(std::move(local), timeout);
+}
+
+std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& installed) {
+  return CreateLocalPlugin(callbacks, [manager = weak_from_this(), installed]() -> const hpk_plugin_v1& {
     const auto impl = manager.lock();
     if (!impl) throw Error(ErrorCode::Closed, "The plugin manager is closed");
     if (installed.info.cpp_abi != CppAbi) {
@@ -576,21 +1185,23 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
     const auto module = impl->PackageDirectory(package.info.digest) / ModuleName;
     const ContractInfo contract{installed.info.contract_id, installed.info.contract_version,
                                 installed.info.contract_fingerprint};
-    const auto* binding = &LoadInProcessModule(module, std::move(package.module_file), contract);
+    const auto* binding = &LoadInProcessModule(module, std::move(package.module_file), contract, impl->profile,
+                                               installed.info.id, installed.info.digest);
     const auto* runtime = RuntimeIdentity();
     if (!runtime || !binding->cpp_abi || installed.info.cpp_abi != binding->cpp_abi || !binding->runtime_identity ||
         binding->runtime_identity() != runtime) {
       throw Error(ErrorCode::ContractMismatch, "The plugin does not share the host's C++ ABI and HuxerUI Runtime");
     }
     return *binding;
-  }, std::move(startup), impl_->ApprovedServices(installed));
-  impl_->local_plugins.emplace(id.plugin, local);
-  return MakeLocalExtension(std::move(local), timeout);
+  }, Startup(installed), ApprovedServices(installed));
 }
 
 Package PluginManager::Impl::VerifyPackage(const Installed& installed) const {
   try {
-    auto package = ReadPackage(PackageDirectory(installed.info.digest));
+    const auto directory = PackageDirectory(installed.info.digest);
+    RequireManagedDirectory(directory.parent_path());
+    RequireManagedDirectory(directory);
+    auto package = ReadPackage(directory);
     if (package.info.digest == installed.info.digest) return package;
   } catch (const Error& error) {
     throw Error(ErrorCode::PackageChanged, "Cannot verify the installed package: " + std::string(error.what()));
@@ -598,10 +1209,28 @@ Package PluginManager::Impl::VerifyPackage(const Installed& installed) const {
   throw Error(ErrorCode::PackageChanged, "The installed package differs from the approved package");
 }
 
-PluginStartup PluginManager::Impl::Startup(const PackageInfo& info) const {
+PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
+  const auto& info = installed.info;
   const auto directory = PackageDirectory(info.digest);
-  const auto data = profile / "data" / ("plugin-" + info.id + ".data");
+  const auto data = DataDirectory(installed.data);
   return {info.id, info.version, info.digest, PathText(directory), PathText(data)};
+}
+
+std::vector<Worker::Service> PluginManager::Impl::WorkerServices(const Installed& installed) const {
+  std::vector<Worker::Service> granted;
+  for (auto& service : ApprovedServices(installed)) {
+    if (service.dispatch) granted.push_back({std::move(service.id), service.version, std::move(service.fingerprint),
+                                             std::move(service.dispatch)});
+  }
+  return granted;
+}
+
+std::shared_ptr<Worker> PluginManager::Impl::MakeWorker(const Installed& installed, const Package& package,
+                                                        std::vector<Worker::Service> granted) {
+  const auto& info = installed.info;
+  return std::make_shared<Worker>(*worker_executable, PackageDirectory(info.digest) / ModuleName, package.module_file,
+      ContractInfo{info.contract_id, info.contract_version, info.contract_fingerprint}, std::move(granted), callbacks,
+      Startup(installed));
 }
 
 std::shared_ptr<Worker> PluginManager::Impl::StartWorker(const std::string& id, const std::stop_token& admission,
@@ -609,30 +1238,24 @@ std::shared_ptr<Worker> PluginManager::Impl::StartWorker(const std::string& id, 
   std::unique_lock lock(mutex);
   if (closed || admission.stop_requested()) throw Error(ErrorCode::Closed, "The plugin generation is closed");
   if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "Extension creation was cancelled");
-  const auto installed = catalog.find(id);
-  if (installed == catalog.end() || !installed->second.enabled) throw Error(ErrorCode::Closed, "The plugin is disabled");
+  const auto installed = profile_state.plugins.find(id);
+  if (installed == profile_state.plugins.end() || !installed->second.enabled) {
+    throw Error(ErrorCode::Closed, "The plugin is disabled");
+  }
 
   if (const auto running = workers.find(id); running != workers.end()) {
     if (running->second->Available() && running->second->Pid()) return running->second;
     running->second->Stop();
+    running->second->WaitForExit();
     workers.erase(running);
   }
 
   const auto package = VerifyPackage(installed->second);
-  auto startup = Startup(package.info);
-  std::vector<Worker::Service> granted;
-  for (auto& service : ApprovedServices(installed->second)) {
-    if (service.dispatch) granted.push_back({std::move(service.id), service.version, std::move(service.fingerprint),
-                                             std::move(service.dispatch)});
-  }
   if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "Extension creation was cancelled");
   if (std::chrono::steady_clock::now() >= deadline) {
     throw Error(ErrorCode::DeadlineExceeded, "The plugin call exceeded its deadline before starting the worker");
   }
-  auto worker = std::make_shared<Worker>(*worker_executable, PackageDirectory(package.info.digest) / ModuleName,
-      package.module_file, ContractInfo{package.info.contract_id, package.info.contract_version,
-                                       package.info.contract_fingerprint}, std::move(granted), callbacks,
-      std::move(startup));
+  auto worker = MakeWorker(installed->second, package, WorkerServices(installed->second));
   workers.emplace(id, worker);
   return worker;
 }

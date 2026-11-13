@@ -8,6 +8,8 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -180,18 +182,18 @@ def verify_mixed(host, package, worker_csv, faults, scratch, sample):
         ("install", worker_csv, worker_digest, "worker_process", "status"),
         ("install", faults, fault_digest, "worker_process"),
     ]
-    data = profile / "data" / f"plugin-{fault_id}.data"
+    assert all(reply["ok"] for reply in run(host, profile, commands=installs))
+    data = installed_data(profile, fault_id)
     data.mkdir(parents=True)
     (data / "sync-service").touch()
-    replies = run(host, profile, commands=installs + [
+    replies = run(host, profile, commands=[
         ("pid",), ("list",),
         ("import", sample, local_id), ("status",), ("reset-status",),
         ("import", sample, worker_id), ("status",), ("list",),
         ("import", big_csv, local_id), ("import", big_csv, worker_id),
         ("import", sample, fault_id),
     ])
-    assert all(reply["ok"] for reply in replies[:3]), replies[:3]
-    host_pid, discovered, local, local_status, _, worker, worker_status, active, big_local, big_worker, sync_callback = replies[3:]
+    host_pid, discovered, local, local_status, _, worker, worker_status, active, big_local, big_worker, sync_callback = replies
     assert {item["plugin"] for item in discovered["importers"]} == {local_id, worker_id, fault_id}, discovered
     assert all(item["worker_pid"] is None for item in discovered["plugins"]), discovered
     assert local["ok"] and worker["ok"], (local, worker)
@@ -252,7 +254,241 @@ def verify_local_lifetime(host, faults, digest, fault_id, scratch, valid):
     assert enabled["ok"] and recovered["ok"], (enabled, recovered)
 
 
-def verify(host, package, faults, worker_csv, scratch):
+def installed_data(profile, plugin_id):
+    state = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
+    record = next(entry for entry in state["plugins"] if entry["manifest"]["id"] == plugin_id)
+    return profile / "data" / record["data"]
+
+
+@contextmanager
+def defer_data_cleanup(directory):
+    if sys.platform == "win32":
+        with (directory / "data-format").open("rb"):
+            yield
+    else:
+        directory.chmod(0o500)
+        try:
+            yield
+        finally:
+            directory.chmod(0o700)
+
+
+def verify_upgrade(host, package, faults, replacement, scratch, valid):
+    plugin_id = "example.csv-faults"
+    profile = scratch / "worker upgrade"
+    old = run(host, profile, "inspect", faults)["digest"]
+    new = run(host, profile, "inspect", replacement)["digest"]
+    other = run(host, profile, "inspect", package)["digest"]
+    check_error(run(host, profile, "upgrade", replacement, old, new), "not_found")
+    assert run(host, profile, "install", faults, old, "worker_process", "status")["ok"]
+    assert run(host, profile, "install", package, other, "worker_process", "status")["ok"]
+    data = installed_data(profile, plugin_id)
+    data.mkdir(parents=True)
+    (data / "data-format").write_text("1", encoding="utf-8")
+    (data / "retained.txt").write_text("user data", encoding="utf-8")
+    check_error(run(host, profile, "upgrade", replacement, "0" * 64, new), "approval_mismatch")
+    check_error(run(host, profile, "upgrade", replacement, old, "0" * 64), "approval_mismatch")
+    failed = data / "fail-upgrade"
+    failed.touch()
+    broken, unchanged, imported = run(host, profile, commands=[
+        ("upgrade", replacement, old, new), ("list",), ("import", valid, plugin_id),
+    ])
+    check_error(broken, "plugin_failed")
+    assert plugin(unchanged, plugin_id)["digest"] == old and imported["ok"], (unchanged, imported)
+    assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
+    assert not (profile / "packages" / new).exists()
+    failed.unlink()
+
+    status_request = scratch / "upgrade status.csv"
+    status_request.write_bytes(b"status")
+    before, changed, after, context, denied = run(host, profile, commands=[
+        ("import", valid, "example.csv"), ("check-worker-upgrade", replacement, old, new),
+        ("import", valid, "example.csv"), ("check-plugin-context", plugin_id), ("import", status_request, plugin_id),
+    ])
+    assert changed["ok"] and changed["old_pid"] != changed["new_pid"], changed
+    assert before["ok"] and after["ok"] and before["plugin_pid"] == after["plugin_pid"], (before, after)
+    assert context["first"][1:3] == ["0.2.0", new], context
+    check_error(denied, "service_denied")
+    migrated = installed_data(profile, plugin_id)
+    assert migrated != data and not data.exists() and not (profile / "packages" / old).exists()
+    assert (migrated / "data-format").read_text() == "2"
+    assert (migrated / "retained.txt").read_text() == "user data"
+
+    local = scratch / "in-process upgrade"
+    assert run(host, local, "install", faults, old, "in_process")["ok"]
+    data = installed_data(local, plugin_id)
+    data.mkdir(parents=True)
+    (data / "data-format").write_text("1", encoding="utf-8")
+    assert run(host, local, "check-in-process-upgrade", replacement, old, new) == {
+        "ok": True, "result": "restart_required", "current_digest": old, "pending_digest": new,
+    }
+    assert (data / "data-format").read_text() == "1"
+    (data / "last-write.txt").write_text("before restart", encoding="utf-8")
+    context = run(host, local, "check-plugin-context", plugin_id)
+    assert context["first"][1:3] == ["0.2.0", new], context
+    migrated = installed_data(local, plugin_id)
+    assert (migrated / "last-write.txt").read_text() == "before restart"
+    assert (migrated / "data-format").read_text() == "2" and not data.exists()
+
+    rejected = scratch / "failed in-process upgrade"
+    assert run(host, rejected, "install", faults, old, "in_process")["ok"]
+    data = installed_data(rejected, plugin_id)
+    data.mkdir(parents=True)
+    (data / "data-format").write_text("1", encoding="utf-8")
+    (data / "fail-upgrade").touch()
+    assert run(host, rejected, "upgrade", replacement, old, new)["result"] == "restart_required"
+    listed, blocked = run(host, rejected, commands=[("list",), ("import", valid, plugin_id)])
+    assert plugin(listed, plugin_id)["digest"] == old and not listed["importers"], listed
+    check_error(blocked, "not_found")
+    assert (data / "data-format").read_text() == "1"
+    recovered = run(host, rejected, "check-plugin-context", plugin_id)
+    assert recovered["first"][1:3] == ["0.1.0", old], recovered
+    assert not (rejected / "packages" / new).exists()
+
+    disabled = scratch / "disabled upgrade"
+    assert run(host, disabled, "install", faults, old, "worker_process")["ok"]
+    assert run(host, disabled, "disable", plugin_id)["ok"]
+    data = installed_data(disabled, plugin_id)
+    data.mkdir(parents=True)
+    (data / "data-format").write_text("1", encoding="utf-8")
+    assert run(host, disabled, "upgrade", replacement, old, new)["result"] == "applied"
+    listed = run(host, disabled, "list")
+    assert not listed["importers"] and not plugin(listed, plugin_id)["enabled"], listed
+    assert (installed_data(disabled, plugin_id) / "data-format").read_text() == "1"
+    assert run(host, disabled, "enable", plugin_id)["ok"]
+    assert run(host, disabled, "import", valid, plugin_id)["ok"]
+    assert (installed_data(disabled, plugin_id) / "data-format").read_text() == "2"
+
+
+def verify_uninstall(host, faults, replacement, scratch, valid):
+    plugin_id = "example.csv-faults"
+    profile = scratch / "uninstall"
+    old = run(host, profile, "inspect", faults)["digest"]
+    new = run(host, profile, "inspect", replacement)["digest"]
+    assert run(host, profile, "install", faults, old, "worker_process", "status")["ok"]
+    data = installed_data(profile, plugin_id)
+    data.mkdir(parents=True)
+    (data.parent / "unrelated.txt").write_text("outside plugin data", encoding="utf-8")
+    (data / "retained.txt").write_text("user data", encoding="utf-8")
+    check_error(run(host, profile, "uninstall", plugin_id, new), "approval_mismatch")
+    imported, removed, listed = run(host, profile, commands=[
+        ("import", valid, plugin_id), ("uninstall", plugin_id, old), ("list",),
+    ])
+    assert imported["ok"] and removed["result"] == "removed", (imported, removed)
+    assert not listed["plugins"] and not listed["importers"], listed
+    assert not (profile / "packages" / old).exists() and (data / "retained.txt").exists()
+    assert run(host, profile, "install", faults, old, "worker_process")["ok"]
+    assert installed_data(profile, plugin_id) == data
+    status_request = scratch / "reinstall status.csv"
+    status_request.write_bytes(b"status")
+    check_error(run(host, profile, "import", status_request, plugin_id), "service_denied")
+    assert run(host, profile, "uninstall", plugin_id, old, "delete-data")["result"] == "removed"
+    assert not data.exists()
+    assert (data.parent / "unrelated.txt").read_text() == "outside plugin data"
+    assert run(host, profile, "install", faults, old, "worker_process")["ok"]
+    assert run(host, profile, "import", valid, plugin_id)["ok"]
+    assert not (installed_data(profile, plugin_id) / "retained.txt").exists()
+
+    local = scratch / "uninstall pending upgrade"
+    assert run(host, local, "install", faults, old, "in_process")["ok"]
+    imported, staged, removed, listed = run(host, local, commands=[
+        ("import", valid, plugin_id), ("upgrade", replacement, old, new),
+        ("uninstall", plugin_id, old), ("list",),
+    ])
+    assert imported["ok"] and staged["result"] == "restart_required", (imported, staged)
+    assert removed["result"] == "cleanup_pending" and not listed["plugins"], (removed, listed)
+    assert not (local / "packages" / new).exists()
+    assert not run(host, local, "list")["plugins"]
+    assert not (local / "packages" / old).exists()
+    assert run(host, local, "install", faults, old, "in_process")["ok"]
+    assert (installed_data(local, plugin_id) / "lifecycle.log").read_text().splitlines() == ["activate", "deactivate"]
+
+
+def verify_interrupted_upgrade(host, faults, replacement, scratch):
+    plugin_id = "example.csv-faults"
+    old = run(host, scratch / "upgrade digests", "inspect", faults)["digest"]
+    new = run(host, scratch / "upgrade digests", "inspect", replacement)["digest"]
+    status_request = scratch / "interrupted upgrade status.csv"
+    status_request.write_bytes(b"status")
+    for mode in ("worker_process", "in_process"):
+        profile = scratch / f"interrupted {mode} upgrade"
+        assert run(host, profile, "install", faults, old, mode, "status")["ok"]
+        data = installed_data(profile, plugin_id)
+        data.mkdir(parents=True)
+        (data / "data-format").write_text("1", encoding="utf-8")
+        flag = data / ("pause-upgrade" if mode == "worker_process" else "exit-upgrade")
+        flag.touch()
+        upgrade = [str(host), str(profile), "upgrade", str(replacement), old, new]
+        if mode == "worker_process":
+            with subprocess.Popen(upgrade, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+                try:
+                    deadline = time.monotonic() + 15
+                    while not list((profile / "data").glob("*/upgrade-ready")):
+                        assert process.poll() is None and time.monotonic() < deadline, "Candidate never started"
+                        time.sleep(0.01)
+                    process.kill()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=15)
+        else:
+            assert run(host, profile, "upgrade", replacement, old, new)["result"] == "restart_required"
+            interrupted = subprocess.run([str(host), str(profile), "list"], capture_output=True, timeout=30)
+            assert interrupted.returncode == 7, interrupted
+
+        recovered = run(host, profile, "list")
+        entry = plugin(recovered, plugin_id)
+        assert entry["digest"] == old and entry["pending_upgrade"] is None, recovered
+        assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
+        assert not (profile / "packages" / new).exists()
+        imported, status = run(host, profile, commands=[("import", status_request, plugin_id), ("status",)])
+        assert imported["ok"] and status["last_imported_rows"] == 41, (imported, status)
+        flag.unlink()
+
+    profile = scratch / "committed upgrade"
+    assert run(host, profile, "install", faults, old, "worker_process", "status")["ok"]
+    data = installed_data(profile, plugin_id)
+    data.mkdir(parents=True)
+    (data / "data-format").write_text("1", encoding="utf-8")
+    state_file = profile / "profile.json"
+    if sys.platform == "win32" or os.geteuid() != 0:
+        with defer_data_cleanup(data):
+            with subprocess.Popen([str(host), str(profile)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True, encoding="utf-8") as process:
+                try:
+                    process.stdin.write(command_line(("upgrade", replacement, old, new)))
+                    process.stdin.flush()
+                    with ThreadPoolExecutor(max_workers=1) as reader:
+                        reply = reader.submit(process.stdout.readline)
+                        try:
+                            assert json.loads(reply.result(timeout=15)) == {"ok": True, "result": "applied"}
+                        except BaseException:
+                            process.kill()
+                            raise
+                    state = json.loads(state_file.read_text(encoding="utf-8"))
+                    assert state["plugins"][0]["digest"] == new and data.name in state["discarded_data"], state
+                    process.kill()
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate(timeout=15)
+    else:
+        assert run(host, profile, "upgrade", replacement, old, new)["result"] == "applied"
+        # Restore the files and cleanup entry that would remain before post-commit cleanup.
+        shutil.copytree(faults, profile / "packages" / old)
+        data.mkdir()
+        (data / "data-format").write_text("1", encoding="utf-8")
+        committed_state = json.loads(state_file.read_text(encoding="utf-8"))
+        committed_state["discarded_data"].append(data.name)
+        state_file.write_text(json.dumps(committed_state), encoding="utf-8")
+    committed = run(host, profile, "list")
+    assert plugin(committed, plugin_id)["digest"] == new and not data.exists(), committed
+    assert not (profile / "packages" / old).exists()
+    assert (installed_data(profile, plugin_id) / "data-format").read_text() == "2"
+    check_error(run(host, profile, "import", status_request, plugin_id), "service_denied")
+
+
+def verify(host, package, faults, worker_csv, replacement, scratch):
     verify_default_profile(host, scratch)
     profile = scratch / "profile"
     valid = scratch / "quoted cells.csv"
@@ -407,6 +643,9 @@ def verify(host, package, faults, worker_csv, scratch):
     assert run(host, scratch / "in-process-only profile", "check-disable-during-create", package) == {
         "ok": True, "delimiter": ",",
     }
+    verify_upgrade(host, package, faults, replacement, scratch, valid)
+    verify_uninstall(host, faults, replacement, scratch, valid)
+    verify_interrupted_upgrade(host, faults, replacement, scratch)
 
     if sys.platform in ("linux", "darwin"):
         verify_host_exit(host, profile, valid, hang_worker, fault_id, scratch)
@@ -418,8 +657,9 @@ if __name__ == "__main__":
     parser.add_argument("package", type=Path)
     parser.add_argument("faults", type=Path)
     parser.add_argument("worker_csv", type=Path)
+    parser.add_argument("replacement", type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="pluginkit csv ") as directory:
         verify(args.host.resolve(), args.package.resolve(), args.faults.resolve(),
-               args.worker_csv.resolve(), Path(directory))
+               args.worker_csv.resolve(), args.replacement.resolve(), Path(directory))
     print("CSV example passed")

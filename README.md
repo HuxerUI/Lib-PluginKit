@@ -58,7 +58,7 @@ cmake -S examples/csv_import/plugin -B build/csv-plugin -G Ninja \
 cmake --build build/csv-plugin
 python3 examples/csv_import/verify.py "$preview_build/example_lib_plugin_kit" \
   build/csv-plugin/packages/csv-importer/Release build/csv-plugin/packages/csv-faults/Release \
-  build/csv-plugin/packages/csv-importer-worker/Release
+  build/csv-plugin/packages/csv-importer-worker/Release build/csv-plugin/packages/csv-faults-upgrade/Release
 ```
 
 The Linux host looks for `hpk-worker` beside its executable. Its default profile is `$XDG_DATA_HOME/huxerui/lib-pluginkit/preview`, with `$HOME/.local/share` as the data directory fallback.
@@ -77,10 +77,11 @@ cmake --build build/csv-plugin-macos
 packages=build/csv-plugin-macos/packages
 codesign --force --sign - "$packages/csv-importer/Release/plugin.dylib"
 codesign --force --sign - "$packages/csv-faults/Release/plugin.dylib"
+codesign --force --sign - "$packages/csv-faults-upgrade/Release/plugin.dylib"
 codesign --force --sign - "$packages/csv-importer-worker/Release/plugin.dylib"
 host="$preview_build/example_lib_plugin_kit.app/Contents/MacOS/example_lib_plugin_kit"
 python3 examples/csv_import/verify.py "$host" "$packages/csv-importer/Release" "$packages/csv-faults/Release" \
-  "$packages/csv-importer-worker/Release"
+  "$packages/csv-importer-worker/Release" "$packages/csv-faults-upgrade/Release"
 ```
 
 The macOS preview locates `hpk-worker` in `Contents/MacOS` beside the host. Its default profile is `~/Library/Application Support/HuxerUI/Lib-PluginKit/Preview`. Use `huxerui package macos --profile release` to package the app with its helper. For local acceptance, run the same verification script against the packaged app's executable.
@@ -90,6 +91,8 @@ The macOS preview locates `hpk-worker` in `Contents/MacOS` beside the host. Its 
 Run the host with just a profile directory for a session that accepts one command per line. Each command produces a JSON response. `list` shows the installed packages, their execution modes, enabled importers, and active worker process IDs. `enable <id>` and `disable <id>` persist across sessions. `import <file> [plugin-id] [timeout-ms]` selects an enabled importer from the manifest suffixes and reports the delimiter, plugin process ID, and parsed rows. The CSV plugin uses the first record as the header and reports malformed input with one-based row and column numbers.
 
 Use `install <package> <approved-digest> <in_process|worker_process> [status]` to select the mode and grant access to the registered `ImportStatus` service. The approval persists in the profile. For `sample.csv`, the import reply reports `progress_rows` as 2 and the `status` command reports `last_imported_rows` as 2.
+
+Use `upgrade <package> <installed-digest> <approved-digest> [status]` to replace a local package with another release of the same plugin. A worker upgrade takes effect in the current session. An in-process upgrade is applied when the preview starts in a new process. `uninstall <id> <installed-digest> [delete-data]` removes the plugin and its grants. The default preserves its current data for a later installation.
 
 ## Package the Windows preview
 
@@ -108,10 +111,12 @@ cmake -S examples/csv_import/plugin -B build/csv-plugin -G Ninja -DCMAKE_BUILD_T
   "-DCSV_IMPORT_SDK=$CsvSdk" -DCSV_IMPORT_TEST_FIXTURES=ON
 cmake --build build/csv-plugin
 python examples/csv_import/verify.py $CsvHostExe $CsvPackageDir .\build\csv-plugin\packages\csv-faults\Release `
-  .\build\csv-plugin\packages\csv-importer-worker\Release
+  .\build\csv-plugin\packages\csv-importer-worker\Release .\build\csv-plugin\packages\csv-faults-upgrade\Release
 ```
 
 The script installs two builds of the same CSV implementation in one profile, checks their process IDs, and calls both through the same synchronous and Task methods. It checks the native path with a request above the IPC size limit. It also covers service approval, receiver lifetime, catalog queries during callbacks, cancellation, activation and deactivation, profile recovery, and worker exit and timeout recovery. On Linux and macOS it checks that the worker exits when the host is killed during a pending call.
+
+The upgrade fixture keeps the same plugin identifier and contract and changes the release version. The script checks hot switching, restart switching, retained and deleted data, candidate activation failure, interruption during validation, and cleanup of files left after a commit.
 
 ## SDK and runtime
 
@@ -147,13 +152,19 @@ A queued deadline or cancellation affects only that call. Canceling the caller's
 Every activation owns one `PluginContext`. `Info()` supplies the manifest ID, release version, and approved digest. Both directory accessors return `const huxerui::File&`. `BundleDirectory()` points to the installed package snapshot, which plugin code should treat as read-only. `DataDirectory()` is writable and stays associated with the plugin ID across activations in that host profile. Extension implementations may be default-constructed or accept `const huxerui::pluginkit::PluginContext&`. All instances receive the same object as the lifecycle hooks. The manager takes `huxerui::File` for the profile and package directories. Pass the worker executable as a `File`, or `std::nullopt` for a host that only runs in-process plugins.
 
 ```cpp
-void Activate(const huxerui::pluginkit::PluginContext& context);
-void Deactivate(const huxerui::pluginkit::PluginContext& context);
+void OnActivate(const huxerui::pluginkit::PluginContext& context);
+void OnDeactivate(const huxerui::pluginkit::PluginContext& context);
 
-HPK_EXPORT_PLUGIN(csv_import::TableImporter, CsvImporter, Activate, Deactivate)
+HPK_EXPORT_PLUGIN(csv_import::TableImporter, CsvImporter, OnActivate, OnDeactivate)
 ```
 
-Supply either hook as needed. Use `nullptr` for an omitted activation hook when supplying only deactivation. `Activate` runs once before the first instance is constructed. On disable or shutdown, PluginKit stops admitting calls, drains active local work, destroys the instances, and calls `Deactivate`. In-process libraries stay mapped until host exit. Worker teardown has a bounded deadline. Native-only contracts can publish `Contract<T>::Info` and use the same factory without generated code. Their handles borrow the real interface. Release those handles after their own work finishes and before awaiting plugin disable or shutdown.
+Supply either hook as needed. Use `nullptr` for an omitted activation hook when supplying only deactivation. `OnActivate` runs once per activation before the first instance is constructed. On disable, uninstall, or shutdown, PluginKit stops admitting calls, drains active local work, destroys the instances, and calls `OnDeactivate` on orderly teardown. In-process libraries stay mapped until host exit. Worker teardown has a bounded deadline. Native-only contracts can publish `Contract<T>::Info` and use the same factory without generated code. Their handles borrow the real interface. Release those handles after their own work finishes and before awaiting plugin disable, uninstall, or shutdown.
+
+Register the host services and extension points, then await `ApplyPendingChanges()` before creating extensions. Inspect the results to report failed in-process upgrades. Call `UpgradePackage(directory, approval)` with the installed digest, the inspected replacement digest, and the full list of services approved for that release. The selected execution mode and enablement carry over. Open a new extension handle after the upgrade takes effect.
+
+An enabled replacement validates its activation and constructor on a private data copy. Plugins migrate their own format in `OnActivate`. Read the format marker before migrating so the same hook can run on later activations. A successful commit selects the replacement package, its data copy, and its grants together. A failed or interrupted validation leaves the last committed state selected. A disabled replacement stays disabled and activates on its first subsequent use. The profile owns these directories. Use `PluginContext::DataDirectory()` for the current activation's path.
+
+`UninstallPackage(id, digest)` preserves the last committed data. Use `PluginDataPolicy::Delete` to remove it. Reinstalling with the same identifier reuses retained data and requires a new grant approval. `CleanupPending` means uninstall committed and file cleanup will be retried when the profile is reopened. In-process libraries may require host exit before their files can be removed.
 
 Register the service implementation once with `ProvideService<T>(implementation)` before opening plugins. During a plugin Task, `GetService<T>()` synchronously returns a handle whose method resolves the current invocation and its package grants. A synchronous in-process extension method can use a synchronous service method. The application SDK can publish ordinary helpers such as `csv_import::SetImportedRows(rows)` around the handle.
 

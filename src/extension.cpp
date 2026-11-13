@@ -517,6 +517,11 @@ void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin) { plugin->Be
 
 Task<void> FinishLocalShutdown(std::shared_ptr<LocalPlugin> plugin) { co_await plugin->FinishShutdown(); }
 
+void ValidateLocalPlugin(const std::shared_ptr<LocalPlugin>& plugin) {
+  LocalInstance instance;
+  (void)plugin->Ensure(instance);
+}
+
 std::shared_ptr<ExtensionTarget> MakeLocalExtension(std::shared_ptr<LocalPlugin> plugin,
                                                      std::chrono::milliseconds timeout) {
   return std::make_shared<LocalExtension>(std::move(plugin), timeout);

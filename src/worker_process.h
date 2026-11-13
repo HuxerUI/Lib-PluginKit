@@ -32,6 +32,8 @@ public:
   Frame Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver = nullptr,
                 std::stop_token stop = {}, bool wait_for_slot = true);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
+  /// Waits for the process to exit after shutdown, including when handles still reference this Worker.
+  void WaitForExit(std::chrono::milliseconds timeout = DefaultTimeout);
   void BeginShutdown() noexcept;
   void Stop() noexcept;
   bool Available() const noexcept { return active_ && !shutting_down_; }
@@ -96,6 +98,7 @@ private:
 
   Handle socket_;
   std::atomic<pid_t> pid_{0};
+  std::condition_variable exited_;
   std::thread reaper_;
 #endif
 };

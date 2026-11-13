@@ -66,24 +66,54 @@ inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path, 
   return *binding;
 }
 
-inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& path, [[maybe_unused]] Handle verified,
-                                               ContractInfo contract) {
-  // A mapped module can own deferred SDK work. Cache its descriptor for the lifetime of this process.
+struct InProcessModules {
   struct Module {
     const hpk_plugin_v1* binding = nullptr;
 #if defined(__linux__)
     Handle file;
 #endif
   };
-  static std::map<std::filesystem::path, std::shared_ptr<Module>> modules;
-  static std::mutex mutex;
-  std::shared_ptr<Module> entry;
+
+  std::map<std::filesystem::path, std::shared_ptr<Module>> modules;
+  std::map<std::filesystem::path, std::string> selected_digests;
+  std::mutex mutex;
+};
+
+inline InProcessModules& LoadedModules() {
+  static InProcessModules modules;
+  return modules;
+}
+
+inline bool IsInProcessModuleMapped(const std::filesystem::path& path) {
+  auto& state = LoadedModules();
+  std::lock_guard lock(state.mutex);
+  return state.modules.contains(path);
+}
+
+inline bool InProcessVersionRequiresRestart(const std::filesystem::path& profile, std::string_view id,
+                                            std::string_view digest) {
+  auto& state = LoadedModules();
+  std::lock_guard lock(state.mutex);
+  const auto found = state.selected_digests.find(profile / std::string(id));
+  return found != state.selected_digests.end() && found->second != digest;
+}
+
+inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& path, [[maybe_unused]] Handle verified,
+                                               ContractInfo contract, const std::filesystem::path& profile,
+                                               std::string_view id, std::string_view digest) {
+  // A mapped module can own deferred SDK work. Cache its descriptor for the lifetime of this process.
+  auto& state = LoadedModules();
+  std::shared_ptr<InProcessModules::Module> entry;
   {
-    std::lock_guard lock(mutex);
-    auto& cached = modules[path];
+    std::lock_guard lock(state.mutex);
+    const auto [selected, inserted] = state.selected_digests.try_emplace(profile / std::string(id), digest);
+    if (!inserted && selected->second != digest) {
+      throw Error(ErrorCode::Busy, "Restart the host before loading a different in-process plugin version");
+    }
+    auto& cached = state.modules[path];
     if (cached && cached->binding) return *cached->binding;
     if (!cached) {
-      cached = std::make_shared<Module>();
+      cached = std::make_shared<InProcessModules::Module>();
 #if defined(__linux__)
       // Keep the descriptor open so the loader's /proc path cannot be reused for another module.
       cached->file = std::move(verified);
@@ -98,7 +128,7 @@ inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& pat
 #endif
   const auto& binding = LoadPluginModule(load_path, contract, HPK_IN_PROCESS);
   {
-    std::lock_guard lock(mutex);
+    std::lock_guard lock(state.mutex);
     entry->binding = &binding;
   }
   return binding;

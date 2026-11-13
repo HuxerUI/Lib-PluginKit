@@ -54,7 +54,8 @@ public:
   const File& BundleDirectory() const noexcept { return bundle_; }
 
   /// @brief Returns the absolute writable directory reserved for this plugin in the host profile.
-  /// PluginKit creates it before activation and reuses it across activations of this plugin ID.
+  /// PluginKit reuses this directory until an upgrade commits a replacement. During upgrade validation,
+  /// OnActivate() receives a copy in which it can migrate the plugin's data format.
   /// @return Reference valid for the lifetime of this context.
   const File& DataDirectory() const noexcept { return data_; }
 
@@ -190,12 +191,12 @@ Task<void> DispatchPlugin(Interface& instance, const hpk_host_v1* host, std::uin
 /// PluginContext for each activation. If both constructors are available, the context overload is used.
 /// @tparam Interface Interface with a public virtual destructor and a Contract specialization.
 /// @tparam Implementation Public implementation constructible from const PluginContext& or by default.
-/// @tparam Activate Optional initialization hook called before creating any instances. An exception fails activation.
-/// @tparam Deactivate Optional cleanup hook called during orderly teardown after all instances are destroyed.
+/// @tparam OnActivate Optional initialization hook called before creating any instances. An exception fails activation.
+/// @tparam OnDeactivate Optional cleanup hook called during orderly teardown after all instances are destroyed.
 /// @note Hooks run on the loading process's application thread. A terminated worker may skip teardown.
 /// @return Reference to a descriptor that remains valid while the plugin library is loaded.
 template<class Interface, class Implementation,
-         void (*Activate)(const PluginContext&) = nullptr, void (*Deactivate)(const PluginContext&) = nullptr>
+         void (*OnActivate)(const PluginContext&) = nullptr, void (*OnDeactivate)(const PluginContext&) = nullptr>
   requires std::derived_from<Implementation, Interface> &&
            std::has_virtual_destructor_v<Interface> &&
            (std::constructible_from<Implementation, const PluginContext&> || std::default_initializable<Implementation>)
@@ -226,7 +227,7 @@ const hpk_plugin_v1& Bind() noexcept {
         *activation = nullptr;
         try {
           auto context = detail::PluginContextAccess::Create(*input);
-          if constexpr (Activate != nullptr) Activate(*context);
+          if constexpr (OnActivate != nullptr) OnActivate(*context);
           // Publish the context only after the activation hook succeeds.
           *activation = context.release();
           return HPK_OK;
@@ -286,7 +287,7 @@ const hpk_plugin_v1& Bind() noexcept {
       [](void* activation) noexcept -> std::int32_t {
         const std::unique_ptr<PluginContext> context(static_cast<PluginContext*>(activation));
         try {
-          if constexpr (Deactivate != nullptr) Deactivate(*context);
+          if constexpr (OnDeactivate != nullptr) OnDeactivate(*context);
           return HPK_OK;
         } catch (const Error& error) {
           return status(error);

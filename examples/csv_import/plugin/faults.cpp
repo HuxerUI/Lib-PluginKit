@@ -21,16 +21,30 @@ void Record(const huxerui::pluginkit::PluginContext& context, std::string_view e
   }
 }
 
-void Activate(const huxerui::pluginkit::PluginContext& context) {
+void OnActivate(const huxerui::pluginkit::PluginContext& context) {
   if (active_context || !context.BundleDirectory().Child("plugin.json").ReadString().Succeeded() ||
       context.DataDirectory().Child("fail-activation").Exists()) {
     throw std::runtime_error("Cannot activate the fixture");
   }
+#if defined(CSV_IMPORT_UPGRADE)
+  const auto& data = context.DataDirectory();
+  const auto format = data.Child("data-format");
+  const auto version = format.ReadString();
+  if ((!version.Succeeded() || version.Value() != "2") && !format.WriteString("2")) {
+    throw std::runtime_error("Cannot migrate CSV fixture data");
+  }
+  if (data.Child("fail-upgrade").Exists()) throw std::runtime_error("CSV candidate failed after migrating data");
+  if (data.Child("pause-upgrade").Exists()) {
+    if (!data.Child("upgrade-ready").WriteString("ready")) throw std::runtime_error("Cannot mark CSV candidate ready");
+    std::this_thread::sleep_for(std::chrono::seconds(30));
+  }
+  if (data.Child("exit-upgrade").Exists()) std::_Exit(7);
+#endif
   Record(context, "activate");
   active_context = &context;
 }
 
-void Deactivate(const huxerui::pluginkit::PluginContext& context) {
+void OnDeactivate(const huxerui::pluginkit::PluginContext& context) {
   if (active_context != &context || live_instances != 0) {
     throw std::runtime_error("Expected the original context after all fixture instances were destroyed");
   }
@@ -130,4 +144,4 @@ private:
 
 } // namespace
 
-HPK_EXPORT_PLUGIN(csv_import::TableImporter, FaultImporter, Activate, Deactivate)
+HPK_EXPORT_PLUGIN(csv_import::TableImporter, FaultImporter, OnActivate, OnDeactivate)
