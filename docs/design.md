@@ -1,6 +1,6 @@
 # Lib-PluginKit Design
 
-This document specifies the intended API and behavior of Lib-PluginKit. Lib-PluginKit is an independent C++20 library for applications that publish typed extension interfaces and accept independently built plugins. HuxerUI is one integration target. The application owns the plugin manager and its lifetime.
+This document specifies the intended API and behavior of Lib-PluginKit. It is a C++20 library for applications that publish typed extension interfaces and accept independently built plugins. The HuxerUI project exposes `HuxerUI::PluginKit`. The application owns the plugin manager and its lifetime.
 
 ## Responsibilities
 
@@ -38,7 +38,7 @@ public:
 
 Portable signatures use fixed-width scalars, enums, UTF-8 strings, byte sequences, lists, optional values, records composed of those types, and Kit-managed handles. A const reference parameter is encoded as a value and has call-scoped lifetime in the implementation. The generated binding constructs and destroys C++ objects on their owning side. Host services use the same contract model in the reverse direction. [Windows DLL memory ownership guidance](https://learn.microsoft.com/en-us/cpp/c-runtime-library/potential-errors-passing-crt-objects-across-dll-boundaries?view=msvc-170)
 
-A native dynamic artifact exports the generated `pluginkit_query_v1` C entry point. It provides a versioned descriptor and the operations needed to create an instance, invoke an operation, and close the instance. The calling convention, struct sizes, buffer ownership, and descriptor version are part of the loader ABI. The binding catches C++ exceptions at its boundary and reports structured errors. Built-in plugins expose distinct registration entries referenced by the application. Both paths use the same contract and dispatch model.
+A plugin shared library exports the generated `pluginkit_query_v1` C entry point. It provides a versioned descriptor and the operations needed to create an instance, invoke an operation, and close the instance. The calling convention, struct sizes, buffer ownership, and descriptor version are part of the loader ABI. The binding catches C++ exceptions at its boundary and reports structured errors. Built-in plugins expose distinct registration entries referenced by the application. Both paths use the same contract and dispatch model.
 
 Operation and record field numbers are stable protocol identifiers. The generated ABI lock records them together with the schema for published revisions. Messages use the same numbered schema across in-process, worker, and Wasm transports. CBOR carries encoded values. Ordinary DTOs are decoded locally, and large payloads use scoped streams. [CBOR specification](https://www.rfc-editor.org/rfc/rfc8949.html)
 
@@ -117,7 +117,7 @@ An author manifest can describe a Markdown importer as follows.
 
 `hpk pack` adds the generated schema fingerprints and signed inventory for the published artifact. Each selected target resolves to a verified entry inside the package. Published content is immutable for a release and target. The manager validates archive boundaries and file sizes before installing content into its managed store.
 
-Discovery reads manifests from explicit local sources and configured repositories. Package selection checks the operating system, architecture, artifact ABI, supported contracts, execution policy, and permissions before activation. The executable descriptor is checked against the verified package at load time. A contribution can advertise a command or file type before its implementation runs.
+Discovery reads manifests from explicit local sources and configured repositories. Package selection checks the operating system, architecture, artifact ABI, supported contracts, execution policy, and permissions before activation. The loader checks the plugin descriptor against the verified package. A contribution can advertise a command or file type before its implementation runs.
 
 The resolver selects one release per plugin ID in a profile. It honors version pins and required version ranges, verifies required host services, rejects required dependency cycles, and reports the dependency chain for conflicts. Optional dependencies become available features when a compatible provider exists. Required dependencies activate before dependents, and teardown follows the reverse order. The committed resolution is persisted for reproducible startup.
 
@@ -129,7 +129,7 @@ Plugin origin and execution backend are separate. `Builtin` and `ExternalPackage
 
 | Backend | Policy and lifetime |
 | --- | --- |
-| `InProcess` | Default for built-in plugins. The application can explicitly approve trusted external artifacts for this backend. External native modules stay mapped until process exit, and an update takes effect at a subsequent startup. |
+| `InProcess` | Default for built-in plugins. The application can explicitly approve trusted external artifacts for this backend. External plugin libraries stay mapped until process exit, and an update takes effect at a subsequent startup. |
 | `WorkerProcess` | Default for separately installed desktop plugins. Each active plugin generation has its own `hpk-worker` with a private IPC channel. The worker starts on demand and loads the selected artifact. |
 | `Wasm` | Executes an independent module with configured imports and resource limits. Availability follows the target runtime and distribution policy. |
 
@@ -149,7 +149,7 @@ A profile records the selected releases, dependency resolution, enabled flags, p
 
 The manager stages verified package files and candidate profile data, then commits a durable revision. Startup recovers an interrupted operation before exposing the catalog. Candidate activation and settings migration use staged Kit-owned state. A failed change preserves the last committed version selection, settings, and dependency resolution. Business data migration and recovery follow the application's contracts.
 
-An enabled worker or Wasm plugin can be upgraded by validating the candidate generation and its resolved dependencies, committing the new selection, and draining the old generation. New calls go to newly opened handles. In-process native updates are recorded as pending restart and validated at startup. Built-in code versions follow the application release. Old packages are retained while a running generation, a pin, or a rollback record references them.
+An enabled worker or Wasm plugin can be upgraded by validating the candidate generation and its resolved dependencies, committing the new selection, and draining the old generation. New calls go to newly opened handles. Updates to in-process plugin libraries are recorded as pending restart and validated at startup. Built-in code versions follow the application release. Old packages are retained while a running generation, a pin, or a rollback record references them.
 
 Settings are versioned, validated against the declared schema, and persisted by plugin ID within the profile. The manager stages settings migrations with the candidate release. Private plugin data has its own lifetime and follows an explicit retention choice on removal. Grants are tied to plugin and publisher identity. A change that expands access requires approval before the new grant takes effect. Revocation invalidates the corresponding scoped handles. The manager restarts affected workers when the new policy requires a different sandbox.
 

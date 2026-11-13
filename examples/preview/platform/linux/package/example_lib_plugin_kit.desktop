@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Lib-PluginKit Preview
+Exec=example_lib_plugin_kit
+Icon=example_lib_plugin_kit
+Categories=Utility;
+Terminal=false

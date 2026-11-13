@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "id": "@plugin_id@",
+  "version": "0.1.0",
+  "target": "@package_target@",
+  "contract": {
+    "id": "@contract_id@",
+    "version": @contract_version@,
+    "fingerprint": "@contract_fingerprint@"
+  },
+  "extension": {
+    "point": "example.table-importers",
+    "id": "@contribution@",
+    "extensions": [".csv"]
+  }
+}
