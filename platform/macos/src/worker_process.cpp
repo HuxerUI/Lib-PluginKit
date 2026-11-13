@@ -6,7 +6,7 @@
 #include <signal.h>
 #include <spawn.h>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 namespace {
 
 void CheckSpawn(int error, std::string_view operation) {
@@ -69,7 +69,8 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, const std::file
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               ContractInfo contract) {
+               ContractInfo contract, std::vector<Service> services, TaskScope callbacks)
+    : services_(std::move(services)), callbacks_(std::move(callbacks)) {
   int sockets[2];
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
     PosixError(ErrorCode::Io, "Cannot create worker socket");
@@ -88,4 +89,4 @@ Worker::Worker(const std::filesystem::path& executable, const std::filesystem::p
   StartReaper(child);
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

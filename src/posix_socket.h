@@ -6,7 +6,7 @@
 #include <poll.h>
 #include <sys/socket.h>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
 inline constexpr int WorkerSocket = 3;
 #if defined(__linux__)
@@ -17,13 +17,13 @@ class SocketStream {
 public:
   explicit SocketStream(int fd, std::optional<Deadline> deadline = std::nullopt) : fd_(fd), deadline_(deadline) {}
 
-  void Read(std::span<std::uint8_t> bytes) const {
+  void Read(std::span<std::byte> bytes) const {
     Transfer(bytes, POLLIN, [this](auto remaining, int flags) {
       return ::recv(fd_, remaining.data(), remaining.size(), flags);
     }, "Cannot read worker frame");
   }
 
-  void Write(ByteView bytes) const {
+  void Write(std::span<const std::byte> bytes) const {
     Transfer(bytes, POLLOUT, [this](auto remaining, int flags) {
 #if defined(__linux__)
       flags |= MSG_NOSIGNAL;
@@ -73,4 +73,4 @@ private:
   std::optional<Deadline> deadline_;
 };
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

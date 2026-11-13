@@ -1,32 +1,112 @@
 #include "csv_contract.bindings.h"
+#include "services/import_status.bindings.h"
 
-#include <pluginkit/plugin.h>
+#include <huxerui/pluginkit/plugin.h>
+#include <huxerui/app.h>
 
 #include <chrono>
 #include <cstdlib>
-#include <thread>
-#if !defined(_WIN32)
 #include <fstream>
-#endif
+#include <future>
 
 namespace {
 
+const huxerui::pluginkit::PluginContext* active_context = nullptr;
+std::uint32_t created_instances = 0;
+std::uint32_t live_instances = 0;
+
+void Record(const huxerui::pluginkit::PluginContext& context, std::string_view event) {
+  if (!context.DataDirectory().Child("lifecycle.log").AppendString(std::string(event) + '\n')) {
+    throw std::runtime_error("Cannot write the fixture lifecycle log");
+  }
+}
+
+void Activate(const huxerui::pluginkit::PluginContext& context) {
+  if (active_context || !context.BundleDirectory().Child("plugin.json").ReadString().Succeeded() ||
+      context.DataDirectory().Child("fail-activation").Exists()) {
+    throw std::runtime_error("Cannot activate the fixture");
+  }
+  Record(context, "activate");
+  active_context = &context;
+}
+
+void Deactivate(const huxerui::pluginkit::PluginContext& context) {
+  if (active_context != &context || live_instances != 0) {
+    throw std::runtime_error("Expected the original context after all fixture instances were destroyed");
+  }
+  Record(context, "deactivate");
+  active_context = nullptr;
+}
+
 class FaultImporter final : public csv_import::TableImporter {
 public:
-  csv_import::ImportResult Import(const csv_import::ImportRequest& request) override {
+  explicit FaultImporter(const huxerui::pluginkit::PluginContext& context) : context_(context) {
+    if (active_context != &context) throw std::runtime_error("Expected the activation's context");
+    ++created_instances;
+    ++live_instances;
+  }
+
+  ~FaultImporter() override { --live_instances; }
+
+  huxerui::Task<csv_import::ImportResult> Import(csv_import::ImportRequest request,
+                                                  csv_import::ImportReceiver receiver) override {
     if (request.source == "exit") std::_Exit(5);
-    if (request.source == "wait") {
+    if (request.source == "context") {
+      const auto& info = context_.Info();
+      co_return csv_import::ImportResult{csv_import::Table{
+          {"id", "version", "digest", "bundle", "data", "created", "live"},
+          {{info.id, info.version, info.digest, context_.BundleDirectory().Path(), context_.DataDirectory().Path(),
+            std::to_string(created_instances), std::to_string(live_instances)}}}, {}};
+    }
+    if (request.source == "status") {
+      co_await SetRows(40);
+      co_await SetRows(41);
+    }
+    if (request.source == "reenter") co_await SetRows(UINT32_MAX);
+    if (request.source == "background") {
+      std::async(std::launch::async, [] { huxerui::pluginkit::GetService<csv_import::ImportStatus>(); }).get();
+    }
+    if (request.source == "other-task") {
+      co_await huxerui::AwaitCallback<void>([](auto completion) {
+        (void)huxerui::UseApplicationTaskScope().Launch([completion]() -> huxerui::Task<void> {
+          try {
+            co_await SetRows(99);
+            completion.Fail(std::make_exception_ptr(std::runtime_error("Unrelated task reached the host")));
+          } catch (...) {
+            completion.Fail(std::current_exception());
+          }
+        });
+        return std::function<void()>{};
+      });
+    }
+    if (request.source == "remember") {
+      saved_ = receiver;
+      co_await receiver.OnRows({1});
+    }
+    if (request.source == "stale" && saved_) co_await saved_->OnRows({2});
+    if (request.source == "status-wait") co_await SetRows(42);
+    if (request.source == "wait" || request.source == "status-wait") {
 #if !defined(_WIN32)
       if (const auto* marker = std::getenv("HPK_CSV_WAIT_MARKER")) std::ofstream(marker).put('\n');
 #endif
-      std::this_thread::sleep_for(std::chrono::minutes(1));
+      co_await huxerui::Delay(std::chrono::minutes(1));
       std::_Exit(6);
     }
     if (request.source == "throw") throw std::runtime_error("Failure fixture");
-    return {csv_import::Table{{"value"}, {{request.source}}}, {}};
+    co_return csv_import::ImportResult{csv_import::Table{{"value"}, {{request.source}}}, {}};
   }
+
+private:
+  static huxerui::Task<void> SetRows(std::uint32_t rows) {
+    if (!co_await huxerui::pluginkit::GetService<csv_import::ImportStatus>().SetImportedRows({rows})) {
+      throw std::runtime_error("The host declined the fixture row count");
+    }
+  }
+
+  const huxerui::pluginkit::PluginContext& context_;
+  std::optional<csv_import::ImportReceiver> saved_;
 };
 
 } // namespace
 
-HPK_EXPORT_PLUGIN(csv_import::TableImporter, FaultImporter)
+HPK_EXPORT_PLUGIN(csv_import::TableImporter, FaultImporter, Activate, Deactivate)

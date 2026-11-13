@@ -64,11 +64,31 @@ target_include_directories(huxerui_pluginkit PRIVATE ${kit_private_includes} PUB
     "$<INSTALL_INTERFACE:include>"
 )
 target_compile_features(huxerui_pluginkit PUBLIC cxx_std_20)
-target_link_libraries(huxerui_pluginkit PRIVATE nlohmann_json::nlohmann_json ${sha256_library})
+_huxerui_select_framework_target(kit_framework)
+target_link_libraries(huxerui_pluginkit
+    PUBLIC ${kit_framework}
+    PRIVATE nlohmann_json::nlohmann_json ${sha256_library}
+)
+set(kit_framework_includes "$<TARGET_PROPERTY:${kit_framework},INTERFACE_INCLUDE_DIRECTORIES>")
 
+if (NOT TARGET HuxerUI::huxerui)
+    find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared HINTS "${HUXERUI_HOME}")
+endif ()
+get_target_property(worker_framework_type HuxerUI::huxerui TYPE)
+if (NOT worker_framework_type STREQUAL "SHARED_LIBRARY")
+    message(FATAL_ERROR "PluginKit workers and plugins require the shared HuxerUI SDK")
+endif ()
 add_executable(hpk-worker tools/worker_main.cpp)
-target_include_directories(hpk-worker PRIVATE include ${kit_private_includes})
+target_include_directories(hpk-worker PRIVATE include ${kit_private_includes} "${kit_framework_includes}")
 target_compile_features(hpk-worker PRIVATE cxx_std_20)
+target_link_libraries(hpk-worker PRIVATE HuxerUI::huxerui)
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set_target_properties(hpk-worker PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+elseif (APPLE)
+    set_target_properties(hpk-worker PROPERTIES
+        BUILD_RPATH "@executable_path;@executable_path/../Frameworks"
+        INSTALL_RPATH "@executable_path;@executable_path/../Frameworks")
+endif ()
 
 if (WIN32)
     set(kit_compile_options /W4 /permissive- /utf-8)
@@ -101,7 +121,8 @@ if (HPK_BUILD_GENERATOR)
     file(TO_CMAKE_PATH "${clang_resource_dir}" clang_resource_dir)
 
     add_executable(hpk tools/hpk.cpp)
-    target_include_directories(hpk PRIVATE include ${kit_private_includes} "${HPK_LIBCLANG_INCLUDE_DIR}")
+    target_include_directories(hpk PRIVATE include ${kit_private_includes} "${HPK_LIBCLANG_INCLUDE_DIR}"
+        "${kit_framework_includes}")
     target_compile_features(hpk PRIVATE cxx_std_20)
     target_compile_options(hpk PRIVATE ${kit_compile_options})
     target_compile_definitions(hpk PRIVATE ${kit_compile_definitions} HPK_CLANG_TARGET="${clang_target}"

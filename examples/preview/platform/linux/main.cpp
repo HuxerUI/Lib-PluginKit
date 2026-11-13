@@ -1,6 +1,6 @@
 #include "csv_host.h"
 
-#include <pluginkit/error.h>
+#include <huxerui/pluginkit/contract.h>
 
 #include <cstdlib>
 #include <vector>
@@ -15,7 +15,7 @@ fs::path DefaultProfile() {
   if (!data.is_absolute()) {
     const auto* home = std::getenv("HOME");
     if (!home || !fs::path(home).is_absolute()) {
-      throw pluginkit::Error(pluginkit::ErrorCode::Io, "Cannot locate local application data");
+      throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::Io, "Cannot locate local application data");
     }
     data = fs::path(home) / ".local" / "share";
   }

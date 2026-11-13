@@ -1,17 +1,17 @@
 #pragma once
 
-#include <pluginkit/wire.h>
+#include <huxerui/pluginkit/detail/wire.h>
 
 #include <charconv>
 #include <filesystem>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
-inline ByteView AsBytes(std::string_view text) {
-  return {reinterpret_cast<const std::uint8_t*>(text.data()), text.size()};
+inline std::span<const std::byte> AsBytes(std::string_view text) {
+  return std::as_bytes(std::span(text));
 }
 
-inline std::string_view AsText(ByteView bytes) {
+inline std::string_view AsText(std::span<const std::byte> bytes) {
   if (bytes.empty()) return {};
   return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
 }
@@ -32,4 +32,4 @@ T ParseInteger(std::string_view text, std::string_view name) {
   throw Error(ErrorCode::InvalidArgument, "Invalid " + std::string(name));
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

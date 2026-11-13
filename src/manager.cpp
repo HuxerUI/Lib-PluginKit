@@ -1,11 +1,13 @@
 #include "digest.h"
 #include "worker_process.h"
+#include "run_transport.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <map>
 
-namespace pluginkit {
+namespace huxerui::pluginkit {
 namespace {
 
 namespace fs = std::filesystem;
@@ -17,7 +19,12 @@ constexpr std::size_t MaxModule = 64 * 1024 * 1024;
 constexpr std::size_t MaxProfile = 1024 * 1024;
 constexpr int MaxManifestDepth = 16;
 
-Json ParseJson(ByteView bytes, int max_depth, ErrorCode error) {
+fs::path NativePath(const File& file) {
+  const auto path = file.Path();
+  return fs::path(std::u8string(path.begin(), path.end()));
+}
+
+Json ParseJson(std::span<const std::byte> bytes, int max_depth, ErrorCode error) {
   return Json::parse(AsText(bytes), [max_depth, error](int depth, Json::parse_event_t, Json&) {
     if (depth > max_depth) throw Error(error, "JSON exceeds the nesting limit");
     return true;
@@ -142,15 +149,28 @@ struct RegisteredContract {
 } // namespace
 
 struct PluginManager::Impl {
-  Impl(const fs::path& directory, const fs::path& executable)
-      : profile(fs::absolute(directory)), worker_executable(fs::absolute(executable)) {
+  Impl(const fs::path& directory, const fs::path& executable, TaskScope callbacks)
+      : profile(fs::absolute(directory)), worker_executable(fs::absolute(executable)), callbacks(std::move(callbacks)) {
     fs::create_directories(profile);
     ownership = LockProfile(profile);
     catalog = ReadCatalog(profile / "profile.json");
   }
 
   ~Impl() {
-    for (const auto& [id, worker] : workers) worker->Stop();
+    for (const auto& [id, worker] : workers) worker->Shutdown();
+  }
+
+  void Shutdown() {
+    std::call_once(shutdown, [&] {
+      decltype(workers) running;
+      {
+        std::lock_guard lock(mutex);
+        closed = true;
+        running.swap(workers);
+      }
+      for (const auto& [id, worker] : running) worker->BeginShutdown();
+      for (const auto& [id, worker] : running) worker->Shutdown();
+    });
   }
 
   void Commit(Catalog candidate) {
@@ -171,11 +191,15 @@ struct PluginManager::Impl {
 
   fs::path profile;
   fs::path worker_executable;
+  TaskScope callbacks;
   Handle ownership;
   mutable std::mutex mutex;
   Catalog catalog;
   std::map<std::string, RegisteredContract, std::less<>> points;
+  std::map<std::string, std::vector<Worker::Service>, std::less<>> services;
   std::map<std::string, std::shared_ptr<Worker>, std::less<>> workers;
+  bool closed = false;
+  std::once_flag shutdown;
 };
 
 std::string_view ErrorName(ErrorCode code) noexcept {
@@ -196,16 +220,33 @@ std::string_view ErrorName(ErrorCode code) noexcept {
     case ErrorCode::Protocol: return "protocol";
     case ErrorCode::PluginFailed: return "plugin_failed";
     case ErrorCode::PayloadTooLarge: return "payload_too_large";
+    case ErrorCode::ServiceDenied: return "service_denied";
+    case ErrorCode::ServiceUnavailable: return "service_unavailable";
+    case ErrorCode::ReentrantCall: return "reentrant_call";
+    case ErrorCode::Cancelled: return "cancelled";
+    case ErrorCode::ReceiverClosed: return "receiver_closed";
   }
   return "unknown";
 }
 
-PluginManager::PluginManager(const fs::path& profile, const fs::path& executable)
-    : impl_(std::make_unique<Impl>(profile, executable)) {}
+PluginManager::PluginManager(const File& profile, const File& executable, TaskScope callbacks)
+    : impl_(std::make_shared<Impl>(NativePath(profile), NativePath(executable), std::move(callbacks))) {}
 
-PluginManager::~PluginManager() = default;
+PluginManager::~PluginManager() {
+  if (impl_) impl_->Shutdown();
+}
+
+Task<void> PluginManager::Shutdown() {
+  return ShutdownManager(impl_);
+}
+
+Task<void> PluginManager::ShutdownManager(std::shared_ptr<Impl> impl) {
+  RejectServiceReentry(co_await CurrentTaskExecution{});
+  co_await RunTransport([impl](std::stop_token) { impl->Shutdown(); });
+}
 
 void PluginManager::Register(std::string_view point, ContractInfo contract) {
+  RejectServiceReentry();
   if (!IsId(point) || !IsId(contract.id) || !contract.version || !IsDigest(contract.fingerprint)) {
     throw Error(ErrorCode::InvalidArgument, "Invalid extension point or contract identity");
   }
@@ -216,10 +257,27 @@ void PluginManager::Register(std::string_view point, ContractInfo contract) {
   }
 }
 
-PackageInfo PluginManager::InspectPackage(const fs::path& directory) { return ReadPackage(directory).info; }
+PackageInfo PluginManager::InspectPackage(const File& directory) {
+  RejectServiceReentry();
+  return ReadPackage(NativePath(directory)).info;
+}
 
-void PluginManager::InstallPackage(const fs::path& directory, std::string_view approved_digest) {
-  auto package = ReadPackage(directory);
+void PluginManager::Provide(ContractInfo contract, std::string_view approved_digest, ServiceDispatch dispatch) {
+  RejectServiceReentry();
+  if (!IsId(contract.id) || !contract.version || !IsDigest(contract.fingerprint) || !IsDigest(approved_digest)) {
+    throw Error(ErrorCode::InvalidArgument, "Invalid host service contract or package digest");
+  }
+  std::lock_guard lock(impl_->mutex);
+  auto& services = impl_->services[std::string(approved_digest)];
+  if (std::ranges::find(services, contract.id, &Worker::Service::id) != services.end()) {
+    throw Error(ErrorCode::InvalidArgument, "The host service is already registered for this package");
+  }
+  services.push_back({std::string(contract.id), contract.version, std::string(contract.fingerprint), std::move(dispatch)});
+}
+
+void PluginManager::InstallPackage(const File& directory, std::string_view approved_digest) {
+  RejectServiceReentry();
+  auto package = ReadPackage(NativePath(directory));
   if (package.info.digest != approved_digest) {
     throw Error(ErrorCode::ApprovalMismatch, "The package contents differ from the approved digest");
   }
@@ -242,7 +300,7 @@ void PluginManager::InstallPackage(const fs::path& directory, std::string_view a
       // Reinstall the approved bytes if the stored copy is unreadable.
     }
     if (const auto running = impl_->workers.find(package.info.id); running != impl_->workers.end()) {
-      running->second->Stop();
+      running->second->Shutdown();
       impl_->workers.erase(running);
     }
   }
@@ -259,23 +317,43 @@ void PluginManager::InstallPackage(const fs::path& directory, std::string_view a
   }
 }
 
-void PluginManager::SetEnabled(std::string_view id, bool enabled) {
-  std::lock_guard lock(impl_->mutex);
-  const auto found = impl_->catalog.find(id);
-  if (found == impl_->catalog.end()) throw Error(ErrorCode::NotFound, "The plugin is not installed");
-  if (found->second.enabled == enabled) return;
-  auto candidate = impl_->catalog;
-  candidate.find(id)->second.enabled = enabled;
-  impl_->Commit(std::move(candidate));
-  if (!enabled) {
-    if (const auto running = impl_->workers.find(id); running != impl_->workers.end()) {
-      running->second->Stop();
-      impl_->workers.erase(running);
+Task<void> PluginManager::SetEnabled(std::string_view id, bool enabled) {
+  return ChangeEnabled(impl_, std::string(id), enabled);
+}
+
+Task<void> PluginManager::ChangeEnabled(std::shared_ptr<Impl> impl, std::string id, bool enabled) {
+  RejectServiceReentry(co_await CurrentTaskExecution{});
+  auto change = [impl, id = std::move(id), enabled](std::stop_token stop) {
+    std::shared_ptr<Worker> worker;
+    {
+      std::lock_guard lock(impl->mutex);
+      if (stop.stop_requested()) return;
+      if (impl->closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
+      const auto found = impl->catalog.find(id);
+      if (found == impl->catalog.end()) throw Error(ErrorCode::NotFound, "The plugin is not installed");
+      if (found->second.enabled == enabled) return;
+      auto candidate = impl->catalog;
+      candidate.find(id)->second.enabled = enabled;
+      impl->Commit(std::move(candidate));
+      if (!enabled) {
+        if (const auto running = impl->workers.find(id); running != impl->workers.end()) {
+          worker = running->second;
+          worker->BeginShutdown();
+        }
+      }
     }
-  }
+    if (worker) {
+      worker->Shutdown();
+      std::lock_guard lock(impl->mutex);
+      const auto running = impl->workers.find(id);
+      if (running != impl->workers.end() && running->second == worker) impl->workers.erase(running);
+    }
+  };
+  co_await RunTransport(std::move(change));
 }
 
 std::vector<PluginInfo> PluginManager::ListPlugins() const {
+  // Read the snapshot without entering the worker's request queue, including during a host callback.
   std::lock_guard lock(impl_->mutex);
   std::vector<PluginInfo> result;
   for (const auto& [id, plugin] : impl_->catalog) {
@@ -297,12 +375,24 @@ std::vector<ExtensionInfo> PluginManager::List(std::string_view point, ContractI
   return result;
 }
 
-ExtensionInstance PluginManager::Open(std::string_view point, ContractInfo contract, const ExtensionId& id,
-                                      std::chrono::milliseconds timeout) {
-  std::lock_guard lock(impl_->mutex);
-  impl_->RequirePoint(point, contract);
-  const auto plugin = impl_->catalog.find(id.plugin);
-  if (plugin == impl_->catalog.end() || plugin->second.info.point != point ||
+Task<ExtensionInstance> PluginManager::Create(std::shared_ptr<Impl> impl, std::string point, ContractInfo contract,
+                                             ExtensionId id, std::chrono::milliseconds timeout) {
+  RejectServiceReentry(co_await CurrentTaskExecution{});
+  auto create = [impl, point = std::move(point), contract, id = std::move(id), timeout](std::stop_token stop) {
+    return CreateWorkerInstance(*impl, point, contract, id, timeout, stop);
+  };
+  co_return co_await RunTransport(std::move(create));
+}
+
+ExtensionInstance PluginManager::CreateWorkerInstance(Impl& state, std::string_view point, ContractInfo contract,
+                                                       const ExtensionId& id, std::chrono::milliseconds timeout,
+                                                       std::stop_token stop) {
+  std::unique_lock lock(state.mutex);
+  if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "Extension creation was cancelled");
+  if (state.closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
+  state.RequirePoint(point, contract);
+  const auto plugin = state.catalog.find(id.plugin);
+  if (plugin == state.catalog.end() || plugin->second.info.point != point ||
       plugin->second.info.contribution != id.contribution) {
     throw Error(ErrorCode::NotFound, "The extension is not installed at this point");
   }
@@ -310,17 +400,20 @@ ExtensionInstance PluginManager::Open(std::string_view point, ContractInfo contr
   if (!installed.enabled) throw Error(ErrorCode::Disabled, "The plugin is disabled");
   if (!Matches(installed.info, contract)) throw Error(ErrorCode::ContractMismatch, "The installed contract differs");
 
-  const auto running = impl_->workers.find(id.plugin);
-  if (running != impl_->workers.end()) {
+  std::stop_source lifetime;
+  const auto running = state.workers.find(id.plugin);
+  if (running != state.workers.end()) {
     if (running->second->Pid()) {
-      const auto reply = running->second->Request({static_cast<std::uint32_t>(Command::Open), 0, 0, {}}, timeout);
-      return ExtensionInstance(running->second, reply.instance);
+      auto worker = running->second;
+      lock.unlock();
+      const auto reply = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, {}}, timeout, nullptr, stop);
+      return ExtensionInstance(std::move(worker), reply.instance, std::move(lifetime));
     }
     running->second->Stop();
-    impl_->workers.erase(running);
+    state.workers.erase(running);
   }
 
-  const auto directory = impl_->PackageDirectory(installed.info.digest);
+  const auto directory = state.PackageDirectory(installed.info.digest);
   const auto package = [&] {
     try {
       return ReadPackage(directory);
@@ -332,12 +425,32 @@ ExtensionInstance PluginManager::Open(std::string_view point, ContractInfo contr
       package.info.contribution != id.contribution || !Matches(package.info, contract)) {
     throw Error(ErrorCode::PackageChanged, "The installed package differs from the approved package");
   }
+  // The fixed prefix and suffix keep valid plugin IDs distinct under Windows path normalization.
+  const auto data = state.profile / "data" / ("plugin-" + package.info.id + ".data");
+  std::error_code directory_error;
+  fs::create_directories(data, directory_error);
+  if (directory_error) throw Error(ErrorCode::Io, "Cannot create the plugin data directory: " + directory_error.message());
+  auto startup = PluginStartup{package.info.id, package.info.version, package.info.digest,
+                               PathText(directory), PathText(data)}.Encode();
   // The open file lets the Linux worker load the same library that was verified above.
-  auto worker = std::make_shared<Worker>(impl_->worker_executable, directory / ModuleName, package.module_file, contract);
-  const auto reply = worker->Request({static_cast<std::uint32_t>(Command::Open), 0, 0, {}}, timeout);
-  // Publish a generation only after its first instance opens successfully.
-  impl_->workers.emplace(id.plugin, worker);
-  return ExtensionInstance(std::move(worker), reply.instance);
+  const auto services = state.services.find(installed.info.digest);
+  auto worker = std::make_shared<Worker>(state.worker_executable, directory / ModuleName, package.module_file, contract,
+                                         services == state.services.end() ? std::vector<Worker::Service>{}
+                                                                          : services->second, state.callbacks);
+  const auto started = std::chrono::steady_clock::now();
+  try {
+    const auto reply = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, std::move(startup)},
+                                       timeout, nullptr, stop);
+    // Publish a generation only after activation and its first instance creation succeed.
+    state.workers.emplace(id.plugin, worker);
+    return ExtensionInstance(std::move(worker), reply.instance, std::move(lifetime));
+  } catch (...) {
+    // A failed first constructor can leave an activated plugin. Teardown uses the remaining creation budget.
+    const auto elapsed = std::chrono::ceil<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    if (elapsed < timeout) worker->Shutdown(timeout - elapsed);
+    else worker->Stop();
+    throw;
+  }
 }
 
-} // namespace pluginkit
+} // namespace huxerui::pluginkit

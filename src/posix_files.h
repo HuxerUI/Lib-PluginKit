@@ -9,7 +9,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
 class Handle {
 public:
@@ -90,7 +90,7 @@ inline bool SyncFile(int file) {
   return result == 0;
 }
 
-inline void WriteAtomicFile(const std::filesystem::path& path, ByteView bytes) {
+inline void WriteAtomicFile(const std::filesystem::path& path, std::span<const std::byte> bytes) {
   const auto parent = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
   Handle directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   if (!directory) PosixError(ErrorCode::Io, "Cannot open staging directory");
@@ -110,4 +110,4 @@ inline void WriteAtomicFile(const std::filesystem::path& path, ByteView bytes) {
   SyncFile(directory.get());
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

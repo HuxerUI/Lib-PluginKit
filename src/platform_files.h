@@ -6,7 +6,7 @@
 #include "posix_files.h"
 #endif
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
 #if defined(_WIN32)
 inline constexpr char PackageTarget[] = "windows-x86_64-msvc";
@@ -19,4 +19,4 @@ inline constexpr char PackageTarget[] = "linux-x86_64-gnu";
 inline constexpr char ModuleName[] = "plugin.so";
 #endif
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

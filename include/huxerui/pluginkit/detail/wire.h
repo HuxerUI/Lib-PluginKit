@@ -1,10 +1,12 @@
 #pragma once
 
 /// @file
-/// @brief Byte types and bounded CBOR encoding used by generated contract bindings.
+/// @brief Bounded CBOR encoding used by generated contract bindings.
 
-#include <pluginkit/abi.h>
-#include <pluginkit/error.h>
+#include <huxerui/pluginkit/detail/abi.h>
+#include <huxerui/pluginkit/contract.h>
+
+#include <huxerui/data.h>
 
 #include <concepts>
 #include <limits>
@@ -14,13 +16,7 @@
 #include <utility>
 #include <vector>
 
-namespace pluginkit {
-
-/// @brief Owning byte buffer for encoded requests and responses.
-using Bytes = std::vector<std::uint8_t>;
-
-/// @brief Read-only view of encoded bytes. The source storage must outlive the view.
-using ByteView = std::span<const std::uint8_t>;
+namespace huxerui::pluginkit {
 
 /// @brief Maximum encoded payload size in bytes for a single request or response.
 inline constexpr std::size_t MaxPayload = HPK_MAX_PAYLOAD;
@@ -53,7 +49,7 @@ class Writer {
 public:
   void Byte(std::uint8_t value) {
     RequireSpace(1);
-    bytes_.push_back(value);
+    bytes_.push_back(static_cast<std::byte>(value));
   }
 
   void Head(unsigned major, std::uint64_t value) {
@@ -77,7 +73,8 @@ public:
     if (!IsUtf8(text)) throw Error(ErrorCode::InvalidArgument, "CBOR text must be UTF-8");
     Head(3, text.size());
     RequireSpace(text.size());
-    bytes_.insert(bytes_.end(), text.begin(), text.end());
+    const auto bytes = std::as_bytes(std::span(text));
+    bytes_.insert(bytes_.end(), bytes.begin(), bytes.end());
   }
 
   Bytes Finish() && { return std::move(bytes_); }
@@ -92,19 +89,19 @@ private:
 
 class Reader {
 public:
-  explicit Reader(ByteView data) : remaining_(data) {
+  explicit Reader(std::span<const std::byte> data) : remaining_(data) {
     if (data.size() > MaxPayload) throw Error(ErrorCode::PayloadTooLarge, "CBOR payload exceeds the byte limit");
   }
 
   std::uint8_t Byte() {
     if (remaining_.empty()) Invalid();
-    const auto value = remaining_.front();
+    const auto value = std::to_integer<std::uint8_t>(remaining_.front());
     remaining_ = remaining_.subspan(1);
     return value;
   }
 
   bool TakeNull() {
-    if (remaining_.empty() || remaining_.front() != 0xf6) return false;
+    if (remaining_.empty() || remaining_.front() != std::byte{0xf6}) return false;
     Byte();
     return true;
   }
@@ -146,6 +143,8 @@ public:
     if (!remaining_.empty()) Invalid();
   }
 
+  std::span<const std::byte> Remaining() const noexcept { return remaining_; }
+
   [[noreturn]] static void Invalid() { throw Error(ErrorCode::Protocol, "Invalid CBOR payload for the contract"); }
 
 private:
@@ -159,7 +158,7 @@ private:
     return value;
   }
 
-  ByteView remaining_;
+  std::span<const std::byte> remaining_;
 };
 
 template<class T>
@@ -245,7 +244,7 @@ Bytes Encode(const T& value) {
 }
 
 template<class T>
-T Decode(ByteView bytes) {
+T Decode(std::span<const std::byte> bytes) {
   Reader reader(bytes);
   auto result = Codec<T>::Read(reader);
   reader.Finish();
@@ -253,4 +252,4 @@ T Decode(ByteView bytes) {
 }
 
 } // namespace detail
-} // namespace pluginkit
+} // namespace huxerui::pluginkit

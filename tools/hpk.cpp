@@ -14,9 +14,9 @@ namespace {
 
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
-using pluginkit::Error;
-using pluginkit::ErrorCode;
-using namespace pluginkit::detail;
+using huxerui::pluginkit::Error;
+using huxerui::pluginkit::ErrorCode;
+using namespace huxerui::pluginkit::detail;
 
 std::string Text(CXString value) {
   const auto* characters = clang_getCString(value);
@@ -45,6 +45,11 @@ std::vector<CXCursor> Children(CXCursor parent) {
 }
 
 std::string Name(CXCursor cursor) { return Text(clang_getCursorSpelling(cursor)); }
+
+fs::path CursorPath(CXFile file) {
+  const auto path = Text(clang_getFileName(file));
+  return fs::path(std::u8string(path.begin(), path.end()));
+}
 
 std::string QualifiedName(CXCursor cursor) {
   auto name = Name(cursor);
@@ -111,7 +116,21 @@ struct Operation {
   std::string name;
   Type request;
   Type response;
+  bool async;
+  std::string receiver;
+  std::string receiver_header;
 };
+
+CXType PluginKitArgument(CXType type, std::string_view name) {
+  const auto canonical = clang_getCanonicalType(type);
+  if (QualifiedName(clang_getTypeDeclaration(canonical)) == name &&
+      !clang_isConstQualifiedType(canonical) && !clang_isVolatileQualifiedType(canonical)) {
+    auto argument = clang_Type_getTemplateArgumentAsType(type, 0);
+    if (argument.kind == CXType_Invalid) argument = clang_Type_getTemplateArgumentAsType(canonical, 0);
+    return argument;
+  }
+  return CXType{CXType_Invalid, {}};
+}
 
 class Schema {
 public:
@@ -125,25 +144,54 @@ public:
         destructor = true;
         continue;
       }
+      const auto count = clang_Cursor_getNumArguments(cursor);
       if (cursor.kind != CXCursor_CXXMethod || clang_getCXXAccessSpecifier(cursor) != CX_CXXPublic ||
-          !clang_CXXMethod_isPureVirtual(cursor) || clang_Cursor_getNumArguments(cursor) != 1 ||
+          !clang_CXXMethod_isPureVirtual(cursor) || count < 1 || count > 2 ||
           clang_Cursor_isVariadic(cursor) || clang_Type_getCXXRefQualifier(clang_getCursorType(cursor)) != CXRefQualifier_None) {
-        Reject(cursor, "Expected a public pure virtual operation with one request parameter");
+        Reject(cursor, "Expected a public pure virtual operation with one request and an optional receiver");
       }
       const auto name = Name(cursor);
-      if (name.starts_with("operator") || name == "ExtensionHandle" || !names.insert(name).second) {
+      if (name.starts_with("operator") || name == "ExtensionHandle" || name == "ServiceHandle" ||
+          name == "Receiver" || !names.insert(name).second) {
         Reject(cursor, "Operation names must be unique ordinary method names");
       }
       const auto argument = clang_Cursor_getArgument(cursor, 0);
       auto type = clang_getCursorType(argument);
+      auto result = clang_getCursorResultType(cursor);
+      const auto task_result = PluginKitArgument(result, "huxerui::Task");
+      const bool async = task_result.kind != CXType_Invalid;
+      if (async) result = task_result;
       if (type.kind == CXType_LValueReference) {
+        if (async) Reject(argument, "A coroutine operation must take its request by value");
         type = clang_getPointeeType(type);
         if (!clang_isConstQualifiedType(type) || clang_isVolatileQualifiedType(type)) {
           Reject(argument, "A borrowed request must be a const reference");
         }
         type = clang_getUnqualifiedType(type);
       }
-      operations.push_back({name, ReadType(type, argument, 0), ReadType(clang_getCursorResultType(cursor), cursor, 0)});
+      Operation operation{name, ReadType(type, argument, 0),
+                          result.kind == CXType_Void ? Type{"void", "void"} : ReadType(result, cursor, 0),
+                          async, {}, {}};
+      if (count == 2) {
+        const auto receiver = clang_Cursor_getArgument(cursor, 1);
+        const auto receiver_type = PluginKitArgument(clang_getCursorType(receiver), "huxerui::pluginkit::Receiver");
+        const auto declaration = clang_getTypeDeclaration(clang_getCanonicalType(receiver_type));
+        CXFile receiver_file = nullptr;
+        CXFile interface_file = nullptr;
+        clang_getSpellingLocation(clang_getCursorLocation(declaration), &receiver_file, nullptr, nullptr, nullptr);
+        clang_getSpellingLocation(clang_getCursorLocation(interface), &interface_file, nullptr, nullptr, nullptr);
+        if (!async || receiver_type.kind == CXType_Invalid || !receiver_file ||
+            clang_File_isEqual(receiver_file, interface_file) || !clang_isCursorDefinition(declaration)) {
+          Reject(receiver, "Use a by-value huxerui::pluginkit::Receiver<Interface> from a separate contract header on a Task operation");
+        }
+        auto binding = CursorPath(receiver_file).lexically_relative(CursorPath(interface_file).parent_path());
+        if (binding.empty()) Reject(receiver, "Could not locate the receiver contract relative to this header");
+        binding.replace_extension(".bindings.h");
+        operation.receiver = "::" + QualifiedName(declaration);
+        const auto relative = binding.generic_u8string();
+        operation.receiver_header.assign(relative.begin(), relative.end());
+      }
+      operations.push_back(std::move(operation));
     }
     if (!destructor || operations.empty()) Reject(interface, "The interface needs a public virtual destructor and operations");
   }
@@ -153,6 +201,8 @@ public:
     for (const auto& method : operations) {
       methods.push_back({{"number", methods.size() + 1}, {"name", method.name},
                          {"request", method.request.wire}, {"response", method.response.wire}});
+      if (method.async) methods.back()["async"] = true;
+      if (!method.receiver.empty()) methods.back()["receiver"] = method.receiver;
     }
     auto types = Json::array();
     for (const auto& record : records) {
@@ -236,8 +286,13 @@ std::string EmitBindings(const Schema& schema, std::string_view header, std::str
   std::ostringstream out;
   out << "#pragma once\n\n"
       << "/// @file\n/// @brief Generated bindings shared by the host and the plugin.\n\n"
-      << "#include \"" << header << "\"\n#include <pluginkit/contract.h>\n#include <pluginkit/wire.h>\n\n"
-      << "namespace pluginkit::detail {\n\n";
+      << "#include \"" << header << "\"\n#include <huxerui/pluginkit/detail/invocation.h>\n";
+  std::set<std::string> receiver_headers;
+  for (const auto& operation : schema.operations) {
+    if (!operation.receiver_header.empty()) receiver_headers.insert(operation.receiver_header);
+  }
+  for (const auto& receiver : receiver_headers) out << "#include \"" << receiver << "\"\n";
+  out << "\nnamespace huxerui::pluginkit::detail {\n\n";
   for (const auto& record : schema.records) {
     const auto type = "::" + record.name;
     out << "template<>\nstruct Codec<" << type << "> {\n"
@@ -256,7 +311,7 @@ std::string EmitBindings(const Schema& schema, std::string_view header, std::str
     out << "};\n  }\n};\n\n";
   }
   const auto type = "::" + schema.interface_name;
-  out << "} // namespace pluginkit::detail\n\nnamespace pluginkit {\n\n"
+  out << "} // namespace huxerui::pluginkit::detail\n\nnamespace huxerui::pluginkit {\n\n"
       << "/// @brief Generated contract identity and operation dispatcher for " << schema.interface_name << ".\n"
       << "template<>\nstruct Contract<" << type << "> {\n"
       << "  /// Exact contract identity shared by the host and plugin.\n"
@@ -264,18 +319,53 @@ std::string EmitBindings(const Schema& schema, std::string_view header, std::str
       << "  /// @brief Decodes the request and invokes the selected operation.\n"
       << "  /// @param implementation Plugin instance that implements the interface.\n"
       << "  /// @param operation Operation number from the published contract.\n"
-      << "  /// @param payload Encoded request borrowed for this call.\n"
-      << "  /// @return Encoded result owned by the caller.\n"
+      << "  /// @param payload Encoded request owned by the task.\n"
+      << "  /// @param context Invocation data for a call that supplies a receiver.\n"
+      << "  /// @return Task that produces the encoded result.\n"
       << "  /// @throws Error With Protocol if the operation or request payload is invalid.\n"
-      << "  static Bytes Dispatch(" << type << "& implementation, std::uint32_t operation, ByteView payload) {\n"
+      << "  static Task<Bytes> Dispatch(" << type << "& implementation, std::uint32_t operation, Bytes payload,\n"
+      << "                              [[maybe_unused]] detail::DispatchContext context) {\n"
       << "    switch (operation) {\n";
   for (std::size_t i = 0; i < schema.operations.size(); ++i) {
     const auto& operation = schema.operations[i];
-    out << "      case " << i + 1 << ":\n        return detail::Encode(implementation." << operation.name
-        << "(detail::Decode<" << operation.request.cpp << ">(payload)));\n";
+    out << "      case " << i + 1 << ": {\n";
+    if (!operation.receiver.empty()) {
+      out << "        if (!context.receiver || !context.invocation.host) {\n"
+          << "          throw Error(ErrorCode::Protocol, \"Missing invocation receiver\");\n        }\n";
+    }
+    const bool returns_value = operation.response.cpp != "void";
+    out << "        ";
+    if (returns_value) out << "auto result = ";
+    if (operation.async) out << "co_await ";
+    out << "implementation." << operation.name << "(detail::Decode<" << operation.request.cpp << ">(payload)";
+    if (!operation.receiver.empty()) {
+      out << ", Receiver<" << operation.receiver << ">(detail::HostEndpoint(context.invocation, context.receiver))";
+    }
+    out << ");\n        co_return " << (returns_value ? "detail::Encode(result)" : "Bytes{}") << ";\n      }\n";
   }
   out << "      default: throw Error(ErrorCode::Protocol, \"Unknown contract operation\");\n"
-      << "    }\n  }\n};\n\n} // namespace pluginkit\n";
+      << "    }\n  }\n};\n\n";
+  if (receiver_headers.empty()) {
+    for (const auto proxy : {"ServiceHandle", "Receiver"}) {
+      out << "/// @brief Invocation-scoped proxy for " << schema.interface_name << " on the host.\n"
+          << "template<>\nclass " << proxy << "<" << type << "> {\npublic:\n"
+          << "  /// @brief Binds the proxy to its owning invocation.\n"
+          << "  explicit " << proxy << "(detail::HostEndpoint endpoint) : endpoint_(endpoint) {}\n\n";
+      for (std::size_t i = 0; i < schema.operations.size(); ++i) {
+        const auto& operation = schema.operations[i];
+        out << "  /// @brief Invokes " << operation.name << " on the host when awaited.\n"
+            << "  /// @param request Value to encode for the host.\n"
+            << "  /// @return Task that completes after the host replies.\n"
+            << "  /// @throws Error If the proxy is expired, unauthorized, or the call fails.\n"
+            << "  Task<" << operation.response.cpp << "> " << operation.name << "(const " << operation.request.cpp
+            << "& request) const {\n"
+            << "    return detail::InvokeHost<" << operation.response.cpp << ">(endpoint_, Contract<" << type
+            << ">::Info, " << i + 1 << ", detail::Encode(request));\n  }\n\n";
+      }
+      out << "private:\n  detail::HostEndpoint endpoint_;\n};\n\n";
+    }
+  }
+  out << "} // namespace huxerui::pluginkit\n";
   return out.str();
 }
 
@@ -283,37 +373,46 @@ std::string EmitHost(const Schema& schema, std::string_view bindings) {
   std::ostringstream out;
   out << "#pragma once\n\n"
       << "/// @file\n/// @brief Generated host API for the published plugin contract.\n\n"
-      << "#include \"" << bindings << "\"\n#include <pluginkit/manager.h>\n\n"
-      << "namespace pluginkit {\n\n"
+      << "#include \"" << bindings << "\"\n#include <huxerui/pluginkit.h>\n\n"
+      << "namespace huxerui::pluginkit {\n\n"
       << "/// @brief Move-only handle to one instance of " << schema.interface_name << " in the plugin worker.\n"
       << "///\n"
       << "/// Calls share the worker's serialized request queue. Coordinate moves, Close(), and destruction\n"
       << "/// with all calls on this handle. Destruction attempts to close the instance and suppresses close errors.\n"
-      << "/// @see PluginManager::OpenExtension()\n"
+      << "/// @see PluginManager::CreateExtension()\n"
       << "template<>\nclass ExtensionHandle<::" << schema.interface_name << "> {\npublic:\n"
-      << "  /// @brief Takes ownership of an instance opened by PluginManager.\n"
+      << "  /// @brief Takes ownership of an instance created by PluginManager.\n"
       << "  /// @param instance Instance to move into this handle.\n"
       << "  explicit ExtensionHandle(detail::ExtensionInstance instance) : instance_(std::move(instance)) {}\n\n";
   for (std::size_t i = 0; i < schema.operations.size(); ++i) {
     const auto& operation = schema.operations[i];
-    out << "  /// @brief Invokes " << operation.name << " synchronously in the plugin worker.\n"
-        << "  /// @param request Value encoded according to the contract.\n"
-        << "  /// @param timeout Time budget from 1 ms through 24 hours, starting after encoding.\n"
-        << "  /// @return Decoded operation result.\n"
+    out << "  /// @brief Invokes " << operation.name << " in the plugin worker when the task runs.\n"
+        << "  /// @param request Value encoded according to the contract.\n";
+    if (!operation.receiver.empty()) out << "  /// @param receiver Host callback object retained for this invocation.\n";
+    out << "  /// @param timeout Time budget from 1 ms through 24 hours, including time in the worker queue.\n"
+        << "  /// @return Task that produces the decoded result.\n"
         << "  /// @throws Error With Closed if the handle or generation is closed, DeadlineExceeded if the request\n"
         << "  /// expires, or WorkerExited if the worker exits before the reply.\n"
         << "  /// @throws Error With PluginFailed if the implementation reports a failure.\n"
         << "  /// @note A queue timeout affects only this call. An in-flight timeout closes the worker generation\n"
         << "  /// and the operation may already have taken effect.\n"
-        << "  " << operation.response.cpp << " " << operation.name << "(const " << operation.request.cpp << "& request,\n"
-        << "      std::chrono::milliseconds timeout = DefaultTimeout) const {\n"
-        << "    return detail::Decode<" << operation.response.cpp << ">(instance_.Invoke(" << i + 1
-        << ", detail::Encode(request), timeout));\n  }\n\n";
+        << "  Task<" << operation.response.cpp << ">"
+        << " " << operation.name << "(const " << operation.request.cpp << "& request,\n";
+    if (!operation.receiver.empty()) out << "      std::shared_ptr<" << operation.receiver << "> receiver,\n";
+    out << "      std::chrono::milliseconds timeout = DefaultTimeout) const {\n";
+    out << "    return detail::InvokeExtension<" << operation.response.cpp << ">(instance_.Call(), " << i + 1
+        << ", detail::Encode(request), timeout";
+    if (!operation.receiver.empty()) {
+      out << ", detail::BindReceiver<" << operation.receiver << ">(std::move(receiver))";
+    }
+    out << ");\n";
+    out << "  }\n\n";
   }
   out << "  /// @brief Closes the local handle and requests release of the instance from a live worker.\n"
+      << "  /// @return Lazy task. Await it before moving or destroying this handle.\n"
       << "  /// @throws Error If the close request fails. A failed close also retires the worker generation.\n"
-      << "  void Close() { instance_.Close(); }\n\nprivate:\n  detail::ExtensionInstance instance_;\n};\n\n"
-      << "} // namespace pluginkit\n";
+      << "  Task<void> Close() { return instance_.Close(); }\n\nprivate:\n  detail::ExtensionInstance instance_;\n};\n\n"
+      << "} // namespace huxerui::pluginkit\n";
   return out.str();
 }
 

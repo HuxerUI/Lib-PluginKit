@@ -12,16 +12,17 @@
 
 #include <array>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
-inline std::string Sha256(ByteView bytes) {
+inline std::string Sha256(std::span<const std::byte> bytes) {
   std::array<unsigned char, 32> digest{};
 #if defined(_WIN32)
   BCRYPT_ALG_HANDLE algorithm = nullptr;
   if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) {
     throw Error(ErrorCode::Io, "Cannot open SHA-256 provider");
   }
-  const auto status = BCryptHash(algorithm, nullptr, 0, const_cast<unsigned char*>(bytes.data()),
+  auto* input = reinterpret_cast<unsigned char*>(const_cast<std::byte*>(bytes.data()));
+  const auto status = BCryptHash(algorithm, nullptr, 0, input,
                                  static_cast<ULONG>(bytes.size()), digest.data(), static_cast<ULONG>(digest.size()));
   BCryptCloseAlgorithmProvider(algorithm, 0);
   if (status < 0) throw Error(ErrorCode::Io, "Cannot compute SHA-256 digest");
@@ -66,4 +67,4 @@ inline bool IsId(std::string_view text) {
   return true;
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

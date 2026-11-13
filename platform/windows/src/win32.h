@@ -6,7 +6,7 @@
 
 #include <memory>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
 struct CloseHandleDeleter {
   void operator()(void* handle) const noexcept { CloseHandle(handle); }
@@ -30,7 +30,7 @@ inline std::string Utf8(std::wstring_view text) {
   return result;
 }
 
-inline void ReadAll(HANDLE file, std::span<std::uint8_t> bytes, ErrorCode code, std::string_view operation) {
+inline void ReadAll(HANDLE file, std::span<std::byte> bytes, ErrorCode code, std::string_view operation) {
   while (!bytes.empty()) {
     DWORD count = 0;
     if (!ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr)) WindowsError(code, operation);
@@ -39,7 +39,7 @@ inline void ReadAll(HANDLE file, std::span<std::uint8_t> bytes, ErrorCode code, 
   }
 }
 
-inline void WriteAll(HANDLE file, ByteView bytes, ErrorCode code, std::string_view operation) {
+inline void WriteAll(HANDLE file, std::span<const std::byte> bytes, ErrorCode code, std::string_view operation) {
   while (!bytes.empty()) {
     DWORD count = 0;
     if (!WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &count, nullptr)) WindowsError(code, operation);
@@ -94,7 +94,7 @@ inline Handle LockProfile(const std::filesystem::path& directory) {
   return Handle(raw);
 }
 
-inline void WriteAtomicFile(const std::filesystem::path& path, ByteView bytes) {
+inline void WriteAtomicFile(const std::filesystem::path& path, std::span<const std::byte> bytes) {
   auto staged = path;
   staged += L".tmp";
   const HANDLE raw = CreateFileW(staged.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -113,4 +113,4 @@ inline void WriteAtomicFile(const std::filesystem::path& path, ByteView bytes) {
   }
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

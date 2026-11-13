@@ -6,7 +6,7 @@
 #include <sys/event.h>
 #include <thread>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
 inline void StartHostWatch() {
   // The watcher observes disconnects while the request thread is inside plugin code.
@@ -33,4 +33,4 @@ inline void StartHostWatch() {
   }).detach();
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

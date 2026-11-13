@@ -3,7 +3,7 @@
 #include <future>
 #include <thread>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 namespace {
 
 struct Pipe {
@@ -54,7 +54,8 @@ private:
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               ContractInfo contract) {
+               ContractInfo contract, std::vector<Service> services, TaskScope callbacks)
+    : services_(std::move(services)), callbacks_(std::move(callbacks)) {
   auto request = CreateWorkerPipe(true);
   auto response = CreateWorkerPipe(false);
   std::array handles{request.read.get(), response.write.get()};
@@ -109,28 +110,37 @@ std::optional<std::uint32_t> Worker::Pid() const noexcept {
 
 void Worker::Stop() noexcept {
   std::lock_guard lock(stop_);
-  active_ = false;
+  {
+    std::lock_guard queue_lock(requests_);
+    if (!active_.exchange(false)) return;
+  }
+  request_ready_.notify_all();
+  generation_stop_.request_stop();
   job_.reset();
 }
 
-Frame Worker::Exchange(const Frame& request, Deadline deadline) {
-  std::packaged_task<Frame()> exchange([this, &request] {
-    WriteFrame([this](ByteView bytes) {
-      WriteAll(to_worker_.get(), bytes, ErrorCode::WorkerExited, "Cannot write worker frame");
-    }, request);
-    return ReadFrame([this](std::span<std::uint8_t> bytes) {
-      ReadAll(from_worker_.get(), bytes, ErrorCode::WorkerExited, "Cannot read worker frame");
+Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
+                       const ReceiverRegistration* receiver) {
+  // A separate pipe helper lets the request thread enforce the I/O deadline.
+  return ExchangeFrames(request, deadline, stop, receiver, [this, deadline](const Frame& outgoing) {
+    std::packaged_task<Frame()> exchange([this, &outgoing] {
+      WriteFrame([this](std::span<const std::byte> bytes) {
+        WriteAll(to_worker_.get(), bytes, ErrorCode::WorkerExited, "Cannot write worker frame");
+      }, outgoing);
+      return ReadFrame([this](std::span<std::byte> bytes) {
+        ReadAll(from_worker_.get(), bytes, ErrorCode::WorkerExited, "Cannot read worker frame");
+      });
     });
+    auto result = exchange.get_future();
+    std::jthread io(std::move(exchange));
+    if (result.wait_until(deadline) != std::future_status::ready) {
+      // Interrupt blocked pipe I/O so the thread can join before the frame goes out of scope.
+      Stop();
+      CancelSynchronousIo(io.native_handle());
+      throw Error(ErrorCode::DeadlineExceeded, "The plugin worker exceeded the request deadline");
+    }
+    return result.get();
   });
-  auto result = exchange.get_future();
-  std::jthread io(std::move(exchange));
-  if (result.wait_until(deadline) != std::future_status::ready) {
-    // Interrupt blocked pipe I/O so the thread can join before the request goes out of scope.
-    Stop();
-    CancelSynchronousIo(io.native_handle());
-    throw Error(ErrorCode::DeadlineExceeded, "The plugin worker exceeded the request deadline");
-  }
-  return result.get();
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

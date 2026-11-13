@@ -1,6 +1,6 @@
 #include "csv_host.h"
 
-#include <pluginkit/error.h>
+#include <huxerui/pluginkit/contract.h>
 #include <windows.h>
 
 #include <vector>
@@ -8,8 +8,8 @@
 namespace csv_import::preview {
 
 namespace fs = std::filesystem;
-using pluginkit::Error;
-using pluginkit::ErrorCode;
+using huxerui::pluginkit::Error;
+using huxerui::pluginkit::ErrorCode;
 
 fs::path DefaultProfile() {
   std::wstring path(32768, L'\0');

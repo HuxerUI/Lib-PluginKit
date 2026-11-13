@@ -56,16 +56,18 @@ The Kit protocol version, business contract version, and plugin release version 
 | `ExtensionId` | The plugin ID and a stable contribution ID within that plugin. |
 | `ExtensionInfo<T>` | Catalog metadata for one contribution, available before the implementation starts. |
 | `ExtensionHandle<T>` | A typed, revocable handle to an opened extension instance. |
-| `PluginContext` | The services and resources scoped to an activated plugin generation. |
+| `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, and writable data directory. |
+| `Task<T>` | Lazy operation whose coroutine runs on its owning thread. |
+| `Receiver<T>` | Typed proxy for a caller-owned callback interface, scoped to one invocation. |
 
-The application owns one `pluginkit::PluginManager` for each plugin profile it manages. `PluginManagerOptions` supplies the profile directory, trusted sources, execution policy, and callback executor. Registration of application extension points and host services completes before startup.
+The application owns one `huxerui::pluginkit::PluginManager` for each plugin profile it manages. `PluginManagerOptions` supplies the profile directory, trusted sources, execution policy, and callback executor. Registration of application extension points and host services completes before startup.
 
 | Responsibility | API | Behavior |
 | --- | --- | --- |
 | Configuration | `RegisterExtensionPoint(point)`, `ProvideService<T>()`, `RegisterBuiltinPlugin(entry)` | Declare typed extension points, supply host services, and explicitly register built-ins. |
 | Manager lifetime | `StartAsync()`, `ShutdownAsync()` | Recover the profile before publishing the catalog. On shutdown, stop new work and release owned runtime resources. |
 | Discovery | `RefreshCatalogAsync()`, `ListPlugins()`, `ListExtensions(point)` | Refresh configured sources and read catalog snapshots. Listing contributions uses manifest metadata. |
-| Invocation | `OpenExtensionAsync(point, id)`, `OpenExtensionAsync(point, query)` | Open an explicit contribution or select one by typed metadata and user preference. Return a typed handle after activation. |
+| Invocation | `CreateExtension(point, id)` | Instantiate a selected contribution and return a typed handle. The selection design also allows matching by typed metadata and user preference. |
 | Changes | `PlanChangesAsync(changes)`, `ApplyPlanAsync(plan, approval)` | Coordinate installation, enablement, disablement, updates, removal, pinning, provider selection, grant changes, and rollback. |
 | Settings | `GetSettings(plugin_id)`, `SetSettingsAsync(plugin_id, values)` | Read a snapshot and validate or persist changes against the plugin settings schema. |
 | Observability | `SubscribeEvents()`, `Diagnostics()` | Report catalog revisions, state transitions, operation progress, and structured failures. Subscription handles release their callbacks. |
@@ -74,7 +76,11 @@ Explicit IDs and stored user preferences take precedence over automatic matching
 
 The generated `ExtensionHandle<DocumentImporter>` exposes an asynchronous `ImportAsync` call. The completion result distinguishes the business value from a Kit failure such as an incompatible contract, deadline expiry, or worker exit. Explicit `CloseAsync()` waits for instance release when the caller needs that boundary. Releasing the handle also schedules cleanup.
 
-A plugin can receive `PluginContext` through its generated binding. `GetService<T>()` returns a typed service approved and resolved for that plugin. The context also provides settings, read-only bundle resources, private storage, logging, and lifetime cancellation. Optional `OnStart()` and `OnStop()` hooks cover initialization and teardown. Kit tracks the tasks, subscriptions, streams, and grants acquired through the context.
+A plugin activation owns a single `PluginContext`. The SDK passes it by const reference to optional `Activate` and `Deactivate` hooks and to each extension implementation that accepts it in its constructor. `Activate` runs before the first instance is created. Normal shutdown destroys the instances before calling `Deactivate`. The host derives the bundle directory from the approved package snapshot and the writable data directory from the plugin ID in the profile. Both are exposed as `huxerui::File`.
+
+During an invocation, `huxerui::pluginkit::GetService<T>()` creates a typed proxy. The worker checks service access against the package digest authorized by the host. The caller can supply a `Receiver<T>` for a task operation and the plugin can await its methods while that invocation is active. The current desktop SDK shares one deadline across the invocation and its callbacks. See the [CSV example](../README.md#sdk-and-runtime) for the implemented API.
+
+The broader lifecycle design includes settings, read-only bundle resources, logging, and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
 
 ## Packages, discovery, and resolution
 

@@ -5,7 +5,7 @@
 #include <signal.h>
 #include <sys/wait.h>
 
-namespace pluginkit::detail {
+namespace huxerui::pluginkit::detail {
 
 void Worker::StartReaper(pid_t child) {
   pid_ = child;
@@ -31,7 +31,12 @@ std::optional<std::uint32_t> Worker::Pid() const noexcept {
 
 void Worker::Stop() noexcept {
   std::lock_guard lock(stop_);
-  if (!active_.exchange(false)) return;
+  {
+    std::lock_guard queue_lock(requests_);
+    if (!active_.exchange(false)) return;
+  }
+  request_ready_.notify_all();
+  generation_stop_.request_stop();
   ::shutdown(socket_.get(), SHUT_RDWR);
   const auto pid = pid_.load();
   if (pid > 0) ::kill(-pid, SIGKILL);
@@ -53,12 +58,13 @@ void Worker::Reap(pid_t child) noexcept {
   ::shutdown(socket_.get(), SHUT_RDWR);
 }
 
-Frame Worker::Exchange(const Frame& request, Deadline deadline) {
+Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
+                       const ReceiverRegistration* receiver) {
   const SocketStream stream(socket_.get(), deadline);
-  WriteFrame([&stream](ByteView bytes) { stream.Write(bytes); }, request);
-  auto reply = ReadFrame([&stream](std::span<std::uint8_t> bytes) { stream.Read(bytes); });
-  stream.CheckDeadline();
-  return reply;
+  return ExchangeFrames(request, deadline, stop, receiver, [&stream](const Frame& outgoing) {
+    WriteFrame([&stream](std::span<const std::byte> bytes) { stream.Write(bytes); }, outgoing);
+    return ReadFrame([&stream](std::span<std::byte> bytes) { stream.Read(bytes); });
+  });
 }
 
-} // namespace pluginkit::detail
+} // namespace huxerui::pluginkit::detail

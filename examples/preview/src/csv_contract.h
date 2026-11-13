@@ -3,12 +3,20 @@
 /// @file
 /// @brief Published contract for the CSV importer example.
 
+#include "receivers/import_progress.h"
+
+#include <huxerui/pluginkit/contract.h>
+#include <huxerui/task.h>
+
 #include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace csv_import {
+
+/// @brief Proxy for progress notifications during an import invocation.
+using ImportReceiver = huxerui::pluginkit::Receiver<ImportProgress>;
 
 /// @brief Input passed by value across the worker boundary.
 struct ImportRequest {
@@ -51,8 +59,9 @@ public:
 
   /// @brief Parses the supplied CSV.
   /// @param request CSV input for this call.
-  /// @return Parsed data on success or input diagnostics.
-  virtual ImportResult Import(const ImportRequest& request) = 0;
+  /// @param receiver Receives progress for this invocation.
+  /// @return Task producing parsed data or input diagnostics.
+  virtual huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) = 0;
 };
 
 } // namespace csv_import

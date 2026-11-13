@@ -1,6 +1,7 @@
 #include "csv_contract.bindings.h"
+#include "services/import_status.bindings.h"
 
-#include <pluginkit/plugin.h>
+#include <huxerui/pluginkit/plugin.h>
 
 namespace csv_import {
 namespace {
@@ -11,7 +12,29 @@ ImportResult Failure(std::string code, std::uint32_t row, std::uint32_t column, 
 
 class CsvImporter final : public TableImporter {
 public:
-  ImportResult Import(const ImportRequest& request) override {
+  explicit CsvImporter(const huxerui::pluginkit::PluginContext& context) : context_(context) {}
+
+  huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) override {
+    co_await huxerui::Delay(std::chrono::milliseconds(1));
+    const auto manifest = co_await context_.BundleDirectory().Child("plugin.json").ReadStringAsync();
+    if (!manifest.Succeeded()) {
+      throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::Io, "Cannot read the installed CSV plugin manifest");
+    }
+    auto result = Parse(request);
+    if (result.table) {
+      const auto rows = static_cast<std::uint32_t>(result.table->rows.size());
+      co_await receiver.OnRows({rows});
+      if (!co_await huxerui::pluginkit::GetService<ImportStatus>().SetImportedRows({rows})) {
+        throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::PluginFailed, "The host declined the imported row count");
+      }
+    }
+    co_return result;
+  }
+
+private:
+  const huxerui::pluginkit::PluginContext& context_;
+
+  static ImportResult Parse(const ImportRequest& request) {
     std::string_view source = request.source;
     if (source.starts_with("\xef\xbb\xbf")) source.remove_prefix(3);
     if (source.empty()) return Failure("csv.empty", 1, 1, "Expected a header row");
