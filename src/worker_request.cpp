@@ -1,5 +1,6 @@
 #include "worker_process.h"
 #include "run_transport.h"
+#include "stream_io.h"
 
 #include <algorithm>
 #include <limits>
@@ -16,59 +17,82 @@ struct RequestSlot {
   ~RequestSlot() { release(); }
 };
 
+template<class Result>
 struct CallbackReply {
   std::mutex mutex;
   std::condition_variable_any ready;
-  std::optional<Bytes> bytes;
+  std::optional<Result> result;
   std::exception_ptr error;
   bool abandoned = false;
   TaskHandle task;
 };
 
-Task<void> ExecuteCallback(std::shared_ptr<CallbackReply> reply, ServiceDispatch dispatch,
-                           std::uint32_t operation, Bytes request) {
-  std::optional<Bytes> bytes;
+template<class Result>
+Task<void> ExecuteCallback(std::shared_ptr<CallbackReply<Result>> reply, std::function<Task<Result>()> work) {
+  std::optional<Result> result;
   std::exception_ptr error;
   try {
     {
       CallbackScope scope(co_await CurrentTaskExecution{});
-      bytes.emplace(co_await dispatch(operation, std::move(request)));
+      result.emplace(co_await work());
     }
   } catch (...) {
     error = std::current_exception();
   }
-  dispatch = {};
+  work = {};
   std::lock_guard lock(reply->mutex);
   if (reply->abandoned) co_return;
-  reply->bytes = std::move(bytes);
+  reply->result = std::move(result);
   reply->error = std::move(error);
   reply->ready.notify_one();
 }
 
-Bytes RunHostCallback(const TaskScope& tasks, ServiceDispatch dispatch, std::uint32_t operation, Bytes request,
-                      Deadline deadline, std::stop_token stop) {
-  auto reply = std::make_shared<CallbackReply>();
-  tasks.Post([tasks, reply, dispatch = std::move(dispatch), operation, request = std::move(request), deadline, stop]() mutable {
+template<class Result>
+Result RunHostCallback(const TaskScope& tasks, std::function<Task<Result>()> work, Deadline deadline,
+                       std::stop_token stop, CallStreams* streams) {
+  auto reply = std::make_shared<CallbackReply<Result>>();
+  tasks.Post([tasks, reply, work = std::move(work), deadline, stop]() mutable {
     std::lock_guard lock(reply->mutex);
     if (reply->abandoned || stop.stop_requested() || std::chrono::steady_clock::now() >= deadline) return;
     try {
-      reply->task = tasks.Launch(ExecuteCallback(reply, std::move(dispatch), operation, std::move(request)));
+      reply->task = tasks.Launch(ExecuteCallback(reply, std::move(work)));
     } catch (...) {
       reply->error = std::current_exception();
       reply->ready.notify_one();
     }
   });
   std::unique_lock lock(reply->mutex);
-  if (!reply->ready.wait_until(lock, stop, deadline, [&] { return reply->bytes.has_value() || reply->error; })) {
+  if (!reply->ready.wait_until(lock, stop, deadline, [&] { return reply->result.has_value() || reply->error; }) ||
+      stop.stop_requested()) {
     reply->abandoned = true;
     auto task = reply->task;
     lock.unlock();
+    if (streams) streams->Revoke();
     task.Cancel();
     if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The invocation was cancelled");
     throw Error(ErrorCode::DeadlineExceeded, "The host callback exceeded the invocation deadline");
   }
   if (reply->error) std::rethrow_exception(reply->error);
-  return std::move(*reply->bytes);
+  return std::move(*reply->result);
+}
+
+Frame MakeStreamReply(const Frame& request, IoResult<Bytes> result) {
+  Frame reply{0, request.instance, request.operation, {}, FrameKind::StreamReply, request.call, request.callback};
+  reply.streams = request.streams;
+  if (result.Succeeded()) {
+    reply.payload = std::move(result).Value();
+  } else {
+    // A native diagnostic can reveal the host's source or destination path.
+    const auto text = AsBytes("The host stream operation failed");
+    reply.code = static_cast<std::uint32_t>(result.Error().code) + 1;
+    reply.payload.assign(text.begin(), text.end());
+  }
+  return reply;
+}
+
+IoResult<Bytes> AcknowledgeStream(IoResult<void> result) {
+  if (!result.Succeeded()) return IoResult<Bytes>(std::move(result).Error());
+  return IoResult<Bytes>(Bytes{});
 }
 
 } // namespace
@@ -115,8 +139,35 @@ void Worker::CheckExchange(Deadline deadline, std::stop_token stop) {
   }
 }
 
+Frame Worker::DispatchCallback(Frame frame, Deadline deadline, std::stop_token stop,
+                               const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams,
+                               StreamIo* sync_io) {
+  if (frame.kind == FrameKind::ServiceCall && sync_io) return RejectSynchronousCallback(frame);
+  // The transport has no read pending while it waits for a host callback.
+  std::stop_source callback;
+  std::stop_callback stop_exchange(stop, [&] { callback.request_stop(); });
+  std::stop_callback stop_callback(callback_stop_.get_token(), [&] { callback.request_stop(); });
+  std::stop_callback worker_exited(exited_stop_.get_token(), [&] { callback.request_stop(); });
+  const auto token = callback.get_token();
+  try {
+    CheckExchange(deadline, token);
+    auto reply = frame.kind == FrameKind::StreamCall
+        ? DispatchStream(std::move(frame), deadline, token, streams, sync_io)
+        : DispatchService(frame, deadline, token, receiver, streams.get());
+    CheckExchange(deadline, token);
+    return reply;
+  } catch (...) {
+    if (streams) streams->Revoke();
+    if (callback_stop_.stop_requested()) throw Error(ErrorCode::Closed, "The plugin generation is closing");
+    if (exited_stop_.stop_requested() && !stop.stop_requested()) {
+      throw Error(ErrorCode::WorkerExited, "The plugin worker exited during a host callback");
+    }
+    throw;
+  }
+}
+
 Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_token stop,
-                              const ReceiverRegistration* receiver) {
+                              const ReceiverRegistration* receiver, CallStreams* streams) {
   const auto request = ReadServicePayload(frame.payload);
   Frame reply{};
   try {
@@ -129,14 +180,12 @@ Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_t
     } else {
       dispatch = &RequireHostService(services_, requested).dispatch;
     }
-    std::stop_source callback;
-    std::stop_callback stop_exchange(stop, [&] { callback.request_stop(); });
-    std::stop_callback stop_callback(callback_stop_.get_token(), [&] { callback.request_stop(); });
-    reply.payload = RunHostCallback(callbacks_, *dispatch, frame.operation,
-                                    Bytes(request.request.begin(), request.request.end()), deadline, callback.get_token());
+    reply.payload = RunHostCallback<Bytes>(callbacks_,
+        [call = *dispatch, operation = frame.operation, data = Bytes(request.request.begin(), request.request.end())]() mutable {
+          return call(operation, std::move(data));
+        }, deadline, stop, streams);
   } catch (const Error& error) {
-    reply = ErrorReply(callback_stop_.stop_requested()
-        ? Error(ErrorCode::Closed, "The plugin generation is closing") : error);
+    reply = ErrorReply(error);
   } catch (...) {
     reply = ErrorReply(Error(ErrorCode::PluginFailed, "Host callback implementation failed"));
   }
@@ -148,8 +197,35 @@ Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_t
   return reply;
 }
 
+Frame Worker::DispatchStream(Frame frame, Deadline deadline, std::stop_token stop,
+                             const std::shared_ptr<CallStreams>& streams, StreamIo* sync_io) {
+  if (sync_io) {
+    return sync_io->Run([streams, request = std::move(frame)] {
+      if (request.operation == HPK_READ_STREAM) {
+        Bytes bytes(request.read_limit);
+        auto count = streams->Read(bytes);
+        if (!count.Succeeded()) return MakeStreamReply(request, IoResult<Bytes>(std::move(count).Error()));
+        bytes.resize(count.Value());
+        return MakeStreamReply(request, IoResult<Bytes>(std::move(bytes)));
+      }
+      auto result = request.operation == HPK_WRITE_STREAM ? streams->Write(request.payload) : streams->Close();
+      return MakeStreamReply(request, AcknowledgeStream(std::move(result)));
+    }, deadline, stop);
+  }
+  return RunHostCallback<Frame>(callbacks_,
+      [streams, request = std::move(frame)]() mutable -> Task<Frame> {
+        if (request.operation == HPK_READ_STREAM) {
+          co_return MakeStreamReply(request, co_await streams->ReadAsync(request.read_limit));
+        }
+        if (request.operation == HPK_WRITE_STREAM) {
+          co_return MakeStreamReply(request, AcknowledgeStream(co_await streams->WriteAsync(std::move(request.payload))));
+        }
+        co_return MakeStreamReply(request, AcknowledgeStream(co_await streams->CloseAsync()));
+      }, deadline, stop, streams.get());
+}
+
 Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver,
-                      std::stop_token stop, bool wait_for_slot) {
+                       std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams) {
   if (timeout <= std::chrono::milliseconds::zero() || timeout > std::chrono::hours(24)) {
     throw Error(ErrorCode::InvalidArgument, "Worker timeout must be between 1 ms and 24 hours");
   }
@@ -177,6 +253,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     request_active_ = false;
     request_ready_.notify_all();
   }};
+  if (streams) streams->SetDeadline(deadline);
   if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
   if (!Pid()) {
     Stop();
@@ -204,8 +281,9 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     }
     request.call = ++next_call_;
     request.receiver = receiver ? 1u : 0u;
+    request.streams = streams ? streams->Slots() : 0u;
     if (activate) request.payload = startup_.Encode();
-    reply = Exchange(request, deadline, generation_stop_.get_token(), receiver);
+    reply = Exchange(request, deadline, generation_stop_.get_token(), receiver, streams);
     CheckExchange(deadline, generation_stop_.get_token());
   } catch (const Error& error) {
     // Retire a failed exchange so a late reply cannot be read as the next request's response.
@@ -230,13 +308,14 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
   }
 
   if (reply.kind == FrameKind::Reply && reply.call == request.call && !reply.callback && !reply.operation &&
-      !reply.receiver && !reply.synchronous) {
+      !reply.receiver && !reply.synchronous && !reply.streams) {
     if (reply.code == 0) {
       const auto valid = (shutdown || activate)
           ? reply.instance == 0 && reply.payload.empty()
           : reply.instance != 0 && (request.instance == 0 || request.instance == reply.instance);
       if (valid) {
         if (activate) activated_ = true;
+        if (streams) streams->CheckOutput();
         return reply;
       }
     } else if (IsErrorCode(reply.code) && reply.instance == 0 &&

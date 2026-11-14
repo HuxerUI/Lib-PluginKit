@@ -2,8 +2,6 @@
 #include "csv_package.h"
 #include "csv_sdk.h"
 
-#include <array>
-
 namespace csv_import {
 namespace {
 
@@ -29,10 +27,6 @@ void OnDeactivate(const PluginContext& context) {
   fixture::active_context = nullptr;
 }
 
-ImportResult Failure(std::string code, std::uint32_t row, std::uint32_t column, std::string message) {
-  return {std::nullopt, {{std::move(code), row, column, std::move(message)}}};
-}
-
 template<char Separator>
 class CsvImporter final : public TableImporter {
 public:
@@ -46,74 +40,29 @@ public:
   std::string Delimiter() const override { return std::string(1, Separator); }
   std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
 
-  huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) override {
+  huxerui::Task<ImportResult> Import(huxerui::AsyncInputStream input, ImportReceiver receiver) override {
+    using huxerui::pluginkit::Error;
+    using huxerui::pluginkit::ErrorCode;
     co_await huxerui::Delay(std::chrono::milliseconds(1));
-    auto result = Parse(request, fixture::ReadCellLimit(*cell_limit));
-    if (result.table) {
-      const auto rows = static_cast<std::uint32_t>(result.table->rows.size());
-      if (receiver) co_await receiver->OnRows({rows});
-      if (!co_await SetImportedRows(rows)) {
-        throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::PluginFailed, "The host declined the imported row count");
-      }
-    }
-    co_return result;
-  }
-
-private:
-  static ImportResult Parse(const ImportRequest& request, std::uint32_t limit) {
-    std::string_view source = request.source;
-    if (source.starts_with("\xef\xbb\xbf")) source.remove_prefix(3);
-    if (source.empty()) return Failure("csv.empty", 1, 1, "Expected a header row");
-    constexpr std::array delimiters{Separator, '\r', '\n', '"'};
-
+    fixture::CsvRecords parser(Separator, fixture::ReadCellLimit(*cell_limit));
     Table table;
-    std::size_t cursor = 0;
-    std::size_t cells = 0;
-    for (std::uint32_t row_number = 1; cursor < source.size(); ++row_number) {
-      std::vector<std::string> row;
-      for (std::uint32_t column = 1;; ++column) {
-        if (++cells > limit) return Failure("csv.cell_limit", row_number, column, "Too many cells");
-        std::string value;
-        if (cursor < source.size() && source[cursor] == '"') {
-          ++cursor;
-          for (;;) {
-            const auto quote = source.find('"', cursor);
-            if (quote == source.npos) return Failure("csv.unclosed_quote", row_number, column, "Expected a closing quote");
-            value.append(source.substr(cursor, quote - cursor));
-            cursor = quote + 1;
-            if (cursor == source.size() || source[cursor] != '"') break;
-            value.push_back('"');
-            ++cursor;
-          }
-          if (cursor < source.size() && source[cursor] != Separator && source[cursor] != '\r' && source[cursor] != '\n') {
-            return Failure("csv.after_quote", row_number, column, "Expected a separator or line break after the closing quote");
-          }
-        } else {
-          const auto end = source.find_first_of(std::string_view(delimiters.data(), delimiters.size()), cursor);
-          if (end != source.npos && source[end] == '"') {
-            return Failure("csv.unexpected_quote", row_number, column, "A quote must start a field");
-          }
-          value = source.substr(cursor, end == source.npos ? source.size() - cursor : end - cursor);
-          cursor = end == source.npos ? source.size() : end;
-        }
-        row.push_back(std::move(value));
-        if (cursor == source.size() || source[cursor] != Separator) break;
-        ++cursor;
-      }
-
-      if (row_number == 1) {
-        table.header = std::move(row);
-      } else {
-        if (row.size() != table.header.size()) {
-          return Failure("csv.column_count", row_number, 1, "The row width differs from the header");
-        }
-        table.rows.push_back(std::move(row));
-      }
-      if (cursor == source.size()) break;
-      const char newline = source[cursor++];
-      if (newline == '\r' && cursor < source.size() && source[cursor] == '\n') ++cursor;
+    const auto append = [&table](fixture::Row row, bool header) {
+      if (header) table.header = std::move(row);
+      else table.rows.push_back(std::move(row));
+    };
+    auto remaining = MaxImportBytes;
+    for (;;) {
+      const auto bytes = co_await fixture::ReadImportChunk(input, remaining);
+      if (bytes.empty()) break;
+      if (!parser.Feed(bytes, append)) co_return ImportResult{std::nullopt, {parser.Error()}};
     }
-    return {std::move(table), {}};
+    if (!parser.Finish(append)) co_return ImportResult{std::nullopt, {parser.Error()}};
+    const auto rows = parser.Rows();
+    if (receiver) co_await receiver->OnRows({rows});
+    if (!co_await SetImportedRows(rows)) {
+      throw Error(ErrorCode::PluginFailed, "The host declined the imported row count");
+    }
+    co_return ImportResult{std::move(table), {}};
   }
 };
 

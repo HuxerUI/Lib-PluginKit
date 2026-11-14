@@ -72,10 +72,17 @@ public:
   }
   std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
 
-  huxerui::Task<csv_import::ImportResult> Import(csv_import::ImportRequest request,
+  huxerui::Task<csv_import::ImportResult> Import(huxerui::AsyncInputStream input,
                                                   csv_import::ImportReceiver receiver) override {
-    if (request.source == "exit") std::_Exit(5);
-    if (request.source == "context") {
+    std::string source;
+    auto remaining = csv_import::MaxImportBytes;
+    for (;;) {
+      const auto bytes = co_await csv_import::fixture::ReadImportChunk(input, remaining);
+      if (bytes.empty()) break;
+      source.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+    if (source == "exit") std::_Exit(5);
+    if (source == "context") {
       const auto& info = context_.Info();
       co_return csv_import::ImportResult{csv_import::Table{
           {"id", "version", "digest", "bundle", "data", "created", "live", "cell_limit"},
@@ -83,17 +90,17 @@ public:
             std::to_string(created_instances), std::to_string(live_instances),
             std::to_string(csv_import::fixture::ReadCellLimit(*cell_limit))}}}, {}};
     }
-    if (request.source == "status") {
+    if (source == "status") {
       co_await SetRows(40);
       co_await SetRows(41);
     }
-    if (request.source == "reenter") co_await SetRows(UINT32_MAX);
-    if (request.source == "background") {
+    if (source == "reenter") co_await SetRows(UINT32_MAX);
+    if (source == "background") {
       std::async(std::launch::async, [] {
         return huxerui::pluginkit::GetService<csv_import::ImportStatus>()->ImportedRows();
       }).get();
     }
-    if (request.source == "other-task") {
+    if (source == "other-task") {
       co_await huxerui::AwaitCallback<void>([](auto completion) {
         (void)huxerui::UseApplicationTaskScope().Launch([completion]() -> huxerui::Task<void> {
           try {
@@ -106,13 +113,13 @@ public:
         return std::function<void()>{};
       });
     }
-    if (request.source == "remember") {
+    if (source == "remember") {
       saved_ = receiver;
       if (receiver) co_await receiver->OnRows({1});
     }
-    if (request.source == "stale" && saved_) co_await saved_->OnRows({2});
-    if (request.source == "status-wait") co_await SetRows(42);
-    if (request.source == "background-stop") {
+    if (source == "stale" && saved_) co_await saved_->OnRows({2});
+    if (source == "status-wait") co_await SetRows(42);
+    if (source == "background-stop") {
       co_await huxerui::pluginkit::RunInvocationWorker([this](std::stop_token stop) {
         Record(context_, "background-start");
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -123,15 +130,15 @@ public:
         Record(context_, stop.stop_requested() ? "background-stopped" : "background-ended");
       });
     }
-    if (request.source == "wait" || request.source == "status-wait") {
+    if (source == "wait" || source == "status-wait") {
 #if !defined(_WIN32)
       if (const auto* marker = std::getenv("HPK_CSV_WAIT_MARKER")) std::ofstream(marker).put('\n');
 #endif
       co_await huxerui::Delay(std::chrono::minutes(1));
       std::_Exit(6);
     }
-    if (request.source == "throw") throw std::runtime_error("Failure fixture");
-    co_return csv_import::ImportResult{csv_import::Table{{"value"}, {{request.source}}}, {}};
+    if (source == "throw") throw std::runtime_error("Failure fixture");
+    co_return csv_import::ImportResult{csv_import::Table{{"value"}, {{source}}}, {}};
   }
 
 private:
@@ -145,10 +152,40 @@ private:
   csv_import::ImportReceiver saved_;
 };
 
+class FaultExporter final : public csv_import::fixture::CsvExporter {
+public:
+  using CsvExporter::CsvExporter;
+
+  huxerui::Task<csv_import::CsvSummary> ConvertAsync(csv_import::ConversionOptions, huxerui::AsyncInputStream input,
+      huxerui::AsyncOutputStream output, huxerui::pluginkit::Receiver<csv_import::ImportProgress> progress) override {
+    using csv_import::fixture::RequireIo;
+    if (active_context->DataDirectory().Child("check-stale-stream").Exists()) {
+      if (saved_) {
+        (void)RequireIo(co_await saved_->ReadAsync(1));
+        throw std::runtime_error("A previous invocation's input accepted a read");
+      }
+      // A retained stream should become stale even when its cursor has not reached EOF.
+      saved_.emplace(std::move(input));
+    } else {
+      auto bytes = RequireIo(co_await input.ReadAsync(csv_import::fixture::CsvChunkSize));
+      if (!bytes.empty()) RequireIo(co_await output.WriteAsync(std::move(bytes)));
+    }
+    const auto data = active_context->DataDirectory();
+    if (data.Child("omit-output-close").Exists()) co_return csv_import::CsvSummary{};
+    RequireIo(co_await output.CloseAsync());
+    if (data.Child("fail-after-output-close").Exists()) throw std::runtime_error("Failure after output close");
+    if (progress) co_await progress->OnRows({0});
+    co_return csv_import::CsvSummary{};
+  }
+
+private:
+  std::optional<huxerui::AsyncInputStream> saved_;
+};
+
 } // namespace
 
 using huxerui::pluginkit::BindExtension;
 
 HPK_EXPORT_PLUGIN(OnActivate, OnDeactivate,
     BindExtension<csv_import::TableImporter, FaultImporter>(csv_import::Importers),
-    BindExtension<csv_import::TableExporter, csv_import::fixture::CsvExporter>(csv_import::Exporters))
+    BindExtension<csv_import::TableExporter, FaultExporter>(csv_import::Exporters))

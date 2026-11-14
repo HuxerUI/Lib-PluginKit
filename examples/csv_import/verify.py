@@ -1,4 +1,5 @@
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -257,6 +258,94 @@ def verify_mixed(host, package, worker_csv, faults, scratch, sample, valid):
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     wrong_digest = run(host, denied_profile, "inspect", wrong_abi)["digest"]
     check_error(run(host, denied_profile, "install", wrong_abi, wrong_digest, "in_process"), "contract_mismatch")
+
+
+def verify_streams(host, package, worker_csv, faults, scratch):
+    source = scratch / "large streamed file.ssv"
+    limit = 512 * 1024
+    # Split CRLF, a doubled quote, and a UTF-8 character across distinct read boundaries.
+    first = b"x" * (3 * limit - len(b"a;b\r\n") - len(b";1\r")) + b";1\r\n"
+    second = b'"' + b"y" * (limit - len(b"\n") - len(b'""')) + b'""z";2\r\n'
+    offset = (len(b"a;b\r\n") + len(first) + len(second)) % limit
+    third = b"z" * (limit - offset - 1) + '上海;3\r\n'.encode("utf-8")
+    row = b'"a ""quoted""; value";' + b"k" * 2048 + b"\r\n"
+    count = 6000
+    source.write_bytes(b"a;b\r\n" + first + second + third + row * count)
+    reference = scratch / "reference output.csv"
+    previous_limit = csv.field_size_limit(4 * limit)
+    try:
+        with source.open(encoding="utf-8", newline="") as text, reference.open("w", encoding="utf-8", newline="") as output:
+            csv.writer(output, quoting=csv.QUOTE_ALL).writerows(csv.reader(text, delimiter=";"))
+    finally:
+        csv.field_size_limit(previous_limit)
+    expected = reference.read_bytes()
+    assert min(source.stat().st_size, len(expected)) > 8 * 1024 * 1024
+
+    import_limit = 32 * 1024 * 1024
+    at_limit = scratch / "at the import limit.csv"
+    with at_limit.open("wb") as bounded:
+        bounded.write(b"column\n")
+        bounded.seek(import_limit - 1)
+        bounded.write(b",")
+    over_limit = scratch / "over the import limit.csv"
+    with over_limit.open("wb") as oversized:
+        oversized.truncate(import_limit + 1)
+
+    for csv_package, mode in ((package, "in_process"), (worker_csv, "worker_process")):
+        profile = scratch / f"streams {mode}"
+        info = run(host, profile, "inspect", csv_package)
+        fault = run(host, profile, "inspect", faults)
+        plugin_id = info["id"]
+        assert run(host, profile, "install", csv_package, info["digest"], mode, "status")["ok"]
+        assert run(host, profile, "install", faults, fault["digest"], mode)["ok"]
+        check_error(run(host, profile, "import", over_limit, plugin_id), "payload_too_large")
+        imported = run(host, profile, "import", at_limit, plugin_id, "15000")
+        assert imported["ok"] and imported["issues"][0]["code"] == "csv.column_count", imported
+        for kind in ("sync", "async"):
+            destination = scratch / f"{mode} {kind}.csv"
+            destination.write_bytes(b"previous contents")
+            pid, result = run(host, profile, commands=[
+                ("pid",), ("convert", kind, source, destination, plugin_id),
+            ])
+            assert result["ok"] and result["rows"] == count + 3, result
+            assert result["input_bytes"] == source.stat().st_size and result["output_bytes"] == len(expected), result
+            assert (result["plugin_pid"] == pid["pid"]) == (mode == "in_process"), result
+            assert destination.read_bytes() == expected, (mode, kind)
+            if kind == "async":
+                assert result["progress_before_eof"] and result["progress_rows"] == count + 3, result
+            if mode == "in_process":
+                result = run(host, profile, "check-local-stream-reentry", plugin_id, kind)
+                assert result == {"ok": True, "read": True, "write": True, "close": True}, result
+
+        if mode == "worker_process":
+            for callback in ("read", "receiver"):
+                result = run(host, profile, "check-worker-exit-during-callback", plugin_id, callback)
+                assert result == {"ok": True, "callback_cancelled": True, "grants_released": True}, result
+
+        destination = scratch / f"retained {mode}.csv"
+        destination.write_bytes(b"retained")
+        for operation in ("write", "close"):
+            result = run(host, profile, "check-output-failure", "async", source, destination, plugin_id, operation)
+            check_error(result, "io")
+            assert destination.read_bytes() == b"retained"
+        data = installed_data(profile, fault["id"])
+        data.mkdir(parents=True, exist_ok=True)
+        for flag, error in (("omit-output-close", "io"), ("fail-after-output-close", "plugin_failed")):
+            (data / flag).touch()
+            check_error(run(host, profile, "convert", "async", source, destination, fault["id"]), error)
+            (data / flag).unlink()
+            assert destination.read_bytes() == b"retained"
+        (data / "check-stale-stream").touch()
+        assert run(host, profile, "check-stale-stream", fault["id"]) == {"ok": True, "old_source_reads": 0}
+        for operation in ("read", "write"):
+            for interruption in ("cancel", "deadline"):
+                result = run(host, profile, "check-stream-interruption", plugin_id, operation, interruption)
+                assert result == {"ok": True, "cancelled": True, "stop_requested": True,
+                                  "deadline": interruption == "deadline"}, result
+            if mode == "worker_process":
+                result = run(host, profile, "check-sync-stream-deadline", plugin_id, operation)
+                assert result == {"ok": True, "deadline_while_io_pending": True}, result
+        assert not list(scratch.glob(".csv-export-*"))
 
 
 def verify_factory_table(host, package, scratch, valid):
@@ -841,6 +930,7 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
     assert repaired["ok"] and repaired["table"] == expected
 
     verify_mixed(host, package, worker_csv, faults, scratch, sample, valid)
+    verify_streams(host, package, worker_csv, faults, scratch)
     verify_factory_table(host, package, scratch, valid)
     verify_reopened_profile(host, package, worker_csv, scratch, sample)
     verify_package_resources(host, package, scratch, sample, module_name)

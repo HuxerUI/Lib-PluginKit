@@ -29,6 +29,9 @@
 /// @brief Maximum size in bytes of an encoded request or response.
 #define HPK_MAX_PAYLOAD (8u * 1024u * 1024u)
 
+/// @brief Maximum size of a data chunk in an invocation stream exchange.
+#define HPK_MAX_STREAM_CHUNK (1024u * 1024u)
+
 /// @brief Maximum number of factories published by one plugin library.
 #define HPK_MAX_EXTENSIONS 256u
 
@@ -67,6 +70,21 @@ enum hpk_status_v1 {
   HPK_CALLBACK_UNAVAILABLE = 10,
   /// The plugin has active work that prevents the requested operation.
   HPK_BUSY = 11,
+  /// An input or output operation failed.
+  HPK_IO = 12,
+};
+
+/// @brief Stream slots supplied by the caller for one invocation.
+enum hpk_stream_slot_v1 {
+  HPK_INPUT_STREAM = 1,
+  HPK_OUTPUT_STREAM = 2,
+};
+
+/// @brief Operations on the sequential stream slots.
+enum hpk_stream_operation_v1 {
+  HPK_READ_STREAM = 1,
+  HPK_WRITE_STREAM = 2,
+  HPK_CLOSE_STREAM = 3,
 };
 
 /// @brief Borrowed response bytes owned by the side delivering the completion.
@@ -100,6 +118,18 @@ typedef struct hpk_host_v1 {
   uint32_t (HPK_CALL *call)(uint64_t invocation, uint32_t receiver, const char* service_id, uint32_t version,
                            const char* fingerprint, uint32_t operation, const uint8_t* data,
                            uint32_t size, hpk_complete_v1 complete, void* user);
+  /// @brief Queues a stream operation on the worker's transport thread.
+  /// @param invocation ID of the call that received the streams.
+  /// @param slot Input or output slot supplied for that call.
+  /// @param operation Read, write, or close.
+  /// @param maximum_bytes Maximum read length, or zero for write and close.
+  /// @param payload Write chunk copied before this function returns. Empty for read and close.
+  /// @param complete Reports success with raw read bytes or an empty acknowledgement. On I/O failure the status
+  /// is one plus the SDK IoErrorCode and the buffer holds a UTF-8 diagnostic.
+  /// @param user Completion state transferred on successful admission.
+  /// @return Zero on admission or a PluginKit ErrorCode.
+  uint32_t (HPK_CALL *stream)(uint64_t invocation, uint32_t slot, uint32_t operation, uint32_t maximum_bytes,
+                             hpk_buffer_v1 payload, hpk_complete_v1 complete, void* user);
 } hpk_host_v1;
 
 /// @brief Host-verified plugin identity and directories borrowed for the activation callback.
@@ -144,6 +174,7 @@ typedef struct hpk_extension_v1 {
   /// @param host Borrowed worker callbacks for this invocation.
   /// @param invocation Worker-assigned ID that identifies this call.
   /// @param receiver Slot for the caller's receiver, or zero when there is none.
+  /// @param streams Bit mask of the input and output slots supplied by the caller.
   /// @param operation Operation number from the generated contract.
   /// @param data Encoded request bytes borrowed until this function returns.
   /// @param size Length of the request in bytes.
@@ -151,7 +182,7 @@ typedef struct hpk_extension_v1 {
   /// @param user Completion state borrowed from the worker until completion.
   /// @return HPK_OK on admission or an error from hpk_status_v1. A rejected call has no completion callback.
   int32_t (HPK_CALL *invoke)(void* instance, const hpk_host_v1* host, uint64_t invocation,
-                            uint32_t receiver, uint32_t operation, const uint8_t* data, uint32_t size,
+                            uint32_t receiver, uint32_t streams, uint32_t operation, const uint8_t* data, uint32_t size,
                             hpk_complete_v1 complete, void* user);
 
   /// @brief Destroys an instance allocated by this factory.

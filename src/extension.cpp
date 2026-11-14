@@ -22,6 +22,12 @@ namespace {
 Error Closed() { return Error(ErrorCode::Closed, "The extension instance is closed"); }
 Error Expired() { return Error(ErrorCode::DeadlineExceeded, "The plugin call exceeded its deadline"); }
 
+std::shared_ptr<CallStreams> RequireStream(const std::weak_ptr<CallStreams>& weak) {
+  auto stream = weak.lock();
+  if (!stream) throw Error(ErrorCode::Closed, "The stream is outside its owning invocation");
+  return stream;
+}
+
 void CheckDeadline(Deadline deadline) {
   if (std::chrono::steady_clock::now() >= deadline) throw Expired();
 }
@@ -56,15 +62,17 @@ public:
     RetireWhenIdle();
   }
 
-  Bytes CallWorker(std::uint32_t operation, Bytes request) override {
-    return Invoke(operation, std::move(request), nullptr, true, {});
+  Bytes CallWorker(std::uint32_t operation, Bytes request, std::shared_ptr<CallStreams> streams) override {
+    return Invoke(operation, std::move(request), nullptr, true, {}, std::move(streams));
   }
 
-  Task<Bytes> CallWorker(std::uint32_t operation, Bytes request, std::optional<ReceiverRegistration> receiver) override {
+  Task<Bytes> CallWorker(std::uint32_t operation, Bytes request, std::optional<ReceiverRegistration> receiver,
+                         std::shared_ptr<CallStreams> streams) override {
     RejectServiceReentry(co_await CurrentTaskExecution{});
-    auto work = [self = shared_from_this(), operation, request = std::move(request), receiver = std::move(receiver)]
+    auto work = [self = shared_from_this(), operation, request = std::move(request), receiver = std::move(receiver),
+                 streams = std::move(streams)]
         (std::stop_token stop) mutable {
-      return self->Invoke(operation, std::move(request), receiver ? &*receiver : nullptr, false, stop);
+      return self->Invoke(operation, std::move(request), receiver ? &*receiver : nullptr, false, stop, std::move(streams));
     };
     co_return co_await RunTransport(std::move(work));
   }
@@ -147,7 +155,8 @@ private:
   }
 
   Bytes Invoke(std::uint32_t operation, Bytes request, const ReceiverRegistration* receiver, bool synchronous,
-               std::stop_token stop) {
+               std::stop_token stop, std::shared_ptr<CallStreams> streams) {
+    const RevokeStreams revoke{streams};
     Check();
     if (request.size() > MaxPayload) throw Error(ErrorCode::PayloadTooLarge, "Request exceeds the byte limit");
     {
@@ -171,7 +180,7 @@ private:
     Frame frame{static_cast<std::uint32_t>(Command::Invoke), instance.id, operation, std::move(request)};
     frame.synchronous = synchronous;
     return instance.worker->Request(std::move(frame), Remaining(deadline), receiver, stop,
-                                    !synchronous).payload;
+                                    !synchronous, streams).payload;
   }
 
   const std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start_;
@@ -267,7 +276,9 @@ public:
     return object;
   }
 
-  void CallSync(LocalInstance& instance, const std::function<void(void*)>& work, Deadline deadline) {
+  void CallSync(LocalInstance& instance, const std::function<void(void*)>& work, Deadline deadline,
+                std::shared_ptr<CallStreams> streams) {
+    const RevokeStreams revoke{std::move(streams)};
     RejectServiceReentry();
     Check(instance);
     if (active_ || synchronous_) throw Error(ErrorCode::Busy, "The in-process plugin has an active call");
@@ -286,7 +297,9 @@ public:
       const void* previous;
       ~Restore() { binding.set_invocation(previous); }
     } restore{*binding_, previous};
+    if (revoke.streams) revoke.streams->SetDeadline(deadline);
     try {
+      const SynchronousStreamScope scope(revoke.streams.get());
       work(object);
     } catch (const Error&) {
       throw;
@@ -294,6 +307,7 @@ public:
       throw Error(ErrorCode::PluginFailed, "The plugin implementation failed");
     }
     CheckDeadline(deadline);
+    if (revoke.streams) revoke.streams->CheckOutput();
   }
 
   void Schedule(const std::shared_ptr<LocalCall>& call) {
@@ -315,6 +329,7 @@ public:
   void Interrupt(const std::shared_ptr<LocalCall>& call, ErrorCode code) {
     if (call->interruption) return;
     call->interruption = code;
+    if (call->streams) call->streams->Revoke();
     call->receiver.reset();
     call->timer.Cancel();
     call->stop.request_stop();
@@ -404,6 +419,7 @@ private:
             binding.attach_invocation(&invocation), binding.detach_invocation);
         co_await call->work(object, call);
         CheckDeadline(call->deadline);
+        if (call->streams) call->streams->CheckOutput();
       }
     } catch (const Error&) {
       error = std::current_exception();
@@ -427,6 +443,7 @@ private:
 
   void FinishCall(const std::shared_ptr<LocalCall>& call, std::exception_ptr error) {
     call->timer.Cancel();
+    if (call->streams) call->streams->Revoke();
     call->receiver.reset();
     call->work = {};
     if (!call->interruption) {
@@ -504,18 +521,21 @@ public:
   void Release() noexcept override { plugin_->Release(instance_); }
   void* BorrowLocal() override { return plugin_->Borrow(instance_); }
 
-  void CallLocal(const std::function<void(void*)>& work) override {
-    plugin_->CallSync(*instance_, work, std::chrono::steady_clock::now() + timeout_);
+  void CallLocal(const std::function<void(void*)>& work, std::shared_ptr<CallStreams> streams) override {
+    plugin_->CallSync(*instance_, work, std::chrono::steady_clock::now() + timeout_, std::move(streams));
   }
 
-  Task<void> CallLocal(LocalWork work, std::shared_ptr<void> receiver) override {
+  Task<void> CallLocal(LocalWork work, std::shared_ptr<void> receiver, std::shared_ptr<CallStreams> streams) override {
     RejectServiceReentry(co_await CurrentTaskExecution{});
     const auto deadline = std::chrono::steady_clock::now() + timeout_;
-    auto start = [plugin = plugin_, instance = instance_, work = std::move(work), receiver = std::move(receiver), deadline]
+    auto start = [plugin = plugin_, instance = instance_, work = std::move(work), receiver = std::move(receiver),
+                  streams = std::move(streams), deadline]
         (CallbackCompletion<void> complete) mutable {
       auto call = plugin->NewInvocation<LocalCall>(std::move(complete));
       call->instance = std::move(instance);
       call->receiver = std::move(receiver);
+      call->streams = std::move(streams);
+      if (call->streams) call->streams->SetDeadline(deadline);
       call->work = std::move(work);
       call->deadline = deadline;
       plugin->Schedule(call);
@@ -554,19 +574,79 @@ std::shared_ptr<ExtensionTarget> MakeWorkerExtension(
   return std::make_shared<WorkerExtension>(std::move(start), timeout, admission, std::move(factory));
 }
 
+// Host stream operations participate in the same reentry guard as service and receiver callbacks.
+InputStream LocalInput(const std::shared_ptr<CallStreams>& streams) {
+  return InputStream::FromReader([weak = std::weak_ptr(streams)](std::span<std::byte> buffer) {
+    const auto owner = RequireStream(weak);
+    CheckSynchronousStream(owner.get());
+    const CallbackScope callback(TaskExecution{});
+    return owner->Read(buffer);
+  });
+}
+
+OutputStream LocalOutput(const std::shared_ptr<CallStreams>& streams) {
+  const auto owner = [weak = std::weak_ptr(streams)] {
+    auto stream = RequireStream(weak);
+    CheckSynchronousStream(stream.get());
+    return stream;
+  };
+  return OutputStream::FromWriter(
+      [owner](std::span<const std::byte> bytes) {
+        const auto stream = owner();
+        const CallbackScope callback(TaskExecution{});
+        return stream->Write(bytes);
+      },
+      [owner] {
+        const auto stream = owner();
+        const CallbackScope callback(TaskExecution{});
+        return stream->Close();
+      });
+}
+
+AsyncInputStream LocalInput(const std::shared_ptr<CallStreams>& streams, TaskExecution execution) {
+  return AsyncInputStream::FromReader(
+      [weak = std::weak_ptr(streams), execution](std::stop_token stop, std::size_t count) -> Task<IoResult<Bytes>> {
+        const auto current = co_await CurrentTaskExecution{};
+        CheckAsyncStream(execution, current, stop);
+        const auto owner = RequireStream(weak);
+        const CallbackScope callback(current);
+        co_return co_await owner->ReadAsync(count);
+      });
+}
+
+AsyncOutputStream LocalOutput(const std::shared_ptr<CallStreams>& streams, TaskExecution execution) {
+  const auto weak = std::weak_ptr(streams);
+  return AsyncOutputStream::FromWriter(
+      [weak, execution](std::stop_token stop, Bytes bytes) -> Task<IoResult<void>> {
+        const auto current = co_await CurrentTaskExecution{};
+        CheckAsyncStream(execution, current, stop);
+        const auto owner = RequireStream(weak);
+        const CallbackScope callback(current);
+        co_return co_await owner->WriteAsync(std::move(bytes));
+      },
+      [weak, execution](std::stop_token stop) -> Task<IoResult<void>> {
+        const auto current = co_await CurrentTaskExecution{};
+        CheckAsyncStream(execution, current, stop);
+        const auto owner = RequireStream(weak);
+        const CallbackScope callback(current);
+        co_return co_await owner->CloseAsync();
+      });
+}
+
 void* ExtensionTarget::BorrowLocal() { throw Error(ErrorCode::UnsupportedMode, "The extension is not in process"); }
-void ExtensionTarget::CallLocal(const std::function<void(void*)>&) {
+void ExtensionTarget::CallLocal(const std::function<void(void*)>&, std::shared_ptr<CallStreams>) {
   throw Error(ErrorCode::UnsupportedMode, "The extension is not in process");
 }
-Task<void> ExtensionTarget::CallLocal(LocalWork, std::shared_ptr<void>) {
+Task<void> ExtensionTarget::CallLocal(LocalWork, std::shared_ptr<void>, std::shared_ptr<CallStreams>) {
   throw Error(ErrorCode::UnsupportedMode, "The extension is not in process");
   co_return;
 }
-Bytes ExtensionTarget::CallWorker(std::uint32_t, Bytes) {
+Bytes ExtensionTarget::CallWorker(std::uint32_t, Bytes, std::shared_ptr<CallStreams>) {
   throw Error(ErrorCode::UnsupportedMode, "The extension has no worker");
 }
-Task<Bytes> ExtensionTarget::CallWorker(std::uint32_t operation, Bytes request, std::optional<ReceiverRegistration>) {
-  co_return CallWorker(operation, std::move(request));
+Task<Bytes> ExtensionTarget::CallWorker(std::uint32_t operation, Bytes request, std::optional<ReceiverRegistration>,
+                                        std::shared_ptr<CallStreams> streams) {
+  co_return CallWorker(operation, std::move(request), std::move(streams));
 }
 
 } // namespace huxerui::pluginkit::detail

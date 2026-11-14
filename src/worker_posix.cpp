@@ -1,4 +1,5 @@
 #include "worker_process.h"
+#include "stream_io.h"
 
 #include "posix_socket.h"
 
@@ -62,14 +63,17 @@ void Worker::Reap(pid_t child) noexcept {
     while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
   }
   pid_ = 0;
+  exited_stop_.request_stop();
   exited_.notify_all();
   ::shutdown(socket_.get(), SHUT_RDWR);
 }
 
 Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
-                       const ReceiverRegistration* receiver) {
+                        const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams) {
   const SocketStream stream(socket_.get(), deadline);
-  return ExchangeFrames(request, deadline, stop, receiver, [&stream](const Frame& outgoing) {
+  StreamIo stream_io;
+  return ExchangeFrames(request, deadline, stop, receiver, streams, request.synchronous ? &stream_io : nullptr,
+                        [&stream](const Frame& outgoing) {
     WriteFrame([&stream](std::span<const std::byte> bytes) { stream.Write(bytes); }, outgoing);
     return ReadFrame([&stream](std::span<std::byte> bytes) { stream.Read(bytes); });
   });

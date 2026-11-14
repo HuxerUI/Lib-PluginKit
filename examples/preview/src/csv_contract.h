@@ -6,8 +6,10 @@
 #include "receivers/import_progress.h"
 
 #include <huxerui/pluginkit/contract.h>
+#include <huxerui/stream.h>
 #include <huxerui/task.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -15,14 +17,11 @@
 
 namespace csv_import {
 
+/// @brief Maximum input size for an import that materializes a table.
+inline constexpr std::size_t MaxImportBytes = 32 * 1024 * 1024;
+
 /// @brief Optional progress callback scoped to one import invocation.
 using ImportReceiver = huxerui::pluginkit::Receiver<ImportProgress>;
-
-/// @brief Input owned by the import Task in either execution mode.
-struct ImportRequest {
-  /// UTF-8 CSV contents supplied by the host.
-  std::string source;
-};
 
 /// @brief Parsed CSV data with a header and ordered records.
 struct Table {
@@ -66,11 +65,11 @@ public:
   virtual std::uint32_t ProcessId() const = 0;
 
   /// @brief Parses the supplied CSV.
-  /// @param request UTF-8 CSV input, moved or copied into the Task.
+  /// @param input Sequential UTF-8 CSV source owned by the Task, up to MaxImportBytes.
   /// @param receiver Optional host object that receives progress before the import returns.
   /// @return Lazy Task yielding a parsed table or input diagnostics.
   /// @throws huxerui::pluginkit::Error If activation or execution fails, including failure to update the host status.
-  virtual huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) = 0;
+  virtual huxerui::Task<ImportResult> Import(huxerui::AsyncInputStream input, ImportReceiver receiver) = 0;
 };
 
 /// @brief Extension point for importers that produce a table from delimited text.

@@ -66,6 +66,7 @@ foreach (header IN ITEMS
         huxerui/pluginkit/detail/abi.h
         huxerui/pluginkit/detail/invocation.h
         huxerui/pluginkit/detail/extension.h
+        huxerui/pluginkit/detail/streams.h
         huxerui/pluginkit/detail/wire.h)
     list(APPEND sdk_inputs "${kit_root}/include/${header}")
     list(APPEND sdk_outputs "${sdk_dir}/${header}")

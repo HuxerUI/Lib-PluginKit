@@ -9,16 +9,22 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <array>
+#include <atomic>
 #include <charconv>
+#include <condition_variable>
+#include <cstring>
+#include <random>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <type_traits>
 #if defined(_WIN32)
 #include <process.h>
+#include <windows.h>
 #else
+#include <csignal>
 #include <unistd.h>
 #endif
 
@@ -27,6 +33,9 @@ namespace {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
 using huxerui::File;
+using huxerui::AsyncInputStream;
+using huxerui::AsyncOutputStream;
+using huxerui::IoResult;
 using huxerui::AwaitCallback;
 using huxerui::Delay;
 using huxerui::Task;
@@ -45,7 +54,7 @@ constexpr char CommandHelp[] =
     "inspect <package>, install <package> <digest> <in_process|worker_process> [status], list, "
     "upgrade <package> <installed-digest> <approved-digest> [status], uninstall <id> <digest> [delete-data], "
     "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], "
-    "round-trip <csv-file> <ssv-file> <plugin-id>, quit";
+    "round-trip <csv-file> <ssv-file> <plugin-id>, convert <sync|async> <ssv-file> <csv-file> <plugin-id> [chunk-kib], quit";
 
 void RegisterPoints(PluginManager& manager) {
   manager.RegisterExtensionPoint(Importers);
@@ -134,12 +143,13 @@ Task<void> WaitFor(Predicate ready) {
   }
 }
 
-struct ImportOutcome {
+struct CallOutcome {
   bool done = false;
   std::exception_ptr error;
 };
 
-Task<void> ObserveImport(Task<csv_import::ImportResult> call, std::shared_ptr<ImportOutcome> outcome) {
+template<class T>
+Task<void> ObserveCall(Task<T> call, std::shared_ptr<CallOutcome> outcome) {
   try {
     (void)co_await std::move(call);
   } catch (...) {
@@ -153,22 +163,91 @@ std::string Utf8(const fs::path& path) {
   return {text.begin(), text.end()};
 }
 
-std::string ReadCsv(const File& path) {
-  auto opened = path.OpenRead();
-  if (!opened.Succeeded()) throw Error(ErrorCode::Io, "Cannot open the CSV file");
-  auto input = std::move(opened).Value();
-  std::string contents;
-  std::array<std::byte, 8192> buffer{};
-  for (;;) {
-    const auto read = input.Read(buffer);
-    if (!read.Succeeded()) throw Error(ErrorCode::Io, "Cannot read the CSV file");
-    const auto count = read.Value();
-    if (!count) break;
-    constexpr std::size_t max_csv = 32 * 1024 * 1024;
-    if (count > max_csv - contents.size()) throw Error(ErrorCode::PayloadTooLarge, "CSV input exceeds the example limit");
-    contents.append(reinterpret_cast<const char*>(buffer.data()), count);
+template<class T>
+T RequireIo(huxerui::IoResult<T> result) {
+  if (!result.Succeeded()) throw Error(ErrorCode::Io, result.Error().message);
+  return std::move(result).Value();
+}
+
+huxerui::AsyncInputStream StringInput(std::string text) {
+  return huxerui::AsyncInputStream::FromReader(
+      [text = std::move(text), offset = std::size_t{}](std::stop_token, std::size_t count) mutable
+          -> Task<huxerui::IoResult<huxerui::Bytes>> {
+        const auto chunk = std::string_view(text).substr(offset, count);
+        offset += chunk.size();
+        huxerui::Bytes bytes(chunk.size());
+        if (!chunk.empty()) std::memcpy(bytes.data(), chunk.data(), chunk.size());
+        co_return huxerui::IoResult<huxerui::Bytes>(std::move(bytes));
+      });
+}
+
+class ConversionProgress final : public csv_import::ImportProgress {
+public:
+  Task<void> OnRows(csv_import::ImportedRows update) override {
+    rows = update.rows;
+    before_eof = before_eof || !eof;
+    co_return;
   }
-  return contents;
+
+  std::uint32_t rows = 0;
+  bool before_eof = false;
+  bool eof = false;
+};
+
+// Keep the staging directory alive through the last SDK or PluginKit I/O lease.
+struct StagedOutput {
+  File directory;
+  File file;
+
+  explicit StagedOutput(File dir) : directory(std::move(dir)), file(directory.Child("output.csv")) {}
+  ~StagedOutput() {
+    (void)file.Delete();
+    (void)directory.Delete();
+  }
+};
+
+std::shared_ptr<StagedOutput> StageOutput(const File& destination) {
+  std::random_device random;
+  const auto parent = destination.Parent().value_or(File("."));
+  for (unsigned attempt = 0; attempt < 8; ++attempt) {
+    auto directory = parent.Child(".csv-export-" + std::to_string(random()) + "-" + std::to_string(random()));
+    std::error_code error;
+    const auto path = directory.Path();
+    if (fs::create_directory(fs::path(std::u8string(path.begin(), path.end())), error)) {
+      return std::make_shared<StagedOutput>(std::move(directory));
+    }
+    if (error && error != std::errc::file_exists) {
+      throw Error(ErrorCode::Io, "Cannot create a staging directory for the CSV output");
+    }
+  }
+  throw Error(ErrorCode::Io, "Cannot create a staging directory for the CSV output");
+}
+
+struct StagedWriter {
+  // The SDK stream must be released before its staging directory.
+  std::shared_ptr<StagedOutput> stage;
+  huxerui::OutputStream output;
+};
+
+huxerui::OutputStream OpenStaged(const std::shared_ptr<StagedOutput>& stage) {
+  const auto writer = std::make_shared<StagedWriter>(StagedWriter{stage, RequireIo(stage->file.OpenWrite())});
+  return huxerui::OutputStream::FromWriter(
+      [writer](std::span<const std::byte> bytes) { return writer->output.Write(bytes); },
+      [writer] { return writer->output.Close(); });
+}
+
+AsyncOutputStream OpenStagedAsync(const std::shared_ptr<StagedOutput>& stage, std::string_view fault) {
+  const auto writer = std::make_shared<StagedWriter>(StagedWriter{stage, RequireIo(stage->file.OpenWrite())});
+  return AsyncOutputStream::FromWriter(
+      [writer, fail = fault == "write"](std::stop_token, huxerui::Bytes bytes) -> Task<IoResult<void>> {
+        auto result = co_await huxerui::RunWorker([writer, bytes = std::move(bytes)] { return writer->output.Write(bytes); });
+        if (fail && result.Succeeded()) co_return IoResult<void>::Failure({huxerui::IoErrorCode::NoSpace, "Fixture write error"});
+        co_return result;
+      },
+      [writer, fail = fault == "close"](std::stop_token) -> Task<IoResult<void>> {
+        if (fail) co_return IoResult<void>::Failure({huxerui::IoErrorCode::Io, "Fixture close error"});
+        co_return co_await huxerui::RunWorker([writer] { return writer->output.Close(); });
+      });
 }
 
 Json Describe(const PackageInfo& package) {
@@ -248,12 +327,16 @@ Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) 
     }
     timeout = std::chrono::milliseconds(milliseconds);
   }
-  auto source = co_await huxerui::RunWorker(ReadCsv, path);
+  const auto info = RequireIo(path.Stat());
+  if (info.size > csv_import::MaxImportBytes) {
+    throw Error(ErrorCode::PayloadTooLarge, "CSV input exceeds the example limit");
+  }
+  auto input = RequireIo(co_await path.OpenReadAsync());
   auto importer = manager.CreateExtension(Importers, *selected, timeout);
   auto progress = std::make_shared<PreviewProgress>();
   const auto delimiter = importer->Delimiter();
   const auto plugin_pid = importer->ProcessId();
-  auto imported = co_await importer->Import({std::move(source)}, progress);
+  auto imported = co_await importer->Import(std::move(input), progress);
 
   auto issues = Json::array();
   for (const auto& issue : imported.issues) {
@@ -290,33 +373,342 @@ Task<Json> RoundTrip(PluginManager& manager, const std::vector<std::string>& arg
     throw Error(ErrorCode::PluginFailed, "Factories from the same package must share a process");
   }
 
-  const auto parse = [](auto& importer, std::string source) -> Task<csv_import::Table> {
-    const csv_import::ImportRequest request{std::move(source)};
-    auto result = co_await importer->Import(request, nullptr);
+  const auto parse = [](auto& importer, huxerui::AsyncInputStream input) -> Task<csv_import::Table> {
+    auto result = co_await importer->Import(std::move(input), nullptr);
     if (!result.table) throw Error(ErrorCode::PluginFailed, "Cannot parse the round-trip input");
     co_return std::move(*result.table);
   };
-  const auto csv = co_await huxerui::RunWorker(ReadCsv, File(args[1]));
-  const auto ssv = co_await huxerui::RunWorker(ReadCsv, File(args[2]));
-  const auto table = co_await parse(importers[0], csv);
+  const auto table = co_await parse(importers[0], RequireIo(co_await File(args[1]).OpenReadAsync()));
   {
     auto semicolon = manager.CreateExtension(Importers, *candidate);
     if (semicolon->Delimiter() != ";" || semicolon->ProcessId() != pid) {
       throw Error(ErrorCode::PluginFailed, "The candidate did not select the semicolon importer");
     }
-    const auto other = co_await parse(semicolon, ssv);
+    const auto other = co_await parse(semicolon, RequireIo(co_await File(args[2]).OpenReadAsync()));
     if (table.header != other.header || table.rows != other.rows) {
       throw Error(ErrorCode::PluginFailed, "CSV and semicolon input did not produce the same table");
     }
   }
   const csv_import::ExportRequest request{table.header, table.rows};
-  auto exported = co_await exporter->Export(request);
-  const auto round_trip = co_await parse(importers[0], exported);
+  std::string exported;
+  auto output = huxerui::AsyncOutputStream::FromWriter(
+      [&exported](std::stop_token, huxerui::Bytes bytes) -> Task<huxerui::IoResult<void>> {
+        exported.append(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        co_return huxerui::IoResult<void>::Success();
+      });
+  co_await exporter->Export(request, std::move(output));
+  const auto round_trip = co_await parse(importers[0], StringInput(exported));
   if (table.header != round_trip.header || table.rows != round_trip.rows) {
     throw Error(ErrorCode::PluginFailed, "The exported CSV did not preserve the input table");
   }
   co_return Json{{"all_importers", all_importers}, {"package_importers", importers.size()},
                  {"format", exporter->Format()}, {"plugin_pid", pid}, {"csv", std::move(exported)}};
+}
+
+Task<Json> Convert(PluginManager& manager, const std::vector<std::string>& args) {
+  const bool synchronous = args[1] == "sync";
+  if (!synchronous && args[1] != "async") throw Error(ErrorCode::InvalidArgument, "Expected sync or async conversion");
+  const File source(args[2]), destination(args[3]);
+  auto exporter = manager.CreateExtension(Exporters, args[4], std::chrono::seconds(30));
+  const auto fault = args.front() == "check-output-failure" ? std::string_view(args[5]) : std::string_view{};
+  csv_import::ConversionOptions options;
+  if (args.front() == "convert" && args.size() == 6) {
+    std::uint32_t kib = 0;
+    const auto& value = args[5];
+    const auto end = value.data() + value.size();
+    const auto result = std::from_chars(value.data(), end, kib);
+    if (result.ec != std::errc{} || result.ptr != end || !kib || kib > HPK_MAX_STREAM_CHUNK / 1024) {
+      throw Error(ErrorCode::InvalidArgument, "Expected a chunk size between 1 and 1024 KiB");
+    }
+    options.read_bytes = kib * 1024;
+  }
+  const auto pid = exporter->ProcessId();
+  auto stage = StageOutput(destination);
+  csv_import::CsvSummary summary{};
+  auto progress = std::make_shared<ConversionProgress>();
+  if (synchronous) {
+    auto input = RequireIo(source.OpenRead());
+    auto output = OpenStaged(stage);
+    summary = exporter->Convert(options, std::move(input), std::move(output));
+  } else {
+    auto original = std::make_shared<AsyncInputStream>(RequireIo(co_await source.OpenReadAsync()));
+    auto input = AsyncInputStream::FromReader(
+        [original, progress](std::stop_token, std::size_t count) -> Task<IoResult<huxerui::Bytes>> {
+          auto result = co_await original->ReadAsync(count);
+          if (result.Succeeded()) progress->eof = result.Value().empty();
+          co_return result;
+        });
+    auto output = OpenStagedAsync(stage, fault);
+    summary = co_await exporter->ConvertAsync(options, std::move(input), std::move(output), progress);
+  }
+  if (!(co_await stage->file.MoveToAsync(destination, true))) {
+    throw Error(ErrorCode::Io, "Cannot publish CSV output");
+  }
+  co_return Json{{"rows", summary.rows}, {"input_bytes", summary.input_bytes}, {"output_bytes", summary.output_bytes},
+                 {"plugin_pid", pid}, {"progress_before_eof", progress->before_eof}, {"progress_rows", progress->rows}};
+}
+
+struct HeldStreamOperation {
+  template<class T>
+  Task<IoResult<T>> Hold(std::stop_token token) {
+    std::stop_callback on_stop(token, [this] { stop_requested = true; });
+    co_return co_await AwaitCallback<IoResult<T>>([this](auto reply) {
+      late = [reply] { reply.Fail(std::make_exception_ptr(std::runtime_error("Late stream completion"))); };
+      started = true;
+      return [this] { cancelled = true; };
+    });
+  }
+
+  std::function<void()> late;
+  bool started = false;
+  bool cancelled = false;
+  bool stop_requested = false;
+};
+
+Task<Json> CheckStreamInterruption(PluginManager& manager, std::string_view plugin, bool writing, bool deadline) {
+  auto exporter = manager.CreateExtension(Exporters, plugin, deadline ? std::chrono::milliseconds(750) : DefaultTimeout);
+  (void)exporter->ProcessId();
+  auto gate = std::make_shared<HeldStreamOperation>();
+  auto input = writing ? StringInput("name;city\nAlice;Paris\n") : AsyncInputStream::FromReader(
+      [gate](std::stop_token stop, std::size_t) { return gate->Hold<huxerui::Bytes>(stop); });
+  auto output = AsyncOutputStream::FromWriter(
+      [gate, writing](std::stop_token stop, huxerui::Bytes) -> Task<IoResult<void>> {
+        if (writing) co_return co_await gate->Hold<void>(stop);
+        co_return IoResult<void>::Success();
+      });
+  auto outcome = std::make_shared<CallOutcome>();
+  const auto tasks = UseApplicationTaskScope();
+  const auto handle = tasks.Launch(ObserveCall(exporter->ConvertAsync({}, std::move(input), std::move(output), nullptr), outcome));
+  co_await WaitFor([gate] { return gate->started; });
+  if (!deadline) handle.Cancel();
+  co_await WaitFor([gate] { return gate->cancelled; });
+  gate->late();
+  if (deadline) {
+    co_await WaitFor([outcome] { return outcome->done; });
+    if (!outcome->error) throw Error(ErrorCode::PluginFailed, "The invocation ignored its deadline");
+    try {
+      std::rethrow_exception(outcome->error);
+    } catch (const Error& error) {
+      if (error.Code() != ErrorCode::DeadlineExceeded) throw;
+    }
+  } else if (outcome->done) {
+    throw Error(ErrorCode::PluginFailed, "A cancelled stream invocation delivered a result");
+  }
+  co_return Json{{"cancelled", gate->cancelled}, {"stop_requested", gate->stop_requested}, {"deadline", deadline}};
+}
+
+Task<Json> CheckLocalStreamReentry(PluginManager& manager, std::string_view plugin, bool synchronous) {
+  auto exporter = manager.CreateExtension(Exporters, plugin);
+  if (exporter->ProcessId() != ProcessId()) throw Error(ErrorCode::InvalidArgument, "Expected an in-process exporter");
+  constexpr std::string_view sample = "name;city\nAlice;Paris\n";
+  struct Checked {
+    bool read = false;
+    bool write = false;
+    bool close = false;
+  };
+  auto checked = std::make_shared<Checked>();
+  if (synchronous) {
+    const auto check = [&exporter] {
+      try {
+        (void)exporter->ProcessId();
+      } catch (const Error& error) {
+        if (error.Code() == ErrorCode::ReentrantCall) return;
+        throw;
+      }
+      throw Error(ErrorCode::PluginFailed, "The synchronous stream callback reentered PluginKit");
+    };
+    auto input = huxerui::InputStream::FromReader(
+        [check, checked, source = sample](std::span<std::byte> buffer) mutable {
+          check();
+          checked->read = true;
+          const auto count = std::min(source.size(), buffer.size());
+          if (count) std::memcpy(buffer.data(), source.data(), count);
+          source.remove_prefix(count);
+          return IoResult<std::size_t>(count);
+        });
+    auto output = huxerui::OutputStream::FromWriter(
+        [check, checked](std::span<const std::byte>) {
+          check();
+          checked->write = true;
+          return IoResult<void>::Success();
+        },
+        [check, checked] {
+          check();
+          checked->close = true;
+          return IoResult<void>::Success();
+        });
+    (void)exporter->Convert({}, std::move(input), std::move(output));
+  } else {
+    const auto check = [&manager, id = std::string(plugin)]() -> Task<void> {
+      co_await Delay(std::chrono::milliseconds(1));
+      try {
+        co_await manager.SetEnabled(id, true);
+      } catch (const Error& error) {
+        if (error.Code() == ErrorCode::ReentrantCall) co_return;
+        throw;
+      }
+      throw Error(ErrorCode::PluginFailed, "The asynchronous stream callback reentered PluginKit");
+    };
+    auto input = AsyncInputStream::FromReader(
+        [check, checked, source = std::make_shared<AsyncInputStream>(StringInput(std::string(sample)))]
+        (std::stop_token, std::size_t count) -> Task<IoResult<huxerui::Bytes>> {
+          co_await check();
+          checked->read = true;
+          co_return co_await source->ReadAsync(count);
+        });
+    auto output = AsyncOutputStream::FromWriter(
+        [check, checked](std::stop_token, huxerui::Bytes) -> Task<IoResult<void>> {
+          co_await check();
+          checked->write = true;
+          co_return IoResult<void>::Success();
+        },
+        [check, checked](std::stop_token) -> Task<IoResult<void>> {
+          co_await check();
+          checked->close = true;
+          co_return IoResult<void>::Success();
+        });
+    (void)co_await exporter->ConvertAsync({}, std::move(input), std::move(output), nullptr);
+  }
+  co_return Json{{"read", checked->read}, {"write", checked->write}, {"close", checked->close}};
+}
+
+void TerminateFixtureWorker(std::uint32_t pid) {
+#if defined(_WIN32)
+  const auto process = ::OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+  if (process) {
+    const auto terminated = ::TerminateProcess(process, 1);
+    ::CloseHandle(process);
+    if (terminated) return;
+  }
+#else
+  if (::kill(static_cast<pid_t>(pid), SIGKILL) == 0) return;
+#endif
+  throw Error(ErrorCode::PluginFailed, "Cannot terminate the CSV fixture worker");
+}
+
+Task<Json> CheckWorkerExitDuringCallback(PluginManager& manager, std::string_view plugin, bool during_receiver) {
+  // Leave a longer invocation deadline than the fixture's wait for a worker-exit response.
+  auto exporter = manager.CreateExtension(Exporters, plugin, DefaultTimeout * 3);
+  const auto pid = exporter->ProcessId();
+  const auto plugins = manager.ListPlugins();
+  if (!pid || pid == ProcessId() || !std::ranges::any_of(plugins, [&](const auto& entry) {
+        return entry.package.id == plugin && entry.worker_pid == pid;
+      })) {
+    throw Error(ErrorCode::InvalidArgument, "Expected a worker exporter");
+  }
+  auto stream = std::make_shared<HeldStreamOperation>();
+  auto progress = std::make_shared<ProgressGate>();
+  auto receiver = std::make_shared<HeldProgress>(progress);
+  const std::weak_ptr<HeldProgress> receiver_lifetime = receiver;
+  auto input = during_receiver ? StringInput("name;city\nAlice;Paris\n") : AsyncInputStream::FromReader(
+      [stream](std::stop_token stop, std::size_t) { return stream->Hold<huxerui::Bytes>(stop); });
+  auto written = std::make_shared<std::size_t>(0);
+  const std::weak_ptr<std::size_t> output_lifetime = written;
+  auto output = AsyncOutputStream::FromWriter(
+      [written = std::move(written)](std::stop_token, huxerui::Bytes bytes) -> Task<IoResult<void>> {
+        *written += bytes.size();
+        co_return IoResult<void>::Success();
+      });
+  const auto outcome = std::make_shared<CallOutcome>();
+  (void)UseApplicationTaskScope().Launch(
+      ObserveCall(exporter->ConvertAsync({}, std::move(input), std::move(output), std::move(receiver)), outcome));
+  co_await WaitFor([&] { return during_receiver ? progress->started : stream->started; });
+  TerminateFixtureWorker(pid);
+  co_await WaitFor([&] {
+    const bool cancelled = during_receiver ? progress->cancelled : stream->cancelled && stream->stop_requested;
+    return cancelled && outcome->done && receiver_lifetime.expired() && output_lifetime.expired();
+  });
+  if (during_receiver) progress->complete->Complete(9);
+  else stream->late();
+  if (!outcome->error) throw Error(ErrorCode::PluginFailed, "The exited worker returned a conversion result");
+  try {
+    std::rethrow_exception(outcome->error);
+  } catch (const Error& error) {
+    if (error.Code() != ErrorCode::WorkerExited) throw;
+  }
+  co_return Json{{"callback_cancelled", true}, {"grants_released", true}};
+}
+
+Task<Json> CheckStaleStream(PluginManager& manager, std::string_view plugin) {
+  auto exporter = manager.CreateExtension(Exporters, plugin);
+  int reads = 0;
+  const auto source = [&reads] {
+    return AsyncInputStream::FromReader([&reads](std::stop_token, std::size_t) -> Task<IoResult<huxerui::Bytes>> {
+      ++reads;
+      co_return IoResult<huxerui::Bytes>(huxerui::Bytes{std::byte{'x'}});
+    });
+  };
+  const auto sink = [] {
+    return AsyncOutputStream::FromWriter([](std::stop_token, huxerui::Bytes) -> Task<IoResult<void>> {
+      co_return IoResult<void>::Success();
+    });
+  };
+  (void)co_await exporter->ConvertAsync({}, source(), sink(), nullptr);
+  try {
+    (void)co_await exporter->ConvertAsync({}, source(), sink(), nullptr);
+    throw Error(ErrorCode::PluginFailed, "The stale stream was not rejected");
+  } catch (const Error& error) {
+    if (error.Code() != ErrorCode::Closed) throw;
+  }
+  co_return Json{{"old_source_reads", reads}};
+}
+
+Task<Json> CheckSynchronousStreamDeadline(PluginManager& manager, std::string_view plugin, bool writing) {
+  using namespace std::chrono_literals;
+  auto exporter = manager.CreateExtension(Exporters, plugin, 400ms);
+  (void)exporter->ProcessId();
+  struct Pending {
+    std::mutex mutex;
+    std::condition_variable release;
+    bool started = false;
+    bool finished = false;
+  };
+  auto pending = std::make_shared<Pending>();
+  const auto hold = [pending] {
+    std::unique_lock lock(pending->mutex);
+    pending->started = true;
+    pending->release.wait_for(lock, 3s, [&] { return pending->finished; });
+  };
+  auto completed = std::make_shared<std::atomic_bool>(false);
+  auto input = huxerui::InputStream::FromReader(
+      [hold, writing, completed, sent = false](std::span<std::byte> bytes) mutable -> IoResult<std::size_t> {
+        if (!writing) {
+          hold();
+          *completed = true;
+          return IoResult<std::size_t>(0);
+        }
+        if (std::exchange(sent, true)) return IoResult<std::size_t>(0);
+        constexpr std::string_view source = "name;city\nAlice;Paris\n";
+        std::memcpy(bytes.data(), source.data(), source.size());
+        return IoResult<std::size_t>(source.size());
+      });
+  auto output = huxerui::OutputStream::FromWriter([hold, writing, completed](std::span<const std::byte>) {
+    if (writing) {
+      hold();
+      *completed = true;
+    }
+    return IoResult<void>::Success();
+  });
+  const auto error = [&]() -> std::optional<ErrorCode> {
+    try {
+      (void)exporter->Convert({}, std::move(input), std::move(output));
+      return std::nullopt;
+    } catch (const Error& failure) {
+      return failure.Code();
+    }
+  }();
+  bool still_running;
+  {
+    std::lock_guard lock(pending->mutex);
+    still_running = pending->started && !completed->load();
+    pending->finished = true;
+  }
+  pending->release.notify_one();
+  if (error != ErrorCode::DeadlineExceeded || !still_running) {
+    throw Error(ErrorCode::PluginFailed, "The synchronous stream did not time out independently of its I/O");
+  }
+  co_await WaitFor([completed] { return completed->load(); });
+  co_return Json{{"deadline_while_io_pending", true}};
 }
 
 Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
@@ -326,28 +718,26 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     auto importer = manager.CreateExtension(Importers, extension);
     auto first = std::make_shared<PreviewProgress>();
     auto second = std::make_shared<PreviewProgress>();
-    const csv_import::ImportRequest remember{"remember"};
-    const csv_import::ImportRequest stale{"stale"};
-    (void)co_await importer->Import(remember, first);
+    (void)co_await importer->Import(StringInput("remember"), first);
     try {
-      (void)co_await importer->Import(stale, second);
+      (void)co_await importer->Import(StringInput("stale"), second);
       throw Error(ErrorCode::PluginFailed, "An expired receiver was accepted");
     } catch (const Error& error) {
       if (error.Code() != ErrorCode::ReceiverClosed) throw;
     }
     auto held = std::make_shared<ProgressGate>();
-    auto running = std::make_shared<ImportOutcome>();
-    (void)tasks.Launch(ObserveImport(importer->Import(remember, std::make_shared<HeldProgress>(held)), running));
+    auto running = std::make_shared<CallOutcome>();
+    (void)tasks.Launch(ObserveCall(importer->Import(StringInput("remember"), std::make_shared<HeldProgress>(held)), running));
     co_await WaitFor([held] { return held->started; });
     // The receiver is still suspended when this independent task reads the catalog.
     auto catalog_during_callback = List(manager);
-    auto queued = std::make_shared<ImportOutcome>();
-    const auto queued_task = tasks.Launch(ObserveImport(importer->Import(remember, second), queued));
+    auto queued = std::make_shared<CallOutcome>();
+    const auto queued_task = tasks.Launch(ObserveCall(importer->Import(StringInput("remember"), second), queued));
     co_await Delay(std::chrono::milliseconds(20));
     queued_task.Cancel();
     try {
       auto short_call = manager.CreateExtension(Importers, extension, std::chrono::milliseconds(30));
-      (void)co_await short_call->Import(remember, second);
+      (void)co_await short_call->Import(StringInput("remember"), second);
       throw Error(ErrorCode::PluginFailed, "A queued invocation exceeded its deadline without failing");
     } catch (const Error& error) {
       if (error.Code() != ErrorCode::DeadlineExceeded) throw;
@@ -360,7 +750,7 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     // A lazy call retains its arguments, while closing the instance revokes its call target.
     auto pending = [&] {
       auto unused = manager.CreateExtension(Importers, extension);
-      return unused->Import(remember, second);
+      return unused->Import(StringInput("remember"), second);
     }();
     try {
       (void)co_await std::move(pending);
@@ -371,8 +761,8 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     auto cancelled = std::make_shared<ProgressGate>();
     auto receiver = std::make_shared<HeldProgress>(cancelled);
     std::weak_ptr<HeldProgress> receiver_lifetime = receiver;
-    auto outcome = std::make_shared<ImportOutcome>();
-    const auto task = tasks.Launch(ObserveImport(importer->Import(remember, std::move(receiver)), outcome));
+    auto outcome = std::make_shared<CallOutcome>();
+    const auto task = tasks.Launch(ObserveCall(importer->Import(StringInput("remember"), std::move(receiver)), outcome));
     co_await WaitFor([cancelled] { return cancelled->started; });
     task.Cancel();
     co_await WaitFor([&] { return cancelled->cancelled && receiver_lifetime.expired(); });
@@ -381,9 +771,9 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
 
     auto restarted = manager.CreateExtension(Importers, extension, DefaultTimeout * 2);
     auto disabled = std::make_shared<ProgressGate>();
-    auto interrupted = std::make_shared<ImportOutcome>();
-    (void)tasks.Launch(ObserveImport(
-        restarted->Import(remember, std::make_shared<HeldProgress>(disabled)), interrupted));
+    auto interrupted = std::make_shared<CallOutcome>();
+    (void)tasks.Launch(ObserveCall(
+        restarted->Import(StringInput("remember"), std::make_shared<HeldProgress>(disabled)), interrupted));
     co_await WaitFor([disabled] { return disabled->started; });
     co_await manager.SetEnabled(plugin, false);
     co_await WaitFor([&] { return interrupted->done && disabled->cancelled; });
@@ -409,8 +799,7 @@ Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool d
     if (extension.PluginId() != plugin) continue;
     auto second = manager.CreateExtension(Importers, extension);
     const auto context = [](auto& importer) -> Task<std::vector<std::string>> {
-      const csv_import::ImportRequest request{"context"};
-      auto result = co_await importer->Import(request, std::make_shared<PreviewProgress>());
+      auto result = co_await importer->Import(StringInput("context"), std::make_shared<PreviewProgress>());
       if (!result.table || result.table->rows.size() != 1) {
         throw Error(ErrorCode::PluginFailed, "Expected the fixture's plugin context");
       }
@@ -434,8 +823,7 @@ Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool d
     }
     if (disable) {
       // Leave the second instance alive so shutdown has to destroy it before calling OnDeactivate.
-      const csv_import::ImportRequest request{"context"};
-      auto pending = second->Import(request, std::make_shared<PreviewProgress>());
+      auto pending = second->Import(StringInput("context"), std::make_shared<PreviewProgress>());
       co_await manager.SetEnabled(plugin, false);
       try {
         (void)co_await std::move(pending);
@@ -599,8 +987,7 @@ Task<Json> CheckInProcessUpgrade(const File& profile, const std::vector<std::str
     throw Error(ErrorCode::PluginFailed, "The approved in-process upgrade was lost");
   }
   auto handle = reopened.CreateExtension(Importers, id);
-  const csv_import::ImportRequest request{"context"};
-  const auto context = co_await handle->Import(request, nullptr);
+  const auto context = co_await handle->Import(StringInput("context"), nullptr);
   if (!context.table || context.table->rows.at(0).at(2) != args[2]) {
     throw Error(ErrorCode::PluginFailed, "The reopened manager selected the replacement too early");
   }
@@ -651,6 +1038,23 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
   if (name == "list" && args.size() == 1) co_return List(manager);
   if (name == "import" && args.size() >= 2 && args.size() <= 4) co_return co_await Import(manager, args);
   if (name == "round-trip" && args.size() == 4) co_return co_await RoundTrip(manager, args);
+  if ((name == "convert" && (args.size() == 5 || args.size() == 6)) ||
+      (name == "check-output-failure" && args.size() == 6)) {
+    co_return co_await Convert(manager, args);
+  }
+  if (name == "check-stream-interruption" && args.size() == 4) {
+    co_return co_await CheckStreamInterruption(manager, args[1], args[2] == "write", args[3] == "deadline");
+  }
+  if (name == "check-local-stream-reentry" && args.size() == 3) {
+    co_return co_await CheckLocalStreamReentry(manager, args[1], args[2] == "sync");
+  }
+  if (name == "check-worker-exit-during-callback" && args.size() == 3) {
+    co_return co_await CheckWorkerExitDuringCallback(manager, args[1], args[2] == "receiver");
+  }
+  if (name == "check-stale-stream" && args.size() == 2) co_return co_await CheckStaleStream(manager, args[1]);
+  if (name == "check-sync-stream-deadline" && args.size() == 3) {
+    co_return co_await CheckSynchronousStreamDeadline(manager, args[1], args[2] == "write");
+  }
   throw Error(ErrorCode::InvalidArgument, CommandHelp);
 }
 

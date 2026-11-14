@@ -131,13 +131,23 @@ One desktop profile can contain packages installed for either `InProcess` or `Wo
 
 Process separation contains a plugin process failure. The application selects a sandbox policy for filesystem, network, and other operating system access. Kit checks declared and granted capabilities when dispatching host services and uses an eligible sandboxed backend where policy requires one. Scoped file and object grants carry the plugin identity, permitted operations, and lifetime. Package trust identifies what code is approved to run. The sandbox determines its access. [Windows AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation)
 
-The manager starts one activation per package generation. All instances of all points in a worker package share the same process and context. Managed calls are serialized across the package. The transport drives I/O independently of business execution, and host callbacks run on the owning application scope. Call options supply a deadline and cancellation. The broader design includes large streams with bounded buffers and backpressure. [Cancellation](https://grpc.io/docs/guides/cancellation/) and [flow control](https://grpc.io/docs/guides/flow-control/)
+The manager starts one activation per package generation. All instances of all points in a worker package share the same process and context. Managed calls are serialized across the package. The transport drives I/O independently of business execution, and host callbacks run on the owning application scope. Call options supply a deadline and cancellation. [Cancellation](https://grpc.io/docs/guides/cancellation/)
 
 The worker receives the package context and expected factory table in `Activate`. `Create` sends the point and its ordinal and returns an instance ID. The worker stores that instance with its factory so `Invoke` uses the corresponding contract's operation table. `Close` destroys one instance. Package shutdown closes all remaining instances before invoking `OnDeactivate`.
 
 A handle is scoped to a factory and generation. Disabling or replacing a package withdraws all its factories and closes admission to new calls. The manager drains or cancels work under its shutdown policy and releases the instances. An application can retain a closed handle and receive a `Closed` result. It queries the current candidates or creates a new handle by plugin ID after a version change.
 
 Worker exit completes pending calls with a failure and marks the generation faulted. A request delivered before a crash can have an unknown business outcome. The application can retry a safe operation explicitly, and Kit preserves the distinction between an undelivered request and a potentially executed request. Restart policy is bounded and exposed in diagnostics. A deadline ends the caller's wait and requests cancellation. For a worker that exceeds its stop deadline, the policy can terminate the worker. In-process execution keeps its resources until the relevant calls finish or the process exits. [Retry safety guidance](https://google.aip.dev/194)
+
+### Invocation streams
+
+An extension operation can take one HuxerUI input stream and one output stream by value. Synchronous operations use `InputStream` and `OutputStream`. Task operations use `AsyncInputStream` and `AsyncOutputStream`. The generator includes both stream types in the contract fingerprint. The host grants sequential access by providing an opened source or sink for that invocation. Local adapters call the original streams on the application's execution context. Worker adapters bind the stream slots to the invocation and exchange raw data in chunks up to 1 MiB. One chunk is in flight at a time, and each write waits for the host acknowledgement. The ordinary CBOR request and result limit remains 8 MiB.
+
+Synchronous worker stream operations run on an independent host I/O thread. Their sources and sinks must be safe to move to that thread, and their callbacks must complete without the waiting application thread. Async stream operations run on the host application scope. Both modes share the invocation deadline and revoke access on termination. Pending native operations retain their own state until they finish, and late completions are discarded.
+
+In-process stream callbacks use the same reentry guard as host services and receivers. A worker exit ends any wait for a stream, receiver, or host service callback, revokes the invocation's grants, and completes the call with `WorkerExited`.
+
+An output must be closed successfully on the host side before the invocation can report success. Closing completes the supplied sink. The host controls publication and can stage a file until the extension succeeds. A raw sink can retain a successfully written prefix after an error or cancellation.
 
 ## Management transactions and persisted state
 

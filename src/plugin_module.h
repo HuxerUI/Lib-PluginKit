@@ -28,6 +28,7 @@ inline void CheckPluginStatus(std::int32_t status) {
     case HPK_CLOSED: throw Error(ErrorCode::Closed, "The plugin generation is closing");
     case HPK_CALLBACK_UNAVAILABLE: throw Error(ErrorCode::CallbackUnavailable, "The call cannot use a host callback");
     case HPK_BUSY: throw Error(ErrorCode::Busy, "The plugin has an active invocation");
+    case HPK_IO: throw Error(ErrorCode::Io, "A plugin I/O operation failed");
     default: throw Error(ErrorCode::Protocol, "The plugin returned an invalid status");
   }
 }

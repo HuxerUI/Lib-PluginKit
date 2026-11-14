@@ -97,6 +97,34 @@ std::uint32_t HPK_CALL CallHost(std::uint64_t invocation, std::uint32_t receiver
   }
 }
 
+std::uint32_t HPK_CALL CallStream(std::uint64_t invocation, std::uint32_t slot, std::uint32_t operation,
+                                 std::uint32_t count, hpk_buffer_v1 payload, hpk_complete_v1 complete,
+                                 void* user) noexcept {
+  auto* channel = current_service_channel;
+  if (!channel || channel->request.call != invocation || !(channel->request.streams & slot)) {
+    return static_cast<std::uint32_t>(ErrorCode::Closed);
+  }
+  try {
+    if (!complete || (payload.size && !payload.data) || channel->callback == UINT32_MAX ||
+        !IsStreamOperation(slot, operation, count, payload.size)) {
+      throw Error(ErrorCode::InvalidArgument, "Invalid invocation stream operation");
+    }
+    Bytes bytes;
+    if (payload.size) {
+      const auto data = std::as_bytes(std::span(payload.data, payload.size));
+      bytes.assign(data.begin(), data.end());
+    }
+    channel->Send({{0, channel->request.instance, operation, std::move(bytes), FrameKind::StreamCall,
+                    channel->request.call, channel->callback + 1, 0, false, slot, count}, complete, user});
+    ++channel->callback;
+    return 0;
+  } catch (const Error& error) {
+    return static_cast<std::uint32_t>(error.Code());
+  } catch (...) {
+    return static_cast<std::uint32_t>(ErrorCode::PluginFailed);
+  }
+}
+
 void HPK_CALL FinishInvoke(void* user, std::uint32_t status, hpk_buffer_v1 buffer) noexcept {
   auto& channel = *static_cast<ServiceChannel*>(user);
   Frame reply{};
@@ -117,7 +145,7 @@ void HPK_CALL FinishInvoke(void* user, std::uint32_t status, hpk_buffer_v1 buffe
   Finish(channel, std::move(reply));
 }
 
-constexpr hpk_host_v1 HostCallbacks{CallHost};
+constexpr hpk_host_v1 HostCallbacks{CallHost, CallStream};
 
 class Server {
 public:
@@ -125,6 +153,10 @@ public:
 
   std::optional<Frame> Dispatch(ServiceChannel& channel) {
     const auto& request = channel.request;
+    const bool invoke = request.code == static_cast<std::uint32_t>(Command::Invoke);
+    if ((request.streams && !invoke) || (request.streams & ~(HPK_INPUT_STREAM | HPK_OUTPUT_STREAM))) {
+      InvalidRequest();
+    }
     if (request.code == static_cast<std::uint32_t>(Command::Shutdown)) {
       if (request.instance || request.operation || request.receiver || request.synchronous || !request.payload.empty()) InvalidRequest();
       Shutdown();
@@ -173,7 +205,7 @@ public:
     auto& target = instance->second;
     current_service_channel = &channel;
     CheckPluginStatus(target.factory.invoke(target.object.get(), &HostCallbacks, request.call, request.receiver,
-        request.operation, reinterpret_cast<const std::uint8_t*>(request.payload.data()),
+        request.streams, request.operation, reinterpret_cast<const std::uint8_t*>(request.payload.data()),
         static_cast<std::uint32_t>(request.payload.size()), FinishInvoke, &channel));
     return std::nullopt;
   }
@@ -228,10 +260,15 @@ void Exchange(Read& read, Write& write, const TaskScope& tasks, Server& server) 
       if (message.frame.kind == FrameKind::Reply) break;
       const auto& outgoing = message.frame;
       const auto reply = ReadFrame(read);
-      if (reply.kind != FrameKind::ServiceReply || reply.call != outgoing.call || reply.callback != outgoing.callback ||
-          reply.instance != outgoing.instance || reply.operation || reply.receiver != outgoing.receiver || reply.synchronous ||
-          (reply.code && (!IsErrorCode(reply.code) || !IsUtf8(AsText(reply.payload))))) {
-        throw Error(ErrorCode::Protocol, "Invalid host service response");
+      const bool stream = outgoing.kind == FrameKind::StreamCall;
+      if (reply.kind != (stream ? FrameKind::StreamReply : FrameKind::ServiceReply) ||
+          reply.call != outgoing.call || reply.callback != outgoing.callback || reply.instance != outgoing.instance ||
+          reply.receiver != outgoing.receiver || reply.streams != outgoing.streams || reply.synchronous ||
+          reply.operation != (stream ? outgoing.operation : 0) ||
+          (reply.code && !IsUtf8(AsText(reply.payload))) ||
+          (!stream && reply.code && !IsErrorCode(reply.code)) ||
+          (stream && !reply.code && reply.payload.size() > outgoing.read_limit)) {
+        throw Error(ErrorCode::Protocol, "Invalid host callback response");
       }
       message.complete(message.user, reply.code, {reinterpret_cast<const std::uint8_t*>(reply.payload.data()),
                                                  static_cast<std::uint32_t>(reply.payload.size())});

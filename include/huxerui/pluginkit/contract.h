@@ -14,8 +14,12 @@
 /// Place it on the class definition, as in `class HPK_REMOTE Importer`. Declare a public virtual
 /// destructor and public pure virtual operations with unique names. Operations may return a synchronous
 /// value, void, or HuxerUI Task<T>. Use contract-supported types and pass Task requests by value.
-/// A Task operation can take a Receiver as its second argument. Leave operations able to throw so
-/// the binding can report failures. The macro expands to an annotation only when hpk gen parses the header.
+/// An extension operation can take one SDK input stream and one SDK output stream by value. Declare the
+/// ordinary request first, then the input stream, output stream, and optional Receiver. Use synchronous
+/// stream types on synchronous methods and asynchronous types on Task methods. A Receiver requires a Task.
+/// Moving a stream into a call grants access for that invocation. Close a supplied output before returning.
+/// Leave operations able to throw so the binding can report failures. The macro expands to an annotation
+/// only when hpk gen parses the header.
 #if defined(HPK_GENERATOR)
 #define HPK_REMOTE [[clang::annotate("hpk.remote")]]
 #else
@@ -76,7 +80,7 @@ class ServiceHandle;
 /// awaited child Task. A retained proxy fails with ReceiverClosed after completion, cancellation, or when
 /// called from a different execution.
 /// @tparam Interface HPK_REMOTE callback interface declared in its own header, with Task operations and
-/// at most one request per operation.
+/// at most one ordinary request per operation.
 template<class Interface>
 using Receiver = std::shared_ptr<Interface>;
 

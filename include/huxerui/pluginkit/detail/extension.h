@@ -3,7 +3,7 @@
 /// @file
 /// @brief Execution modes and shared implementation of typed extension and service handles.
 
-#include <huxerui/pluginkit/detail/invocation.h>
+#include <huxerui/pluginkit/detail/streams.h>
 
 #include <functional>
 #include <tuple>
@@ -55,6 +55,7 @@ struct LocalInvocation : std::enable_shared_from_this<LocalInvocation> {
   std::stop_source stop;
   std::shared_ptr<void> receiver;
   std::shared_ptr<void> services;
+  std::shared_ptr<CallStreams> streams;
   std::optional<ErrorCode> interruption;
   std::function<void()> cancel_callback;
   std::vector<std::shared_ptr<void>> background;
@@ -70,10 +71,11 @@ public:
   virtual void Check() const = 0;
   virtual void Release() noexcept = 0;
   virtual void* BorrowLocal();
-  virtual void CallLocal(const std::function<void(void*)>& work);
-  virtual Task<void> CallLocal(LocalWork work, std::shared_ptr<void> receiver);
-  virtual Bytes CallWorker(std::uint32_t operation, Bytes request);
-  virtual Task<Bytes> CallWorker(std::uint32_t operation, Bytes request, std::optional<ReceiverRegistration> receiver);
+  virtual void CallLocal(const std::function<void(void*)>& work, std::shared_ptr<CallStreams> streams);
+  virtual Task<void> CallLocal(LocalWork work, std::shared_ptr<void> receiver, std::shared_ptr<CallStreams> streams);
+  virtual Bytes CallWorker(std::uint32_t operation, Bytes request, std::shared_ptr<CallStreams> streams = {});
+  virtual Task<Bytes> CallWorker(std::uint32_t operation, Bytes request, std::optional<ReceiverRegistration> receiver,
+                                 std::shared_ptr<CallStreams> streams);
 };
 
 class CallbackScope {
@@ -193,20 +195,21 @@ Result InvokeServiceSync(Invoke invoke) {
 
 template<class Result, class Encode>
 Task<Result> InvokeWorker(std::shared_ptr<ExtensionTarget> target, std::uint32_t operation, Encode encode,
-                          std::optional<ReceiverRegistration> receiver = {}) {
+                          std::optional<ReceiverRegistration> receiver = {}, std::shared_ptr<CallStreams> streams = {}) {
   target->Check();
-  co_return DecodeResult<Result>(co_await target->CallWorker(operation, encode(), std::move(receiver)));
+  co_return DecodeResult<Result>(co_await target->CallWorker(operation, encode(), std::move(receiver), std::move(streams)));
 }
 
 template<class Result, class Invoke>
-Task<Result> InvokeLocal(std::shared_ptr<ExtensionTarget> target, Invoke invoke, std::shared_ptr<void> receiver = {}) {
+Task<Result> InvokeLocal(std::shared_ptr<ExtensionTarget> target, Invoke invoke, std::shared_ptr<void> receiver = {},
+                         std::shared_ptr<CallStreams> streams = {}) {
   if constexpr (std::is_void_v<Result>) {
-    co_await target->CallLocal(std::move(invoke), std::move(receiver));
+    co_await target->CallLocal(std::move(invoke), std::move(receiver), std::move(streams));
   } else {
     auto result = std::make_shared<std::optional<Result>>();
     co_await target->CallLocal([invoke = std::move(invoke), result](void* object, auto invocation) mutable {
       return invoke(object, std::move(invocation), result);
-    }, std::move(receiver));
+    }, std::move(receiver), std::move(streams));
     co_return std::move(**result);
   }
 }
@@ -217,12 +220,12 @@ Task<void> StoreLocalResult(Task<Result> call, std::shared_ptr<std::optional<Res
 }
 
 template<class Result, class Invoke>
-Result InvokeLocalSync(ExtensionTarget& target, Invoke invoke) {
+Result InvokeLocalSync(ExtensionTarget& target, Invoke invoke, std::shared_ptr<CallStreams> streams = {}) {
   if constexpr (std::is_void_v<Result>) {
-    target.CallLocal(invoke);
+    target.CallLocal(invoke, std::move(streams));
   } else {
     std::optional<Result> result;
-    target.CallLocal([&](void* object) { result.emplace(invoke(object)); });
+    target.CallLocal([&](void* object) { result.emplace(invoke(object)); }, std::move(streams));
     return std::move(*result);
   }
 }

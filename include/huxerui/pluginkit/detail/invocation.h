@@ -102,13 +102,15 @@ private:
   std::uint32_t receiver_;
 };
 
-/// @brief Worker invocation information needed by generated dispatch to bind a receiver.
-/// Service and receiver dispatch on the host use an empty context.
+/// @brief Worker invocation information used to bind the caller's receiver and streams.
+/// Host service and receiver dispatch use an empty context.
 struct DispatchContext {
   /// Worker callback table and identity, borrowed for the duration of the invocation.
   HostInvocation invocation{};
   /// Invocation's receiver slot, or zero if the caller supplied no receiver.
   std::uint32_t receiver = 0;
+  /// Bit mask of the invocation's supplied stream slots.
+  std::uint32_t streams = 0;
 };
 
 // The plugin owns its thread-local storage even when it is loaded into the host process.

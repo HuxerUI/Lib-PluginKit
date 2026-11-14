@@ -8,11 +8,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
-#if !defined(_WIN32)
 #include <thread>
-#endif
 
 namespace huxerui::pluginkit::detail {
+
+class StreamIo;
 
 class Worker : public std::enable_shared_from_this<Worker> {
 public:
@@ -23,7 +23,7 @@ public:
 
   std::optional<std::uint32_t> Pid() const noexcept;
   Frame Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver = nullptr,
-                std::stop_token stop = {}, bool wait_for_slot = true);
+                std::stop_token stop = {}, bool wait_for_slot = true, std::shared_ptr<CallStreams> streams = {});
   void ValidateFactories(std::stop_token stop);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
   /// Waits for the process to exit after shutdown, including when handles still reference this Worker.
@@ -34,27 +34,39 @@ public:
 
 private:
   Frame Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
-                 const ReceiverRegistration* receiver);
+                 const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams);
+  Frame DispatchCallback(Frame request, Deadline deadline, std::stop_token stop,
+                         const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams,
+                         StreamIo* sync_io);
   Frame DispatchService(const Frame& request, Deadline deadline, std::stop_token stop,
-                        const ReceiverRegistration* receiver);
+                        const ReceiverRegistration* receiver, CallStreams* streams);
+  Frame DispatchStream(Frame request, Deadline deadline, std::stop_token stop,
+                       const std::shared_ptr<CallStreams>& streams, StreamIo* sync_io);
 
   template<class Transact>
   Frame ExchangeFrames(const Frame& request, Deadline deadline, std::stop_token stop,
-                       const ReceiverRegistration* receiver, Transact transact) {
+                       const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams,
+                       StreamIo* sync_io, Transact transact) {
     auto frame = transact(request);
     std::uint32_t callback = 0;
     for (;;) {
       CheckExchange(deadline, stop);
       if (frame.kind == FrameKind::Reply) return frame;
-      if (frame.kind != FrameKind::ServiceCall || request.code != static_cast<std::uint32_t>(Command::Invoke) ||
+      if ((frame.kind != FrameKind::ServiceCall && frame.kind != FrameKind::StreamCall) ||
+          request.code != static_cast<std::uint32_t>(Command::Invoke) ||
           frame.call != request.call || !frame.callback || frame.callback != ++callback ||
           frame.instance != request.instance || !frame.operation || frame.code || frame.synchronous) {
-        throw Error(ErrorCode::Protocol, "Invalid host service request");
+        throw Error(ErrorCode::Protocol, "Invalid worker callback request");
       }
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
-      auto reply = request.synchronous
-          ? RejectSynchronousCallback(frame)
-          : DispatchService(frame, deadline, stop, receiver);
+      if (frame.kind == FrameKind::StreamCall) {
+        if (frame.receiver || !streams || !(request.streams & frame.streams)) {
+          throw Error(ErrorCode::Protocol, "The invocation did not authorize this stream");
+        }
+      } else if (frame.streams) {
+        throw Error(ErrorCode::Protocol, "A host service call has an unexpected stream slot");
+      }
+      const auto reply = DispatchCallback(std::move(frame), deadline, stop, receiver, streams, sync_io);
       CheckExchange(deadline, stop);
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
       frame = transact(reply);
@@ -79,12 +91,14 @@ private:
   std::mutex stop_;
   std::stop_source generation_stop_;
   std::stop_source callback_stop_;
+  std::stop_source exited_stop_;
 
 #if defined(_WIN32)
   Handle process_;
   Handle to_worker_;
   Handle from_worker_;
   Handle job_;
+  std::jthread exit_watch_;
   std::uint32_t pid_ = 0;
 #else
   void StartReaper(pid_t child);

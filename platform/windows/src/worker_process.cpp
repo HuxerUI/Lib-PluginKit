@@ -1,4 +1,5 @@
 #include "worker_process.h"
+#include "stream_io.h"
 
 #include <future>
 #include <thread>
@@ -97,9 +98,16 @@ Worker::Worker(const std::filesystem::path& executable, const std::filesystem::p
   process_ = std::move(process);
   to_worker_ = std::move(request.write);
   from_worker_ = std::move(response.read);
+  // A worker can exit while the host is servicing a callback and has no pipe read pending.
+  exit_watch_ = std::jthread([process = process_.get(), exited = exited_stop_]() mutable {
+    if (WaitForSingleObject(process, INFINITE) == WAIT_OBJECT_0) exited.request_stop();
+  });
 }
 
-Worker::~Worker() = default;
+Worker::~Worker() {
+  Stop();
+  if (exit_watch_.joinable()) exit_watch_.join();
+}
 
 std::optional<std::uint32_t> Worker::Pid() const noexcept {
   if (!active_ || WaitForSingleObject(process_.get(), 0) != WAIT_TIMEOUT) return std::nullopt;
@@ -124,9 +132,11 @@ void Worker::WaitForExit(std::chrono::milliseconds timeout) {
 }
 
 Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
-                       const ReceiverRegistration* receiver) {
+                        const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams) {
+  StreamIo stream_io;
   // A separate pipe helper lets the request thread enforce the I/O deadline.
-  return ExchangeFrames(request, deadline, stop, receiver, [this, deadline](const Frame& outgoing) {
+  return ExchangeFrames(request, deadline, stop, receiver, streams, request.synchronous ? &stream_io : nullptr,
+                        [this, deadline](const Frame& outgoing) {
     std::packaged_task<Frame()> exchange([this, &outgoing] {
       WriteFrame([this](std::span<const std::byte> bytes) {
         WriteAll(to_worker_.get(), bytes, ErrorCode::WorkerExited, "Cannot write worker frame");
