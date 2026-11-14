@@ -3,6 +3,7 @@
 #include "platform_files.h"
 #include "transport.h"
 
+#include <array>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -50,13 +51,16 @@ inline void ValidatePluginDescriptor(const hpk_plugin_v1& binding, std::span<con
   if (binding.extension_count != expected.size()) {
     throw Error(ErrorCode::ContractMismatch, "The module factory count differs from the approved package");
   }
-  // Factories at other points may be interleaved differently in the manifest and library.
-  std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
+  // Each declared slot must select a distinct export, including when the worker decodes the slots from IPC.
+  std::array<bool, HPK_MAX_EXTENSIONS> matched{};
   for (const auto& extension : expected) {
-    const auto* found = FindExtension(binding, extension.point, ordinals[extension.point]++);
+    const auto* found = FindExtension(binding, extension.point, extension.ordinal);
     if (!found || extension.Info() !=
         ContractInfo{found->contract_id, found->contract_version, found->contract_fingerprint}) {
       throw Error(ErrorCode::ContractMismatch, "The module factory does not match the host extension point " + extension.point);
+    }
+    if (std::exchange(matched[found - binding.extensions], true)) {
+      throw Error(ErrorCode::ContractMismatch, "Several declarations select the same module factory");
     }
     if (mode == HPK_WORKER_PROCESS && !found->invoke) {
       throw Error(ErrorCode::UnsupportedMode, "The module has a factory without worker dispatch");
@@ -167,8 +171,16 @@ inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& pat
   return binding;
 }
 
-inline void* ActivatePlugin(const hpk_plugin_v1& binding, const PluginStartup& startup) {
-  const hpk_plugin_context_v1 context{startup.id.c_str(), startup.version.c_str(), startup.digest.c_str(),
+inline void* ActivatePlugin(const hpk_plugin_v1& binding, const PluginStartup& startup, std::uint32_t mode) {
+  ValidatePluginDescriptor(binding, startup.extensions, mode);
+  const auto& data = startup.data_directory;
+  const auto path = std::filesystem::path(std::u8string(data.begin(), data.end()));
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  if (error) throw Error(ErrorCode::Io, "Cannot create the plugin data directory: " + error.message());
+
+  const auto& identity = startup.identity;
+  const hpk_plugin_context_v1 context{identity.id.c_str(), identity.version.c_str(), identity.digest.c_str(),
                                      startup.bundle_directory.c_str(), startup.data_directory.c_str()};
   void* activation = nullptr;
   CheckPluginStatus(binding.activate(&context, &activation));

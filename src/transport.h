@@ -2,7 +2,7 @@
 
 #include "bytes.h"
 
-#include <huxerui/pluginkit/contract.h>
+#include <huxerui/pluginkit/plugin.h>
 
 #include <array>
 #include <chrono>
@@ -34,6 +34,7 @@ inline bool IsErrorCode(std::uint32_t code) {
 
 struct ExpectedExtension {
   std::string point;
+  std::uint32_t ordinal;
   std::string contract_id;
   std::uint32_t contract_version;
   std::string contract_fingerprint;
@@ -42,9 +43,7 @@ struct ExpectedExtension {
 };
 
 struct PluginStartup {
-  std::string id;
-  std::string version;
-  std::string digest;
+  PluginIdentity identity;
   std::string bundle_directory;
   std::string data_directory;
   std::vector<ExpectedExtension> extensions;
@@ -52,15 +51,16 @@ struct PluginStartup {
   Bytes Encode() const {
     Writer writer;
     writer.Array(6);
-    writer.Text(id);
-    writer.Text(version);
-    writer.Text(digest);
+    writer.Text(identity.id);
+    writer.Text(identity.version);
+    writer.Text(identity.digest);
     writer.Text(bundle_directory);
     writer.Text(data_directory);
     writer.Array(extensions.size());
     for (const auto& extension : extensions) {
-      writer.Array(4);
+      writer.Array(5);
       writer.Text(extension.point);
+      Codec<std::uint32_t>::Write(writer, extension.ordinal);
       writer.Text(extension.contract_id);
       Codec<std::uint32_t>::Write(writer, extension.contract_version);
       writer.Text(extension.contract_fingerprint);
@@ -71,13 +71,14 @@ struct PluginStartup {
   static PluginStartup Decode(std::span<const std::byte> payload) {
     Reader reader(payload);
     reader.Record(6);
-    PluginStartup startup{reader.Text(), reader.Text(), reader.Text(), reader.Text(), reader.Text(), {}};
+    PluginStartup startup{{reader.Text(), reader.Text(), reader.Text()}, reader.Text(), reader.Text(), {}};
     const auto count = reader.Array();
     if (!count || count > HPK_MAX_EXTENSIONS) throw Error(ErrorCode::Protocol, "Invalid startup factory count");
     startup.extensions.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
-      reader.Record(4);
-      startup.extensions.push_back({reader.Text(), reader.Text(), Codec<std::uint32_t>::Read(reader), reader.Text()});
+      reader.Record(5);
+      startup.extensions.push_back({reader.Text(), Codec<std::uint32_t>::Read(reader), reader.Text(),
+                                    Codec<std::uint32_t>::Read(reader), reader.Text()});
     }
     reader.Finish();
     return startup;
@@ -90,14 +91,6 @@ inline Bytes ExtensionPayload(std::string_view point, std::uint32_t ordinal) {
   writer.Text(point);
   Codec<std::uint32_t>::Write(writer, ordinal);
   return std::move(writer).Finish();
-}
-
-inline void PreparePluginData(const PluginStartup& startup) {
-  const auto& text = startup.data_directory;
-  const auto path = std::filesystem::path(std::u8string(text.begin(), text.end()));
-  std::error_code error;
-  std::filesystem::create_directories(path, error);
-  if (error) throw Error(ErrorCode::Io, "Cannot create the plugin data directory: " + error.message());
 }
 
 inline Bytes ServicePayload(ContractInfo service, std::span<const std::byte> request) {

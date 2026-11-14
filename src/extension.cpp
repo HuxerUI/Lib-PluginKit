@@ -1,12 +1,22 @@
 #include "extension.h"
 #include "plugin_module.h"
 #include "run_transport.h"
+#include "worker_process.h"
 
 #include <algorithm>
 #include <deque>
-#include <map>
 
 namespace huxerui::pluginkit::detail {
+
+const RegisteredService& RequireHostService(std::span<const RegisteredService> services, ContractInfo contract) {
+  const auto service = std::ranges::find(services, contract.id, &RegisteredService::id);
+  if (service == services.end()) throw Error(ErrorCode::ServiceDenied, "Host service is not authorized for this package");
+  if (ContractInfo{service->id, service->version, service->fingerprint} != contract) {
+    throw Error(ErrorCode::ContractMismatch, "Host service contract does not match");
+  }
+  return *service;
+}
+
 namespace {
 
 Error Closed() { return Error(ErrorCode::Closed, "The extension instance is closed"); }
@@ -228,9 +238,7 @@ public:
     if (instance.object) return instance.object;
     if (!activation_) {
       const auto& binding = load_();
-      ValidatePluginDescriptor(binding, startup_.extensions, HPK_IN_PROCESS);
-      PreparePluginData(startup_);
-      activation_ = ActivatePlugin(binding, startup_);
+      activation_ = ActivatePlugin(binding, startup_, HPK_IN_PROCESS);
       binding_ = &binding;
     }
     instance.factory = FindExtension(*binding_, instance.point, instance.ordinal);
@@ -245,9 +253,8 @@ public:
   }
 
   void ValidateFactories() {
-    std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
     for (const auto& entry : startup_.extensions) {
-      LocalInstance instance(entry.point, ordinals[entry.point]++);
+      LocalInstance instance(entry.point, entry.ordinal);
       (void)Ensure(instance);
     }
   }
@@ -379,12 +386,7 @@ private:
     const auto& call = *static_cast<LocalInvocation*>(context);
     if (call.interruption) throw Closed();
     const auto& plugin = *static_cast<LocalPlugin*>(call.services.get());
-    const auto found = std::ranges::find(plugin.services_, contract.id, &RegisteredService::id);
-    if (found == plugin.services_.end()) throw Error(ErrorCode::ServiceDenied, "The package cannot call this host service");
-    if (ContractInfo{found->id, found->version, found->fingerprint} != contract) {
-      throw Error(ErrorCode::ContractMismatch, "Host service contract does not match");
-    }
-    return found->implementation;
+    return RequireHostService(plugin.services_, contract).implementation;
   }
 
   static Task<void> Run(std::shared_ptr<LocalPlugin> plugin, std::shared_ptr<LocalCall> call,

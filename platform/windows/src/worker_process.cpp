@@ -54,7 +54,7 @@ private:
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               std::vector<Service> services, TaskScope callbacks, PluginStartup plugin)
+               std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup plugin)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(plugin)) {
   auto request = CreateWorkerPipe(true);
   auto response = CreateWorkerPipe(false);

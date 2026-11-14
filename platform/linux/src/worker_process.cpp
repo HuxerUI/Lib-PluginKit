@@ -66,7 +66,7 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, int module) {
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path&, const Handle& verified_module,
-               std::vector<Service> services, TaskScope callbacks, PluginStartup startup)
+               std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup startup)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(startup)) {
   int sockets[2];
   if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {

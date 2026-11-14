@@ -2,6 +2,7 @@
 #include "extension.h"
 #include "plugin_module.h"
 #include "run_transport.h"
+#include "worker_process.h"
 
 #include <huxerui/pluginkit/plugin.h>
 
@@ -50,7 +51,15 @@ ExecutionMode ParseMode(std::string_view mode, ErrorCode error) {
   throw Error(error, "Unknown plugin execution mode");
 }
 
-PackageInfo ParseManifest(const Json& manifest, std::string digest) {
+} // namespace
+
+namespace detail {
+
+struct ManifestParser {
+  static PackageInfo Parse(const Json& manifest, std::string digest);
+};
+
+PackageInfo ManifestParser::Parse(const Json& manifest, std::string digest) {
   try {
     if (!manifest.at("schema_version").is_number_integer() || manifest.at("schema_version") != 1 ||
         manifest.at("target") != PackageTarget) {
@@ -67,25 +76,23 @@ PackageInfo ParseManifest(const Json& manifest, std::string digest) {
     if (!extensions.is_array() || extensions.empty() || extensions.size() > HPK_MAX_EXTENSIONS) {
       throw Error(ErrorCode::InvalidPackage, "Invalid extension list");
     }
+    info.extensions.reserve(extensions.size());
+    // Factory order is independent for each point, even when points are interleaved in the manifest.
+    std::map<std::string, std::uint32_t, std::less<>> ordinals;
     for (const auto& extension : extensions) {
       if (!extension.is_object() || !extension.contains("point") ||
           extension.size() > (extension.contains("metadata") ? 2u : 1u)) {
         throw Error(ErrorCode::InvalidPackage, "An extension may contain only a point and optional metadata");
       }
-      PackageExtension entry{extension.at("point").get<std::string>(), {}};
+      auto point = extension.at("point").get<std::string>();
+      if (!IsId(point)) throw Error(ErrorCode::InvalidPackage, "Invalid extension point");
+      std::optional<std::string> metadata_json;
       if (const auto metadata = extension.find("metadata"); metadata != extension.end()) {
-        if (!metadata->is_object()) throw Error(ErrorCode::InvalidPackage, "Invalid extension metadata");
-        entry.file_extensions = metadata->value("extensions", std::vector<std::string>{});
+        if (!metadata->is_object()) throw Error(ErrorCode::InvalidPackage, "Extension metadata must be a JSON object");
+        metadata_json = metadata->dump();
       }
-      if (!IsId(entry.point) || entry.file_extensions.size() > 32) {
-        throw Error(ErrorCode::InvalidPackage, "Invalid extension point or metadata");
-      }
-      for (const auto& suffix : entry.file_extensions) {
-        if (!suffix.starts_with('.') || !IsId(std::string_view(suffix).substr(1))) {
-          throw Error(ErrorCode::InvalidPackage, "Invalid file suffix in the manifest");
-        }
-      }
-      info.extensions.push_back(std::move(entry));
+      const auto ordinal = ordinals[point]++;
+      info.extensions.push_back(ExtensionInfo(info.id, std::move(point), std::move(metadata_json), info.digest, ordinal));
     }
     const auto modes = manifest.at("execution_modes").get<std::vector<std::string>>();
     if (modes.empty() || modes.size() > 2) throw Error(ErrorCode::InvalidPackage, "Invalid execution mode list");
@@ -106,6 +113,10 @@ PackageInfo ParseManifest(const Json& manifest, std::string digest) {
   }
 }
 
+} // namespace detail
+
+namespace {
+
 struct Package {
   Bytes manifest_bytes;
   Bytes module_bytes;
@@ -123,7 +134,7 @@ Package ReadPackage(const fs::path& directory) {
   const auto digest = Sha256(AsBytes(Sha256(manifest_bytes) + Sha256(module_bytes)));
   try {
     auto manifest = ParseJson(manifest_bytes, MaxManifestDepth, ErrorCode::InvalidPackage);
-    auto info = ParseManifest(manifest, digest);
+    auto info = ManifestParser::Parse(manifest, digest);
     return {std::move(manifest_bytes), std::move(module_bytes), std::move(module_file), std::move(manifest), std::move(info)};
   } catch (const Json::exception& error) {
     throw Error(ErrorCode::InvalidPackage, "Cannot parse plugin.json: " + std::string(error.what()));
@@ -186,7 +197,7 @@ Installed ReadInstalled(const Json& entry) {
   const auto digest = entry.at("digest").get<std::string>();
   if (!IsDigest(digest)) throw Error(ErrorCode::Io, "Invalid package digest in the profile");
   auto manifest = entry.at("manifest");
-  auto info = ParseManifest(manifest, digest);
+  auto info = ManifestParser::Parse(manifest, digest);
   InstallOptions approval{ParseMode(entry.at("mode").get<std::string>(), ErrorCode::Io),
                           entry.at("services").get<std::vector<std::string>>()};
   auto data = entry.at("data").get<std::string>();
@@ -395,7 +406,10 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   std::vector<RegisteredService> ApprovedServices(const Installed& installed) const {
     std::vector<RegisteredService> approved;
     for (const auto& id : installed.approval.services) {
-      if (const auto service = services.find(id); service != services.end()) approved.push_back(service->second);
+      if (const auto service = services.find(id); service != services.end() &&
+          (installed.approval.mode == ExecutionMode::InProcess || service->second.dispatch)) {
+        approved.push_back(service->second);
+      }
     }
     return approved;
   }
@@ -405,9 +419,8 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   void StorePackage(const Package& package);
   PluginStartup Startup(const Installed& installed) const;
   std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed, PluginStartup startup);
-  std::shared_ptr<Worker> MakeWorker(const Package& package, std::vector<Worker::Service> granted,
+  std::shared_ptr<Worker> MakeWorker(const Package& package, std::vector<RegisteredService> granted,
                                      PluginStartup startup);
-  std::vector<Worker::Service> WorkerServices(const Installed& installed) const;
   std::vector<std::shared_ptr<Worker>> ActiveAndRetiredWorkers(std::string_view id) const;
   std::shared_ptr<Worker> StartWorker(const std::string& id, const std::stop_token& admission,
                                      Deadline deadline, std::stop_token stop);
@@ -688,7 +701,7 @@ void PluginManager::Impl::ValidatePackage(const PackageInfo& info, InstallOption
     throw Error(ErrorCode::UnsupportedMode, "The package or host cannot use the selected execution mode");
   }
   for (const auto& extension : info.extensions) {
-    (void)RequirePackagePoint(extension.point, options.mode);
+    (void)RequirePackagePoint(extension.Point(), options.mode);
   }
   if (options.mode == ExecutionMode::InProcess && info.cpp_abi != CppAbi) {
     throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
@@ -942,13 +955,13 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
   std::shared_ptr<LocalPlugin> local;
   std::exception_ptr failure;
   try {
-    std::vector<Worker::Service> granted;
+    std::vector<RegisteredService> granted;
     PluginStartup startup;
     {
       std::lock_guard lock(mutex);
       ValidatePackage(replacement->info, replacement->approval);
       if (replacement->enabled) startup = Startup(*replacement);
-      if (replacement->approval.mode == ExecutionMode::WorkerProcess) granted = WorkerServices(*replacement);
+      if (replacement->approval.mode == ExecutionMode::WorkerProcess) granted = ApprovedServices(*replacement);
     }
     co_await RetirePlugin(id);
     const auto prepare = [self = shared_from_this(), target = *replacement, source_data = DataDirectory(current_data),
@@ -1145,10 +1158,8 @@ std::vector<ExtensionInfo> PluginManager::List(std::string_view point, ContractI
   std::vector<ExtensionInfo> result;
   for (const auto& [id, plugin] : impl_->profile_state.plugins) {
     if ((plugin_id && id != *plugin_id) || !plugin.enabled || impl_->IsPluginBusy(id, plugin)) continue;
-    std::uint32_t ordinal = 0;
     for (const auto& extension : plugin.info.extensions) {
-      if (extension.point != point) continue;
-      result.push_back(ExtensionInfo(id, extension, plugin.info.digest, ordinal++));
+      if (extension.Point() == point) result.push_back(extension);
     }
   }
   return result;
@@ -1175,19 +1186,14 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
     throw Error(ErrorCode::Busy, "The plugin has a pending version change, restart, or uninstall");
   }
   const auto& extensions = installed.info.extensions;
-  if (candidate && candidate->point_ != point) {
+  if (candidate && candidate->Point() != point) {
     throw Error(ErrorCode::NotFound, "The candidate belongs to a different extension point");
   }
-  bool selected = false;
-  std::uint32_t ordinal = 0;
+  const ExtensionInfo* selected = nullptr;
   for (const auto& extension : extensions) {
-    if (extension.point != point) continue;
-    if (candidate && ordinal != candidate->ordinal_) {
-      ++ordinal;
-      continue;
-    }
+    if (extension.Point() != point || (candidate && extension.ordinal_ != candidate->ordinal_)) continue;
     if (selected) throw Error(ErrorCode::Ambiguous, "The plugin provides multiple factories at this extension point");
-    selected = true;
+    selected = &extension;
     if (candidate) break;
   }
   if (!selected) throw Error(ErrorCode::NotFound, "The plugin has no such factory at this extension point");
@@ -1199,14 +1205,14 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
     const auto admission = impl_->admissions.try_emplace(plugin->first).first->second.get_token();
     return MakeWorkerExtension([impl = impl_, id = plugin->first, admission](Deadline deadline, std::stop_token stop) {
       return impl->StartWorker(id, admission, deadline, stop);
-    }, timeout, admission, ExtensionPayload(point, ordinal));
+    }, timeout, admission, ExtensionPayload(point, selected->ordinal_));
   }
 
   const auto running = impl_->local_plugins.find(plugin_id);
   auto local = running == impl_->local_plugins.end() ? impl_->MakeLocal(installed, impl_->Startup(installed))
                                                      : running->second;
   if (running == impl_->local_plugins.end()) impl_->local_plugins.emplace(plugin->first, local);
-  return MakeLocalExtension(std::move(local), std::string(point), ordinal, timeout);
+  return MakeLocalExtension(std::move(local), std::string(point), selected->ordinal_, timeout);
 }
 
 std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& installed, PluginStartup startup) {
@@ -1246,26 +1252,18 @@ PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
   const auto& info = installed.info;
   const auto directory = PackageDirectory(info.digest);
   const auto data = DataDirectory(installed.data);
-  PluginStartup startup{info.id, info.version, info.digest, PathText(directory), PathText(data), {}};
+  PluginStartup startup{{info.id, info.version, info.digest}, PathText(directory), PathText(data), {}};
   startup.extensions.reserve(info.extensions.size());
   for (const auto& extension : info.extensions) {
     // The manifest selects the factory slot. The host supplies the contract the library must implement.
-    const auto& contract = RequirePackagePoint(extension.point, installed.approval.mode);
-    startup.extensions.push_back({extension.point, contract.id, contract.version, contract.fingerprint});
+    const auto& contract = RequirePackagePoint(extension.Point(), installed.approval.mode);
+    startup.extensions.push_back({extension.Point(), extension.ordinal_, contract.id, contract.version,
+                                  contract.fingerprint});
   }
   return startup;
 }
 
-std::vector<Worker::Service> PluginManager::Impl::WorkerServices(const Installed& installed) const {
-  std::vector<Worker::Service> granted;
-  for (auto& service : ApprovedServices(installed)) {
-    if (service.dispatch) granted.push_back({std::move(service.id), service.version, std::move(service.fingerprint),
-                                             std::move(service.dispatch)});
-  }
-  return granted;
-}
-
-std::shared_ptr<Worker> PluginManager::Impl::MakeWorker(const Package& package, std::vector<Worker::Service> granted,
+std::shared_ptr<Worker> PluginManager::Impl::MakeWorker(const Package& package, std::vector<RegisteredService> granted,
                                                         PluginStartup startup) {
   return std::make_shared<Worker>(*worker_executable, PackageDirectory(package.info.digest) / ModuleName,
       package.module_file, std::move(granted), callbacks, std::move(startup));
@@ -1293,7 +1291,7 @@ std::shared_ptr<Worker> PluginManager::Impl::StartWorker(const std::string& id, 
   if (std::chrono::steady_clock::now() >= deadline) {
     throw Error(ErrorCode::DeadlineExceeded, "The plugin call exceeded its deadline before starting the worker");
   }
-  auto worker = MakeWorker(package, WorkerServices(installed->second), Startup(installed->second));
+  auto worker = MakeWorker(package, ApprovedServices(installed->second), Startup(installed->second));
   workers.emplace(id, worker);
   return worker;
 }

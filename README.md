@@ -119,7 +119,7 @@ python examples/csv_import/verify.py $CsvHostExe $CsvPackageDir .\build\csv-plug
 
 The script installs two builds of the same CSV package in one profile, one per execution mode. It verifies ordered batch creation, ambiguous plugin ID lookup, candidate selection, and a round trip through the package's two importers and one exporter. It checks that the factories share a process and context, activate once, and are enabled or disabled together. It also moves the original package and verifies that a new host process can reuse the installed snapshot and grants. A changed host contract for the exporter rejects the whole factory table before activation, even when the first call targets an importer. The script checks requests above the IPC size limit, receiver lifetime, catalog queries during callbacks, cancellation, and worker recovery. On Linux and macOS it checks that the worker exits when the host is killed during a pending call.
 
-The upgrade fixture keeps the same plugin identifier and contracts and changes the release version. The script checks hot switching, restart switching, stale candidates, retained and deleted data, failures in activation and factory construction, interrupted validation, and cleanup after a commit.
+The script compares numeric and nested metadata in the `inspect` reply and in the candidate lists before and after a restart. It also distinguishes omitted metadata from an empty object. The upgrade fixture keeps the same plugin identifier and contracts and changes the release version. It covers hot switching, restart switching, stale candidates, retained and deleted data, failures in activation and factory construction, interrupted validation, and cleanup after a commit.
 
 ## SDK and runtime
 
@@ -146,8 +146,7 @@ plugins.InstallPackage(package, digest, {
 
 auto candidates = plugins.ListExtensions(Importers);
 auto selected = std::ranges::find_if(candidates, [](const auto& candidate) {
-    return candidate.plugin_id == "example.csv" &&
-        std::ranges::find(candidate.file_extensions, ".csv") != candidate.file_extensions.end();
+    return candidate.PluginId() == "example.csv" && MatchesSuffix(candidate, ".csv");
 });
 if (selected == candidates.end()) throw Error(ErrorCode::NotFound, "CSV importer unavailable");
 auto importer = plugins.CreateExtension(Importers, *selected);
@@ -160,6 +159,8 @@ auto exporter = plugins.CreateExtension(Exporters, "example.csv");
 ```
 
 Candidates refer to the approved package digest. Query again after upgrading. `CreateExtension(point, plugin_id)` reports `Ambiguous` when the plugin provides several factories for that point. `CreateExtensions` returns handles in plugin ID order and in manifest order within each package.
+
+`MatchesSuffix` is a CSV host function. It validates the example's `metadata.extensions` array and compares suffixes with ASCII case folding. [CSV host selection](examples/preview/src/csv_host.cpp)
 
 The handle releases the instance at scope exit. The first managed method starts the plugin and creates the instance. In-process calls invoke the real C++ object on the host's application thread with typed values. Worker calls encode values over IPC, and the worker calls the same implementation in a windowless Runtime. A synchronous IPC method blocks until it receives a result or reaches its deadline. It reports `Busy` if another business exchange is in progress and `CallbackUnavailable` if the method requests a host callback. Use Task methods for callbacks and work that needs to suspend.
 
@@ -193,7 +194,9 @@ The host passes a `std::shared_ptr<T>` as the receiver argument. The plugin call
 
 A directory package contains `plugin.json` and a platform-specific shared library. Use `plugin.dylib` for `macos-arm64`, `plugin.so` for `linux-x86_64-gnu`, and `plugin.dll` for `windows-x86_64-msvc`. The manifest lists `execution_modes` and carries the `cpp_abi` stamp for in-process packages. The SDK produced by the example publishes this stamp in `cpp-abi.txt`. Its digest is the SHA-256 of the concatenated lowercase hexadecimal SHA-256 digests of the raw manifest and library, in that order. The profile stores the approved snapshot, its mode, its service grants, and its enablement state.
 
-The top-level `extensions` array declares one entry per factory with a `point` and optional `metadata`. The CSV example uses `metadata.extensions` for file suffixes. Repeat a point to publish several implementations. Keep their order the same within that point in the manifest and `HPK_EXPORT_PLUGIN`. The relative order of different points can vary. [CSV manifest](examples/csv_import/plugin/plugin.json.in)
+The top-level `extensions` array declares one entry per factory with a `point` and an optional `metadata` JSON object. `InspectPackage().extensions` and `ListExtensions()` both return `ExtensionInfo` entries. Each entry exposes the plugin ID through `PluginId()`, the extension point through `Point()`, and the validated UTF-8 JSON object text through `metadata_json`. An omitted member yields `std::nullopt`. An empty object yields `"{}"`. The host parses the text with its chosen JSON library and defines its own metadata keys. An inspected entry can select the factory once that exact package is installed and enabled.
+
+Repeat a point to publish several implementations. Keep their order the same within that point in the manifest and `HPK_EXPORT_PLUGIN`. The relative order of different points can vary. [CSV manifest](examples/csv_import/plugin/plugin.json.in)
 
 The host obtains each expected contract from its registered `ExtensionPoint<T>`. The plugin's `BindExtension` puts the SDK's contract ID, version, and fingerprint into each factory entry in its library. Installation checks that all declared points are registered and support the selected mode. On first use, the loader checks every factory against its host registration before running `OnActivate`. Discovery uses the manifest, so a listed candidate can fail this check when its library loads.
 

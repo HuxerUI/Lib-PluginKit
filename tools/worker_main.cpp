@@ -193,9 +193,7 @@ private:
 
   void Activate(const PluginStartup& startup) {
     const auto& binding = LoadPluginModule(path_);
-    ValidatePluginDescriptor(binding, startup.extensions, HPK_WORKER_PROCESS);
-    PreparePluginData(startup);
-    activation_ = ActivatePlugin(binding, startup);
+    activation_ = ActivatePlugin(binding, startup, HPK_WORKER_PROCESS);
     binding_ = &binding;
   }
 

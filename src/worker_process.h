@@ -1,7 +1,7 @@
 #pragma once
 
+#include "extension.h"
 #include "platform_files.h"
-#include "transport.h"
 
 #include <huxerui/pluginkit.h>
 
@@ -16,15 +16,8 @@ namespace huxerui::pluginkit::detail {
 
 class Worker : public std::enable_shared_from_this<Worker> {
 public:
-  struct Service {
-    std::string id;
-    std::uint32_t version;
-    std::string fingerprint;
-    ServiceDispatch dispatch;
-  };
-
   Worker(const std::filesystem::path& executable, const std::filesystem::path& module_path,
-         const Handle& verified_module, std::vector<Service> services, TaskScope callbacks,
+         const Handle& verified_module, std::vector<RegisteredService> services, TaskScope callbacks,
          PluginStartup startup);
   ~Worker();
 
@@ -71,7 +64,7 @@ private:
   static void CheckExchange(Deadline deadline, std::stop_token stop);
   static Frame RejectSynchronousCallback(const Frame& frame);
 
-  const std::vector<Service> services_;
+  const std::vector<RegisteredService> services_;
   const TaskScope callbacks_;
   const PluginStartup startup_;
   bool activated_ = false;

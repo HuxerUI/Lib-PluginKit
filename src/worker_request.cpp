@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <limits>
-#include <map>
 
 namespace huxerui::pluginkit::detail {
 namespace {
@@ -119,7 +118,6 @@ void Worker::CheckExchange(Deadline deadline, std::stop_token stop) {
 Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_token stop,
                               const ReceiverRegistration* receiver) {
   const auto request = ReadServicePayload(frame.payload);
-  const auto service = std::ranges::find(services_, request.id, &Service::id);
   Frame reply{};
   try {
     const ContractInfo requested{request.id, request.version, request.fingerprint};
@@ -129,11 +127,7 @@ Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_t
       if (receiver->contract != requested) throw Error(ErrorCode::ContractMismatch, "Receiver contract does not match");
       dispatch = &receiver->dispatch;
     } else {
-      if (service == services_.end()) throw Error(ErrorCode::ServiceDenied, "Host service is not authorized for this package");
-      if (ContractInfo{service->id, service->version, service->fingerprint} != requested) {
-        throw Error(ErrorCode::ContractMismatch, "Host service contract does not match");
-      }
-      dispatch = &service->dispatch;
+      dispatch = &RequireHostService(services_, requested).dispatch;
     }
     std::stop_source callback;
     std::stop_callback stop_exchange(stop, [&] { callback.request_stop(); });
@@ -258,9 +252,8 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
 void Worker::ValidateFactories(std::stop_token stop) {
   Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, DefaultTimeout, nullptr, stop);
   // Exercise each factory on the candidate's activation before the manager commits the package.
-  std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
   for (const auto& extension : startup_.extensions) {
-    auto factory = ExtensionPayload(extension.point, ordinals[extension.point]++);
+    auto factory = ExtensionPayload(extension.point, extension.ordinal);
     const auto reply = Request({static_cast<std::uint32_t>(Command::Create), 0, 0, std::move(factory)},
                                DefaultTimeout, nullptr, stop);
     Request({static_cast<std::uint32_t>(Command::Close), reply.instance, 0, {}}, DefaultTimeout, nullptr, stop);

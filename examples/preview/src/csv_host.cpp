@@ -174,8 +174,8 @@ std::string ReadCsv(const File& path) {
 Json Describe(const PackageInfo& package) {
   auto extensions = Json::array();
   for (const auto& extension : package.extensions) {
-    auto entry = Json{{"point", extension.point}};
-    if (!extension.file_extensions.empty()) entry["metadata"] = {{"extensions", extension.file_extensions}};
+    auto entry = Json{{"point", extension.Point()}};
+    if (extension.metadata_json) entry["metadata"] = Json::parse(*extension.metadata_json);
     extensions.push_back(std::move(entry));
   }
   return {{"id", package.id}, {"version", package.version}, {"digest", package.digest},
@@ -195,23 +195,44 @@ Json List(PluginManager& manager) {
   const auto describe = [&manager](auto point) {
     auto result = Json::array();
     for (const auto& extension : manager.ListExtensions(point)) {
-      result.push_back({{"plugin", extension.plugin_id}, {"extensions", extension.file_extensions}});
+      auto entry = Json{{"plugin", extension.PluginId()}};
+      if (extension.metadata_json) entry["metadata"] = Json::parse(*extension.metadata_json);
+      result.push_back(std::move(entry));
     }
     return result;
   };
   return {{"plugins", std::move(plugins)}, {"importers", describe(Importers)}, {"exporters", describe(Exporters)}};
 }
 
+char LowercaseAscii(char character) {
+  if (character >= 'A' && character <= 'Z') return static_cast<char>(character - 'A' + 'a');
+  return character;
+}
+
+bool MatchesSuffix(const ExtensionInfo& candidate, std::string_view suffix) {
+  if (suffix.empty() || !candidate.metadata_json) return false;
+  const auto metadata = Json::parse(*candidate.metadata_json);
+  const auto extensions = metadata.find("extensions");
+  if (extensions == metadata.end() || !extensions->is_array() || extensions->size() > 32) return false;
+
+  // A malformed suffix list makes the candidate ineligible for file-based selection.
+  bool matches = false;
+  for (const auto& item : *extensions) {
+    const auto* value = item.get_ptr<const std::string*>();
+    if (!value || value->size() < 2 || !value->starts_with('.') ||
+        value->find_first_of("/\\") != std::string::npos || value->find('\0') != std::string::npos) return false;
+    if (std::ranges::equal(*value, suffix, {}, LowercaseAscii, LowercaseAscii)) matches = true;
+  }
+  return matches;
+}
+
 Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) {
   const File path(args[1]);
-  auto suffix = path.Extension();
-  for (auto& character : suffix) {
-    if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
-  }
+  const auto suffix = path.Extension();
   std::optional<ExtensionInfo> selected;
   for (const auto& extension : manager.ListExtensions(Importers)) {
-    if (args.size() >= 3 && extension.plugin_id != args[2]) continue;
-    if (std::ranges::find(extension.file_extensions, suffix) == extension.file_extensions.end()) continue;
+    if (args.size() >= 3 && extension.PluginId() != args[2]) continue;
+    if (!MatchesSuffix(extension, suffix)) continue;
     if (selected) throw Error(ErrorCode::Ambiguous, "Several importers match this file");
     selected = extension;
   }
@@ -260,7 +281,7 @@ Task<Json> RoundTrip(PluginManager& manager, const std::vector<std::string>& arg
   }
   const auto candidates = manager.ListExtensions(Importers);
   const auto candidate = std::ranges::find_if(candidates, [&](const auto& entry) {
-    return entry.plugin_id == plugin && std::ranges::find(entry.file_extensions, ".ssv") != entry.file_extensions.end();
+    return entry.PluginId() == plugin && MatchesSuffix(entry, ".ssv");
   });
   if (candidate == candidates.end()) throw Error(ErrorCode::NotFound, "No semicolon importer for this package");
   auto exporter = manager.CreateExtension(Exporters, plugin);
@@ -300,7 +321,7 @@ Task<Json> RoundTrip(PluginManager& manager, const std::vector<std::string>& arg
 
 Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
   for (const auto& extension : manager.ListExtensions(Importers)) {
-    if (extension.plugin_id != plugin) continue;
+    if (extension.PluginId() != plugin) continue;
     const auto tasks = UseApplicationTaskScope();
     auto importer = manager.CreateExtension(Importers, extension);
     auto first = std::make_shared<PreviewProgress>();
@@ -385,7 +406,7 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
 
 Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool disable) {
   for (const auto& extension : manager.ListExtensions(Importers)) {
-    if (extension.plugin_id != plugin) continue;
+    if (extension.PluginId() != plugin) continue;
     auto second = manager.CreateExtension(Importers, extension);
     const auto context = [](auto& importer) -> Task<std::vector<std::string>> {
       const csv_import::ImportRequest request{"context"};
@@ -434,6 +455,16 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
   auto manager = std::make_shared<PluginManager>(profile, std::nullopt, tasks);
   RegisterPoints(*manager);
   const auto info = PluginManager::InspectPackage(package);
+  const auto candidate = std::ranges::find_if(info.extensions, [](const ExtensionInfo& extension) {
+    return extension.Point() == Importers.id && MatchesSuffix(extension, ".ssv");
+  });
+  if (candidate == info.extensions.end()) throw Error(ErrorCode::NotFound, "No semicolon importer in the package");
+  try {
+    (void)manager->CreateExtension(Importers, *candidate);
+    throw Error(ErrorCode::PluginFailed, "Created an extension before its package was installed");
+  } catch (const Error& error) {
+    if (error.Code() != ErrorCode::NotFound) throw;
+  }
   try {
     manager->InstallPackage(package, info.digest);
     throw Error(ErrorCode::PluginFailed, "The in-process-only host installed a worker package");
@@ -442,7 +473,6 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
   }
   manager->InstallPackage(package, info.digest, {.mode = ExecutionMode::InProcess, .services = {}});
 
-  const auto candidate = manager->ListExtensions(Importers).front();
   for (int attempt = 0; attempt < 20; ++attempt) {
     struct Outcome {
       std::optional<ExtensionHandle<csv_import::TableImporter>> handle;
@@ -460,7 +490,7 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
       outcome->disabled = true;
     });
     // The second post lets the disable Task start before this call tries to create the first handle.
-    tasks.Post([tasks, manager, outcome, candidate] {
+    tasks.Post([tasks, manager, outcome, candidate = *candidate] {
       tasks.Post([manager, outcome, candidate] {
         try {
           outcome->handle.emplace(manager->CreateExtension(Importers, candidate));
@@ -487,7 +517,7 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
     }
     co_await manager->SetEnabled(info.id, true);
   }
-  auto importer = manager->CreateExtension(Importers, candidate);
+  auto importer = manager->CreateExtension(Importers, *candidate);
   const auto delimiter = importer->Delimiter();
   co_await manager->Shutdown();
   co_return Json{{"delimiter", delimiter}};
@@ -504,8 +534,11 @@ Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::str
   const auto package = PluginManager::InspectPackage(File(args[1]));
   const auto& id = package.id;
   const auto exporters = manager.ListExtensions(Exporters);
-  const auto candidate = std::ranges::find(exporters, id, &ExtensionInfo::plugin_id);
-  if (candidate == exporters.end()) throw Error(ErrorCode::NotFound, "The upgrade fixture has no exporter");
+  const auto candidate = std::ranges::find(exporters, id, &ExtensionInfo::PluginId);
+  const auto replacement = std::ranges::find(package.extensions, Exporters.id, &ExtensionInfo::Point);
+  if (candidate == exporters.end() || replacement == package.extensions.end()) {
+    throw Error(ErrorCode::NotFound, "The upgrade fixture has no exporter");
+  }
   auto previous = manager.CreateExtension(Importers, id);
   auto previous_exporter = manager.CreateExtension(Exporters, *candidate);
   auto pending = manager.CreateExtension(Importers, id);
@@ -532,7 +565,7 @@ Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::str
     if (error.Code() != ErrorCode::PackageChanged) throw;
   }
   auto next = manager.CreateExtension(Importers, id);
-  auto exporter = manager.CreateExtension(Exporters, id);
+  auto exporter = manager.CreateExtension(Exporters, *replacement);
   const auto new_pid = next->ProcessId();
   if (exporter->ProcessId() != new_pid) throw Error(ErrorCode::PluginFailed, "Expected one replacement worker");
   co_return Json{{"old_pid", old_pid}, {"new_pid", new_pid}};

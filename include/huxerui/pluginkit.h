@@ -16,6 +16,7 @@
 #include <memory>
 #include <optional>
 #include <stop_token>
+#include <string>
 
 namespace huxerui::pluginkit {
 
@@ -79,12 +80,41 @@ enum class UninstallStatus {
   CleanupPending,
 };
 
-/// @brief Manifest metadata for one factory provided by a package.
-struct PackageExtension {
-  /// Extension point registered by the host.
-  std::string point;
-  /// Advertised file suffixes, including their leading dots.
-  std::vector<std::string> file_extensions;
+namespace detail {
+struct ManifestParser;
+}
+
+/// @brief Describes one factory declared by a specific package snapshot.
+///
+/// Package inspection and catalog queries return this information before activation. The entry can select
+/// the factory once its exact package snapshot is installed and enabled.
+/// @see PluginManager::InspectPackage(), PluginManager::ListExtensions(), PluginManager::CreateExtension()
+class ExtensionInfo {
+public:
+  /// @brief Returns the identifier of the declaring package.
+  /// @return Reference valid for the lifetime of this entry.
+  const std::string& PluginId() const noexcept { return plugin_id_; }
+
+  /// @brief Returns the name of the extension point implemented by this factory.
+  /// @return Reference valid for the lifetime of this entry.
+  const std::string& Point() const noexcept { return point_; }
+
+  /// Validated UTF-8 JSON object text. Formatting can differ from the manifest.
+  /// An omitted metadata field yields std::nullopt. An empty object yields "{}". The host interprets the object.
+  std::optional<std::string> metadata_json;
+
+private:
+  friend class PluginManager;
+  friend struct detail::ManifestParser;
+  ExtensionInfo(std::string_view plugin_id, std::string point, std::optional<std::string> metadata,
+                std::string_view digest, std::uint32_t ordinal)
+      : metadata_json(std::move(metadata)), plugin_id_(plugin_id), point_(std::move(point)), digest_(digest),
+        ordinal_(ordinal) {}
+
+  std::string plugin_id_;
+  std::string point_;
+  std::string digest_;
+  std::uint32_t ordinal_;
 };
 
 /// @brief Metadata from a directory package and the digest of its exact contents.
@@ -99,7 +129,7 @@ struct PackageInfo {
   /// Package digest to present for approval and pass to InstallPackage().
   std::string digest;
   /// Factories in manifest order, up to HPK_MAX_EXTENSIONS. Several factories may implement the same point.
-  std::vector<PackageExtension> extensions;
+  std::vector<ExtensionInfo> extensions;
   /// Execution modes advertised by the package for this target. InstallPackage() approves one of them.
   std::vector<ExecutionMode> execution_modes;
   /// Shared SDK and C++ build identity checked for in-process execution. Ignored for worker execution.
@@ -118,28 +148,6 @@ struct PluginInfo {
   std::optional<std::uint32_t> worker_pid;
   /// Approved replacement waiting for a new host process, if any.
   std::optional<PackageInfo> pending_upgrade;
-};
-
-/// @brief Candidate returned by PluginManager::ListExtensions() for one approved factory.
-///
-/// The candidate identifies a factory in a specific package snapshot and extension point. Query again
-/// after a package upgrade to select from the replacement's factories.
-struct ExtensionInfo {
-  /// Plugin identifier from the installed package.
-  std::string plugin_id;
-  /// Advertised file suffixes, including their leading dots.
-  std::vector<std::string> file_extensions;
-
-private:
-  friend class PluginManager;
-  ExtensionInfo(std::string_view plugin, const PackageExtension& extension, std::string_view digest,
-                std::uint32_t ordinal)
-      : plugin_id(plugin), file_extensions(extension.file_extensions), point_(extension.point), digest_(digest),
-        ordinal_(ordinal) {}
-
-  std::string point_;
-  std::string digest_;
-  std::uint32_t ordinal_;
 };
 
 /// @brief Move-only owner of one extension instance in the package's approved execution mode.
@@ -381,8 +389,8 @@ public:
 
   /// @brief Lists candidates declared at a registered extension point without activating packages.
   ///
-  /// Discovery uses the manifest. The loader checks the complete factory table against the host contracts
-  /// when the package is first used.
+  /// Discovery returns the optional JSON text of each candidate's metadata. The loader checks the complete
+  /// factory table against the host contracts when the package is first used.
   /// @tparam Interface Published interface with a Contract specialization.
   /// @param point Previously registered extension point.
   /// @return Candidates in plugin identifier order and manifest order within each available package.
@@ -393,7 +401,7 @@ public:
     return List(point.id, Contract<Interface>::Info);
   }
 
-  /// @brief Synchronously creates a handle to a candidate from ListExtensions().
+  /// @brief Synchronously creates a handle to a factory declared by the installed package snapshot.
   ///
   /// With generated bindings, instance creation is deferred until the first synchronous method call or
   /// until the first Task method is awaited. For an unmarked in-process interface, this function creates
@@ -401,7 +409,7 @@ public:
   /// Before activation, the loader checks every exported factory against the registered extension points.
   /// @tparam Interface Interface with contract metadata.
   /// @param point Previously registered extension point.
-  /// @param candidate Factory selected from the point's current candidates.
+  /// @param candidate Factory selected from package inspection or a catalog query for this point.
   /// @param timeout Time budget for each managed call, from 1 ms through 24 hours, including time in the queue.
   /// An unmarked in-process interface runs under the caller's ordinary C++ lifetime and timing rules.
   /// @return A move-only handle exposing Interface through operator->.
@@ -412,7 +420,7 @@ public:
   template<class Interface>
   ExtensionHandle<Interface> CreateExtension(ExtensionPoint<Interface> point, const ExtensionInfo& candidate,
                                              std::chrono::milliseconds timeout = DefaultTimeout) {
-    return ExtensionHandle<Interface>(Create(point.id, Contract<Interface>::Info, candidate.plugin_id,
+    return ExtensionHandle<Interface>(Create(point.id, Contract<Interface>::Info, candidate.PluginId(),
                                              &candidate, timeout));
   }
 

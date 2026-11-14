@@ -1,6 +1,8 @@
 #pragma once
 
-#include "worker_process.h"
+#include "transport.h"
+
+#include <huxerui/pluginkit/detail/extension.h>
 
 namespace huxerui::pluginkit::detail {
 
@@ -12,7 +14,11 @@ struct RegisteredService {
   ServiceDispatch dispatch;
 };
 
+// Looks up a granted service and checks its complete contract before either invocation path uses it.
+const RegisteredService& RequireHostService(std::span<const RegisteredService> services, ContractInfo contract);
+
 class LocalPlugin;
+class Worker;
 
 std::shared_ptr<LocalPlugin> CreateLocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load,
                                                PluginStartup startup, std::vector<RegisteredService> services);

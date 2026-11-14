@@ -56,7 +56,7 @@ The Kit ABI and protocol, application contract version, and plugin release versi
 | `PluginInfo` | A catalog snapshot containing the installed package, any pending upgrade, enabled state, and execution status. |
 | `Contract` | The versioned callable schema derived from an interface. |
 | `ExtensionPoint<T>` | A named application extension point for a contract. Several points can use the same interface with different metadata and selection rules. |
-| `ExtensionInfo` | A candidate for one factory, tied to an extension point and approved package digest. Available before activation. |
+| `ExtensionInfo` | A factory declaration tied to an extension point and a package digest, returned by both package inspection and discovery. |
 | `ExtensionHandle<T>` | A typed, revocable handle to an opened extension instance. |
 | `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, and writable data directory. |
 | `Task<T>` | Lazy operation whose coroutine runs on its owning thread. |
@@ -74,7 +74,7 @@ The application owns one `huxerui::pluginkit::PluginManager` for each plugin pro
 | Settings | `GetSettings(plugin_id)`, `SetSettingsAsync(plugin_id, values)` | Read a snapshot and validate or persist changes against the plugin settings schema. |
 | Observability | `SubscribeEvents()`, `Diagnostics()` | Report catalog revisions, state transitions, operation progress, and structured failures. Subscription handles release their callbacks. |
 
-`ListExtensions` returns candidates with their plugin ID and advertised file suffixes. The host can pick a candidate and pass it to `CreateExtension`. A plugin ID selects a factory when it is the only one at that point and yields `Ambiguous` when several match. `CreateExtensions` returns one handle per available factory, ordered by plugin ID and then by declaration order within each package. Disabled packages disappear from extension discovery while their package records remain visible. After an upgrade, a candidate for the old digest yields `PackageChanged`.
+`ListExtensions` returns candidates with their plugin ID and optional JSON object text in `metadata_json`. The host can parse the text using its own metadata conventions to pick a candidate and pass it to `CreateExtension`. A plugin ID selects a factory when it is the only one at that point and yields `Ambiguous` when several match. `CreateExtensions` returns one handle per available factory, ordered by plugin ID and then by declaration order within each package. Disabled packages disappear from extension discovery while their package records remain visible. After an upgrade, a candidate for the old digest yields `PackageChanged`.
 
 `ExtensionHandle<DocumentImporter>` exposes the published interface through `operator->`. The host calls `importer->Format()` or awaits `importer->Import(request)` using the original signatures. Scope exit releases the handle and retires the instance after active work leaves it.
 
@@ -106,7 +106,9 @@ The CSV example publishes two importers and one exporter in the same package.
 }
 ```
 
-Each factory matches the export table by point and zero-based declaration order within that point. The manifest may interleave points differently from the export table. Optional metadata lets the host select an implementation without starting it. At installation the manager checks that every point is registered and supports the selected mode. Before running `OnActivate`, the loader checks the full table of declared factories against the plugin's exports and compares each exported contract ID, version, and fingerprint with the host point's registered contract. The SDK generates this identity for remote interfaces.
+The manifest parser assigns each factory a zero-based ordinal within its point. Discovery, instance creation, and factory validation use the same point and ordinal. The manifest may interleave points differently from the export table. A host can select an inspected entry once the exact package is installed and enabled. Optional metadata must be a JSON object. Package inspection and candidate discovery expose its UTF-8 JSON text and preserve its values after the profile is reopened. An omitted object yields no text. An empty object yields `"{}"`. The host parses the text and defines the meanings of its keys, such as the CSV preview's file suffix array.
+
+At installation the manager checks that every point is registered and supports the selected mode. Before running `OnActivate`, the loader checks the full table of declared factories against the plugin's exports and compares each exported contract ID, version, and fingerprint with the host point's registered contract. The SDK generates this identity for remote interfaces.
 
 The planned `hpk pack` tool adds generated schema fingerprints and a signed inventory for the published artifact. Each selected target resolves to a verified entry inside the package. Published content is immutable for a release and target. The manager checks file sizes before installing content into its managed store.
 

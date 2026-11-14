@@ -227,8 +227,10 @@ def verify_mixed(host, package, worker_csv, faults, scratch, sample, valid):
             assert round_trip["plugin_pid"] == plugin(live, plugin_id)["worker_pid"] != pid["pid"], live
         assert disabled["ok"] and enabled["ok"] and plugin(hidden, plugin_id)["worker_pid"] is None, hidden
         assert all(item["plugin"] != plugin_id for point in ("importers", "exporters") for item in hidden[point]), hidden
-        assert [item["extensions"] for item in visible["importers"] if item["plugin"] == plugin_id] == [[".csv"], [".ssv"]]
-        assert [item["extensions"] for item in visible["exporters"] if item["plugin"] == plugin_id] == [[".csv"]]
+        assert [item["metadata"]["extensions"] for item in visible["importers"] if item["plugin"] == plugin_id] == [
+            [".csv"], [".ssv"],
+        ]
+        assert [item["metadata"]["extensions"] for item in visible["exporters"] if item["plugin"] == plugin_id] == [[".csv"]]
         assert log.read_text().splitlines() == previous + ["activate", "deactivate"]
 
     assert run(host, profile, "import", sample, local_id)["table"] == local["table"]
@@ -267,6 +269,13 @@ def verify_factory_table(host, package, scratch, valid):
         check_error(run(host, profile, "inspect", source), "invalid_package")
         del record[field]
 
+    valid_metadata = exporter["metadata"]
+    for invalid_metadata in (None, [], "csv", 5):
+        exporter["metadata"] = invalid_metadata
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        check_error(run(host, profile, "inspect", source), "invalid_package")
+    exporter["metadata"] = valid_metadata
+
     point = exporter["point"]
     exporter["point"] = "example.unregistered"
     path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -284,23 +293,50 @@ def verify_factory_table(host, package, scratch, valid):
         assert not (installed_data(profile, package_info["id"]) / "lifecycle.log").exists()
 
 
-def verify_reopened_profile(host, package, scratch, sample):
+def verify_reopened_profile(host, package, worker_csv, scratch, sample):
     sample_ssv = sample.with_suffix(".ssv")
+    empty_exporter_package = scratch / "empty exporter metadata"
+    shutil.copytree(worker_csv, empty_exporter_package)
+    empty_manifest_path = empty_exporter_package / "plugin.json"
+    empty_manifest = json.loads(empty_manifest_path.read_text(encoding="utf-8"))
+    empty_manifest["extensions"][-1]["metadata"] = {}
+    empty_manifest_path.write_text(json.dumps(empty_manifest), encoding="utf-8")
+    csv_metadata = {
+        "extensions": [".CSV"],
+        "priority": 2**64 - 1,
+        "options": {"dialect": {"delimiter": ",", "strict": True}, "weights": [-2, 0.25, None], "locale": "中文"},
+    }
     for mode in ("in_process", "worker_process"):
         source = scratch / f"original package {mode}"
         shutil.copytree(package, source)
         path = source / "plugin.json"
         manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["extensions"][0]["metadata"] = csv_metadata
         del manifest["extensions"][-1]["metadata"]
+        # Interleave the points while keeping the two importers in their exported order.
+        manifest["extensions"][1], manifest["extensions"][2] = manifest["extensions"][2], manifest["extensions"][1]
         path.write_text(json.dumps(manifest), encoding="utf-8")
         profile = scratch / f"reopened {mode}"
         info = run(host, profile, "inspect", source)
         assert info["extensions"] == manifest["extensions"], info
         plugin_id = info["id"]
-        installed, imported, status = run(host, profile, commands=[
-            ("install", source, info["digest"], mode, "status"), ("import", sample, plugin_id), ("status",),
+        empty = run(host, profile, "inspect", empty_exporter_package)
+        assert empty["extensions"] == empty_manifest["extensions"], empty
+        empty_id = empty["id"]
+        expected_importers = [
+            {"plugin": plugin_id, "metadata": entry["metadata"]} for entry in manifest["extensions"][::2]
+        ] + [
+            {"plugin": empty_id, "metadata": entry["metadata"]} for entry in empty_manifest["extensions"][:2]
+        ]
+        expected_exporters = [{"plugin": plugin_id}, {"plugin": empty_id, "metadata": {}}]
+        installed, installed_empty, listed, imported, status = run(host, profile, commands=[
+            ("install", source, info["digest"], mode, "status"),
+            ("install", empty_exporter_package, empty["digest"], mode, "status"), ("list",),
+            ("import", sample, plugin_id), ("status",),
         ])
-        assert installed["ok"] and imported["ok"] and status["last_imported_rows"] == 2, (installed, imported, status)
+        assert installed["ok"] and installed_empty["ok"], (installed, installed_empty)
+        assert imported["ok"] and status["last_imported_rows"] == 2, (imported, status)
+        assert listed["importers"] == expected_importers and listed["exporters"] == expected_exporters, listed
         log = installed_data(profile, plugin_id) / "lifecycle.log"
         lifecycle = ["activate", "deactivate"]
         assert log.read_text().splitlines() == lifecycle
@@ -316,8 +352,39 @@ def verify_reopened_profile(host, package, scratch, sample):
         ])
         entry = plugin(listed, plugin_id)
         assert entry["enabled"] and entry["digest"] == info["digest"] and entry["mode"] == mode, entry
+        assert entry["extensions"] == manifest["extensions"], entry
+        assert plugin(listed, empty_id)["extensions"] == empty_manifest["extensions"], listed
+        assert listed["importers"] == expected_importers and listed["exporters"] == expected_exporters, listed
         assert round_trip["ok"] and round_trip["package_importers"] == 2 and round_trip["format"] == "csv", round_trip
         assert status["last_imported_rows"] == 2 and log.read_text().splitlines() == lifecycle * 2, status
+
+
+def verify_suffix_metadata(host, package, scratch, sample):
+    source = scratch / "CSV suffix metadata"
+    shutil.copytree(package, source)
+    path = source / "plugin.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    manifest["extensions"][0]["metadata"] = {"extensions": [".csv", 42]}
+    manifest["extensions"][1]["metadata"] = {"extensions": {"label": "semicolon"}, "priority": 0}
+    manifest["extensions"][-1]["metadata"] = {}
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    profile = scratch / "CSV suffix policy"
+    info = run(host, profile, "inspect", source)
+    assert info["ok"] and info["extensions"] == manifest["extensions"], info
+    plugin_id = info["id"]
+    installed, listed, csv, ssv = run(host, profile, commands=[
+        ("install", source, info["digest"], "worker_process", "status"), ("list",),
+        ("import", sample, plugin_id), ("import", sample.with_suffix(".ssv"), plugin_id),
+    ])
+    assert installed["ok"], installed
+    assert [entry["metadata"] for entry in listed["importers"]] == [
+        entry["metadata"] for entry in manifest["extensions"][:2]
+    ], listed
+    assert listed["exporters"] == [{"plugin": plugin_id, "metadata": {}}], listed
+    assert plugin(listed, plugin_id)["worker_pid"] is None, listed
+    check_error(csv, "not_found")
+    check_error(ssv, "not_found")
+    assert not (installed_data(profile, plugin_id) / "lifecycle.log").exists()
 
 
 def verify_local_lifetime(host, faults, digest, fault_id, scratch, valid):
@@ -727,10 +794,11 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
 
     verify_mixed(host, package, worker_csv, faults, scratch, sample, valid)
     verify_factory_table(host, package, scratch, valid)
-    verify_reopened_profile(host, package, scratch, sample)
+    verify_reopened_profile(host, package, worker_csv, scratch, sample)
+    verify_suffix_metadata(host, package, scratch, sample)
     verify_local_lifetime(host, faults, fault_digest, fault_id, scratch, valid)
     assert run(host, scratch / "in-process-only profile", "check-disable-during-create", package) == {
-        "ok": True, "delimiter": ",",
+        "ok": True, "delimiter": ";",
     }
     verify_upgrade(host, package, faults, replacement, scratch, valid)
     verify_uninstall(host, faults, replacement, scratch, valid)
