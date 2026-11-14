@@ -3,14 +3,29 @@
 #include "exporters/export_contract.bindings.h"
 #include "process_id.h"
 
+#include <csv_resources_resources.h>
 #include <huxerui/pluginkit/plugin.h>
 
+#include <charconv>
 #include <stdexcept>
 
 namespace csv_import::fixture {
 
 inline const huxerui::pluginkit::PluginContext* active_context = nullptr;
 inline std::uint32_t live_exporters = 0;
+
+inline std::uint32_t ReadCellLimit(const huxerui::RawAsset& asset) {
+  const auto text = asset.ReadString();
+  std::string_view value_text(text);
+  while (!value_text.empty() && (value_text.back() == '\r' || value_text.back() == '\n')) value_text.remove_suffix(1);
+  std::uint32_t value = 0;
+  const auto end = value_text.data() + value_text.size();
+  const auto parsed = std::from_chars(value_text.data(), end, value);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !value) {
+    throw std::runtime_error("Invalid CSV cell limit resource");
+  }
+  return value;
+}
 
 inline void Record(const huxerui::pluginkit::PluginContext& context, std::string_view event) {
   if (!context.DataDirectory().Child("lifecycle.log").AppendString(std::string(event) + '\n')) {

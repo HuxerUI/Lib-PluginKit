@@ -117,28 +117,88 @@ PackageInfo ManifestParser::Parse(const Json& manifest, std::string digest) {
 
 namespace {
 
+void RequireManagedDirectory(const fs::path& directory, ErrorCode code = ErrorCode::Io) {
+  // Keep package and data operations inside their directory trees.
+  const auto status = fs::symlink_status(directory);
+  if (status.type() == fs::file_type::not_found) return;
+  if (!fs::is_directory(status)) throw Error(code, "Expected a directory at " + PathText(directory));
+#if defined(_WIN32)
+  const auto attributes = GetFileAttributesW(directory.c_str());
+  if (attributes == INVALID_FILE_ATTRIBUTES) WindowsError(ErrorCode::Io, "Cannot inspect a managed directory");
+  if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+    throw Error(code, "A managed directory cannot redirect outside the package or profile");
+  }
+#endif
+}
+
+// Validate each directory before descending, since a Windows junction can appear as a directory.
+std::vector<fs::path> ResourceFiles(const fs::path& directory) {
+  const auto resources = directory / "resources";
+  std::vector<fs::path> files;
+  if (fs::symlink_status(resources).type() == fs::file_type::not_found) return files;
+  RequireManagedDirectory(resources, ErrorCode::InvalidPackage);
+  for (const auto& entry : fs::recursive_directory_iterator(resources)) {
+    const auto status = entry.symlink_status();
+    if (fs::is_directory(status)) {
+      RequireManagedDirectory(entry.path(), ErrorCode::InvalidPackage);
+      continue;
+    }
+    if (!fs::is_regular_file(status)) {
+      throw Error(ErrorCode::InvalidPackage, "Unsupported entry in plugin resources: " + PathText(entry.path()));
+    }
+    files.push_back(entry.path().lexically_relative(directory));
+  }
+  if (std::ranges::find(files, fs::path("resources/huxerui/resources.bin")) == files.end()) {
+    throw Error(ErrorCode::InvalidPackage, "The plugin resource directory has no HuxerUI index");
+  }
+  return files;
+}
+
 struct Package {
   Bytes manifest_bytes;
   Bytes module_bytes;
   Handle module_file;
   Json manifest;
   PackageInfo info;
+  fs::path directory;
+  std::vector<fs::path> resources;
 };
 
-Package ReadPackage(const fs::path& directory) {
+Package ReadPackage(const fs::path& directory) try {
   auto manifest_bytes = ReadFileBytes(directory / "plugin.json", MaxManifest);
   auto module_file = OpenRegularFile(directory / ModuleName);
   auto module_bytes = ReadFileBytes(module_file.get(), MaxModule);
   if (module_bytes.empty()) throw Error(ErrorCode::InvalidPackage, std::string(ModuleName) + " is empty");
-  // Approval covers the exact manifest and library bytes, including manifest formatting.
-  const auto digest = Sha256(AsBytes(Sha256(manifest_bytes) + Sha256(module_bytes)));
-  try {
-    auto manifest = ParseJson(manifest_bytes, MaxManifestDepth, ErrorCode::InvalidPackage);
-    auto info = ManifestParser::Parse(manifest, digest);
-    return {std::move(manifest_bytes), std::move(module_bytes), std::move(module_file), std::move(manifest), std::move(info)};
-  } catch (const Json::exception& error) {
-    throw Error(ErrorCode::InvalidPackage, "Cannot parse plugin.json: " + std::string(error.what()));
+  auto resources = ResourceFiles(directory);
+  std::map<std::string, std::string> hashes;
+  hashes.emplace("plugin.json", Sha256(manifest_bytes));
+  hashes.emplace(ModuleName, Sha256(module_bytes));
+  for (const auto& relative : resources) {
+    const auto name = relative.generic_u8string();
+    const std::string path(name.begin(), name.end());
+    if (!IsUtf8(path) || path.find_first_of("\\:") != std::string::npos) {
+      throw Error(ErrorCode::InvalidPackage, "Invalid UTF-8 resource path in the plugin package");
+    }
+    hashes.emplace(path, Sha256File(directory / relative));
   }
+
+  // Hash the exact bytes and UTF-8 paths in order, independent of directory enumeration order.
+  const auto digest = ComputeSha256([&](const auto& update) {
+    // Each record has a NUL-terminated path followed by the fixed-width hash of the exact file bytes.
+    for (const auto& [path, hash] : hashes) {
+      update(AsBytes(path));
+      update(AsBytes(std::string_view("\0", 1)));
+      update(AsBytes(hash));
+    }
+  });
+  auto manifest = ParseJson(manifest_bytes, MaxManifestDepth, ErrorCode::InvalidPackage);
+  auto info = ManifestParser::Parse(manifest, digest);
+  return {std::move(manifest_bytes), std::move(module_bytes), std::move(module_file), std::move(manifest),
+          std::move(info), directory, std::move(resources)};
+} catch (const Json::exception& error) {
+  throw Error(ErrorCode::InvalidPackage, "Cannot parse plugin.json: " + std::string(error.what()));
+} catch (const fs::filesystem_error& error) {
+  throw Error(ErrorCode::Io, "Cannot read plugin package: " + std::string(error.what()));
 }
 
 struct Installed {
@@ -177,20 +237,6 @@ bool IsManagedDataName(std::string_view name) {
   if (!name.starts_with("plugin-") || suffix == std::string_view::npos || suffix <= 7) return false;
   const auto id = name.substr(7, suffix - 7);
   return IsId(id) && IsDataName(id, name);
-}
-
-void RequireManagedDirectory(const fs::path& directory) {
-  // Keep package and data operations inside the profile, including when deleting an abandoned snapshot.
-  const auto status = fs::symlink_status(directory);
-  if (status.type() == fs::file_type::not_found) return;
-  if (!fs::is_directory(status)) throw Error(ErrorCode::Io, "Expected a managed directory at " + PathText(directory));
-#if defined(_WIN32)
-  const auto attributes = GetFileAttributesW(directory.c_str());
-  if (attributes == INVALID_FILE_ATTRIBUTES) WindowsError(ErrorCode::Io, "Cannot inspect a managed directory");
-  if (attributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-    throw Error(ErrorCode::Io, "A managed directory cannot redirect outside the profile");
-  }
-#endif
 }
 
 Installed ReadInstalled(const Json& entry) {
@@ -414,9 +460,9 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
     return approved;
   }
 
-  Package VerifyPackage(const Installed& installed) const;
   void ValidatePackage(const PackageInfo& info, InstallOptions& approval) const;
   void StorePackage(const Package& package);
+  Package VerifyPackage(const Installed& installed) const;
   PluginStartup Startup(const Installed& installed) const;
   std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed, PluginStartup startup);
   std::shared_ptr<Worker> MakeWorker(const Package& package, std::vector<RegisteredService> granted,
@@ -428,9 +474,9 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   void ChangeWorkerEnabled(const std::string& id, bool enabled, std::stop_token stop);
   Task<void> SetEnabled(std::string id, bool enabled);
   Task<UpgradeStatus> Upgrade(File directory, UpgradeApproval approval);
+  Task<UpgradeStatus> ApplyUpgrade(std::string id, std::optional<Package> source, UpgradeApproval approval = {});
   Task<UninstallStatus> Uninstall(std::string id, std::string expected_digest, PluginDataPolicy data);
   Task<std::vector<PendingChangeResult>> ApplyPending();
-  Task<UpgradeStatus> ApplyUpgrade(std::string id, std::optional<Package> source, UpgradeApproval approval = {});
   Task<void> RetirePlugin(const std::string& id);
   void CleanupFiles();
   bool IsPluginBusy(std::string_view id, const Installed& installed) const;
@@ -548,6 +594,7 @@ void PluginManager::Impl::CleanupFiles() {
   // A mapped library may still be referenced by C++ code. Its directory can be cleaned in a later process.
   RemoveUnusedDirectories(profile / "packages", packages,
       [&](const fs::path& path, std::string_view name) {
+        if (name.starts_with("staging-") && IsDigest(name.substr(8))) return true;
         return IsDigest(name) && !retired_workers.contains(name) && !IsInProcessModuleMapped(path / ModuleName);
       });
   auto remaining = profile_state.discarded_data;
@@ -677,11 +724,6 @@ void PluginManager::Register(std::string_view point, ContractInfo contract, bool
   }
 }
 
-PackageInfo PluginManager::InspectPackage(const File& directory) {
-  RejectServiceReentry();
-  return ReadPackage(NativePath(directory)).info;
-}
-
 void PluginManager::Provide(ContractInfo contract, std::shared_ptr<void> implementation, ServiceDispatch dispatch) {
   RejectServiceReentry();
   if (!implementation || !IsId(contract.id) || !contract.version || !IsDigest(contract.fingerprint)) {
@@ -695,46 +737,9 @@ void PluginManager::Provide(ContractInfo contract, std::shared_ptr<void> impleme
   }
 }
 
-void PluginManager::Impl::ValidatePackage(const PackageInfo& info, InstallOptions& options) const {
-  if (std::ranges::find(info.execution_modes, options.mode) == info.execution_modes.end() ||
-      (options.mode == ExecutionMode::WorkerProcess && !worker_executable)) {
-    throw Error(ErrorCode::UnsupportedMode, "The package or host cannot use the selected execution mode");
-  }
-  for (const auto& extension : info.extensions) {
-    (void)RequirePackagePoint(extension.Point(), options.mode);
-  }
-  if (options.mode == ExecutionMode::InProcess && info.cpp_abi != CppAbi) {
-    throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
-  }
-  std::ranges::sort(options.services);
-  if (options.services.size() > 64 || std::ranges::adjacent_find(options.services) != options.services.end() ||
-      !std::ranges::all_of(options.services, [](const auto& service) { return IsId(service); })) {
-    throw Error(ErrorCode::InvalidArgument, "Invalid approved service list");
-  }
-  for (const auto& service : options.services) {
-    const auto found = services.find(service);
-    if (found == services.end() || (options.mode == ExecutionMode::WorkerProcess && !found->second.dispatch)) {
-      throw Error(ErrorCode::InvalidArgument, "The approved service is unavailable in the selected mode: " + service);
-    }
-  }
-}
-
-void PluginManager::Impl::StorePackage(const Package& package) {
-  const auto destination = PackageDirectory(package.info.digest);
-  RequireManagedDirectory(destination.parent_path());
-  RequireManagedDirectory(destination);
-  try {
-    if (ReadPackage(destination).info.digest == package.info.digest) return;
-  } catch (const Error&) {
-    // Restore the approved bytes if a previous write left an incomplete snapshot.
-  }
-  if (IsInProcessModuleMapped(destination / ModuleName)) {
-    throw Error(ErrorCode::Busy, "Restart the host before replacing a mapped plugin library");
-  }
-  fs::create_directories(destination);
-  // Both files must be in place before the profile can reference the package.
-  WriteAtomicFile(destination / "plugin.json", package.manifest_bytes);
-  WriteAtomicFile(destination / ModuleName, package.module_bytes);
+PackageInfo PluginManager::InspectPackage(const File& directory) {
+  RejectServiceReentry();
+  return ReadPackage(NativePath(directory)).info;
 }
 
 void PluginManager::InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options) {
@@ -788,23 +793,81 @@ void PluginManager::InstallPackage(const File& directory, std::string_view appro
   }
 }
 
-Task<UpgradeStatus> PluginManager::UpgradePackage(File directory, UpgradeApproval approval) {
-  return RunManagement<UpgradeStatus>(impl_, [directory = std::move(directory), approval = std::move(approval)]
-                                       (Impl& impl) mutable {
-    return impl.Upgrade(std::move(directory), std::move(approval));
-  });
+void PluginManager::Impl::ValidatePackage(const PackageInfo& info, InstallOptions& options) const {
+  if (std::ranges::find(info.execution_modes, options.mode) == info.execution_modes.end() ||
+      (options.mode == ExecutionMode::WorkerProcess && !worker_executable)) {
+    throw Error(ErrorCode::UnsupportedMode, "The package or host cannot use the selected execution mode");
+  }
+  for (const auto& extension : info.extensions) {
+    (void)RequirePackagePoint(extension.Point(), options.mode);
+  }
+  if (options.mode == ExecutionMode::InProcess && info.cpp_abi != CppAbi) {
+    throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
+  }
+  std::ranges::sort(options.services);
+  if (options.services.size() > 64 || std::ranges::adjacent_find(options.services) != options.services.end() ||
+      !std::ranges::all_of(options.services, [](const auto& service) { return IsId(service); })) {
+    throw Error(ErrorCode::InvalidArgument, "Invalid approved service list");
+  }
+  for (const auto& service : options.services) {
+    const auto found = services.find(service);
+    if (found == services.end() || (options.mode == ExecutionMode::WorkerProcess && !found->second.dispatch)) {
+      throw Error(ErrorCode::InvalidArgument, "The approved service is unavailable in the selected mode: " + service);
+    }
+  }
 }
 
-Task<UninstallStatus> PluginManager::UninstallPackage(std::string_view id, std::string_view expected_digest,
-                                                      PluginDataPolicy data) {
-  return RunManagement<UninstallStatus>(impl_, [id = std::string(id), digest = std::string(expected_digest), data]
-                                         (Impl& impl) mutable {
-    return impl.Uninstall(std::move(id), std::move(digest), data);
-  });
+void PluginManager::Impl::StorePackage(const Package& package) try {
+  const auto destination = PackageDirectory(package.info.digest);
+  RequireManagedDirectory(destination.parent_path());
+  RequireManagedDirectory(destination);
+  try {
+    if (ReadPackage(destination).info.digest == package.info.digest) return;
+  } catch (const Error&) {
+    // Restore the approved bytes if a previous write left an incomplete snapshot.
+  }
+  if (IsInProcessModuleMapped(destination / ModuleName)) {
+    throw Error(ErrorCode::Busy, "Restart the host before replacing a mapped plugin library");
+  }
+  fs::create_directories(destination.parent_path());
+  const auto staged = destination.parent_path() / ("staging-" + NewToken());
+  if (!fs::create_directory(staged)) throw Error(ErrorCode::Io, "Cannot create the package staging directory");
+  try {
+    WriteAtomicFile(staged / "plugin.json", package.manifest_bytes);
+    WriteAtomicFile(staged / ModuleName, package.module_bytes);
+    for (const auto& relative : package.resources) {
+      const auto output = staged / relative;
+      fs::create_directories(output.parent_path());
+      CopyRegularFile(package.directory / relative, output);
+    }
+    // Approve the staged bytes that will be installed, including resources copied after inspection.
+    if (ReadPackage(staged).info.digest != package.info.digest) {
+      throw Error(ErrorCode::ApprovalMismatch, "The package contents changed while staging the approved snapshot");
+    }
+    fs::remove_all(destination);
+    fs::rename(staged, destination);
+  } catch (...) {
+    std::error_code removal;
+    fs::remove_all(staged, removal);
+    throw;
+  }
+} catch (const fs::filesystem_error& error) {
+  throw Error(ErrorCode::Io, "Cannot store plugin package: " + std::string(error.what()));
 }
 
-Task<std::vector<PendingChangeResult>> PluginManager::ApplyPendingChanges() {
-  return RunManagement<std::vector<PendingChangeResult>>(impl_, [](Impl& impl) { return impl.ApplyPending(); });
+Package PluginManager::Impl::VerifyPackage(const Installed& installed) const {
+  try {
+    const auto directory = PackageDirectory(installed.info.digest);
+    RequireManagedDirectory(directory.parent_path());
+    RequireManagedDirectory(directory);
+    auto package = ReadPackage(directory);
+    if (package.info.digest == installed.info.digest) return package;
+  } catch (const Error& error) {
+    throw Error(ErrorCode::PackageChanged, "Cannot verify the installed package: " + std::string(error.what()));
+  } catch (const fs::filesystem_error& error) {
+    throw Error(ErrorCode::PackageChanged, "Cannot verify the installed package: " + std::string(error.what()));
+  }
+  throw Error(ErrorCode::PackageChanged, "The installed package differs from the approved package");
 }
 
 std::vector<std::shared_ptr<Worker>> PluginManager::Impl::ActiveAndRetiredWorkers(std::string_view id) const {
@@ -846,45 +909,11 @@ Task<void> PluginManager::Impl::RetirePlugin(const std::string& id) {
   std::erase_if(retired_workers, [&](const auto& entry) { return entry.second.id == id; });
 }
 
-Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string expected_digest,
-                                                    PluginDataPolicy data) {
-  if (data != PluginDataPolicy::Keep && data != PluginDataPolicy::Delete) {
-    throw Error(ErrorCode::InvalidArgument, "Invalid plugin data policy");
-  }
-  std::optional<Change> change;
-  {
-    std::lock_guard lock(mutex);
-    const auto& current = RequireInstalled(id);
-    if (current.info.digest != expected_digest) throw Error(ErrorCode::ApprovalMismatch, "The installed digest changed");
-    change.emplace(*this, id);
-  }
-  co_await RetirePlugin(id);
-  std::lock_guard lock(mutex);
-  (void)RequireInstalled(id);
-  auto next = profile_state;
-  const auto current = next.plugins.extract(id);
-  const auto pending = next.upgrades.extract(id);
-  const auto package_path = PackageDirectory(current.mapped().info.digest);
-  const auto data_path = DataDirectory(current.mapped().data);
-  fs::path pending_package;
-  fs::path pending_data;
-  if (!pending.empty()) pending_package = PackageDirectory(pending.mapped().target.info.digest);
-  if (!pending.empty() && pending.mapped().applying) {
-    next.discarded_data.insert(pending.mapped().target.data);
-    pending_data = DataDirectory(pending.mapped().target.data);
-  }
-  if (data == PluginDataPolicy::Keep) next.retained_data.emplace(id, current.mapped().data);
-  else next.discarded_data.insert(current.mapped().data);
-  Commit(std::move(next));
-  CleanupFilesAfterCommit();
-  std::error_code error;
-  const auto remains = [&](const fs::path& path) {
-    const auto status = fs::symlink_status(path, error);
-    return status.type() != fs::file_type::not_found;
-  };
-  const auto cleanup_pending = remains(package_path) || (!pending_package.empty() && remains(pending_package)) ||
-      (!pending_data.empty() && remains(pending_data)) || (data == PluginDataPolicy::Delete && remains(data_path));
-  co_return cleanup_pending ? UninstallStatus::CleanupPending : UninstallStatus::Removed;
+Task<UpgradeStatus> PluginManager::UpgradePackage(File directory, UpgradeApproval approval) {
+  return RunManagement<UpgradeStatus>(impl_, [directory = std::move(directory), approval = std::move(approval)]
+                                       (Impl& impl) mutable {
+    return impl.Upgrade(std::move(directory), std::move(approval));
+  });
 }
 
 Task<UpgradeStatus> PluginManager::Impl::Upgrade(File directory, UpgradeApproval approval) {
@@ -1030,6 +1059,59 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     CleanupFilesAfterCommit();
   }
   std::rethrow_exception(failure);
+}
+
+Task<UninstallStatus> PluginManager::UninstallPackage(std::string_view id, std::string_view expected_digest,
+                                                      PluginDataPolicy data) {
+  return RunManagement<UninstallStatus>(impl_, [id = std::string(id), digest = std::string(expected_digest), data]
+                                         (Impl& impl) mutable {
+    return impl.Uninstall(std::move(id), std::move(digest), data);
+  });
+}
+
+Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string expected_digest,
+                                                    PluginDataPolicy data) {
+  if (data != PluginDataPolicy::Keep && data != PluginDataPolicy::Delete) {
+    throw Error(ErrorCode::InvalidArgument, "Invalid plugin data policy");
+  }
+  std::optional<Change> change;
+  {
+    std::lock_guard lock(mutex);
+    const auto& current = RequireInstalled(id);
+    if (current.info.digest != expected_digest) throw Error(ErrorCode::ApprovalMismatch, "The installed digest changed");
+    change.emplace(*this, id);
+  }
+  co_await RetirePlugin(id);
+  std::lock_guard lock(mutex);
+  (void)RequireInstalled(id);
+  auto next = profile_state;
+  const auto current = next.plugins.extract(id);
+  const auto pending = next.upgrades.extract(id);
+  const auto package_path = PackageDirectory(current.mapped().info.digest);
+  const auto data_path = DataDirectory(current.mapped().data);
+  fs::path pending_package;
+  fs::path pending_data;
+  if (!pending.empty()) pending_package = PackageDirectory(pending.mapped().target.info.digest);
+  if (!pending.empty() && pending.mapped().applying) {
+    next.discarded_data.insert(pending.mapped().target.data);
+    pending_data = DataDirectory(pending.mapped().target.data);
+  }
+  if (data == PluginDataPolicy::Keep) next.retained_data.emplace(id, current.mapped().data);
+  else next.discarded_data.insert(current.mapped().data);
+  Commit(std::move(next));
+  CleanupFilesAfterCommit();
+  std::error_code error;
+  const auto remains = [&](const fs::path& path) {
+    const auto status = fs::symlink_status(path, error);
+    return status.type() != fs::file_type::not_found;
+  };
+  const auto cleanup_pending = remains(package_path) || (!pending_package.empty() && remains(pending_package)) ||
+      (!pending_data.empty() && remains(pending_data)) || (data == PluginDataPolicy::Delete && remains(data_path));
+  co_return cleanup_pending ? UninstallStatus::CleanupPending : UninstallStatus::Removed;
+}
+
+Task<std::vector<PendingChangeResult>> PluginManager::ApplyPendingChanges() {
+  return RunManagement<std::vector<PendingChangeResult>>(impl_, [](Impl& impl) { return impl.ApplyPending(); });
 }
 
 Task<std::vector<PendingChangeResult>> PluginManager::Impl::ApplyPending() {
@@ -1233,19 +1315,6 @@ std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& ins
     }
     return *binding;
   }, std::move(startup), ApprovedServices(installed));
-}
-
-Package PluginManager::Impl::VerifyPackage(const Installed& installed) const {
-  try {
-    const auto directory = PackageDirectory(installed.info.digest);
-    RequireManagedDirectory(directory.parent_path());
-    RequireManagedDirectory(directory);
-    auto package = ReadPackage(directory);
-    if (package.info.digest == installed.info.digest) return package;
-  } catch (const Error& error) {
-    throw Error(ErrorCode::PackageChanged, "Cannot verify the installed package: " + std::string(error.what()));
-  }
-  throw Error(ErrorCode::PackageChanged, "The installed package differs from the approved package");
 }
 
 PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {

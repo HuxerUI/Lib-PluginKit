@@ -48,6 +48,15 @@ inline Handle OpenRegularFile(const std::filesystem::path& path, int flags = O_R
   return file;
 }
 
+inline std::size_t ReadFileChunk(int file, std::span<std::byte> bytes) {
+  ssize_t count;
+  do {
+    count = ::read(file, bytes.data(), bytes.size());
+  } while (count < 0 && errno == EINTR);
+  if (count < 0) PosixError(ErrorCode::Io, "Cannot read file");
+  return static_cast<std::size_t>(count);
+}
+
 inline Bytes ReadFileBytes(int file, std::size_t limit) {
   struct stat status {};
   if (::fstat(file, &status) != 0) PosixError(ErrorCode::Io, "Cannot read file size");
@@ -58,11 +67,9 @@ inline Bytes ReadFileBytes(int file, std::size_t limit) {
   Bytes bytes(static_cast<std::size_t>(status.st_size));
   std::span remaining(bytes);
   while (!remaining.empty()) {
-    const auto count = ::read(file, remaining.data(), remaining.size());
-    if (count < 0 && errno == EINTR) continue;
-    if (count < 0) PosixError(ErrorCode::Io, "Cannot read file");
+    const auto count = ReadFileChunk(file, remaining);
     if (!count) throw Error(ErrorCode::Io, "Unexpected end of file");
-    remaining = remaining.subspan(static_cast<std::size_t>(count));
+    remaining = remaining.subspan(count);
   }
   return bytes;
 }
@@ -90,21 +97,28 @@ inline bool SyncFile(int file) {
   return result == 0;
 }
 
+template<class Feed>
+void WriteFileContents(const std::filesystem::path& path, Feed feed, bool exclusive) {
+  const auto file = OpenRegularFile(path, O_WRONLY | O_CREAT | (exclusive ? O_EXCL : O_TRUNC));
+  feed([&](std::span<const std::byte> bytes) {
+    while (!bytes.empty()) {
+      const auto count = ::write(file.get(), bytes.data(), bytes.size());
+      if (count < 0 && errno == EINTR) continue;
+      if (count < 0) PosixError(ErrorCode::Io, "Cannot write staged file");
+      if (!count) throw Error(ErrorCode::Io, "Zero bytes written to staged file");
+      bytes = bytes.subspan(static_cast<std::size_t>(count));
+    }
+  });
+  if (!SyncFile(file.get())) PosixError(ErrorCode::Io, "Cannot flush staged file");
+}
+
 inline void WriteAtomicFile(const std::filesystem::path& path, std::span<const std::byte> bytes) {
   const auto parent = path.has_parent_path() ? path.parent_path() : std::filesystem::path(".");
   Handle directory(::open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC));
   if (!directory) PosixError(ErrorCode::Io, "Cannot open staging directory");
   auto staged = path;
   staged += ".tmp";
-  auto file = OpenRegularFile(staged, O_WRONLY | O_CREAT | O_TRUNC);
-  while (!bytes.empty()) {
-    const auto count = ::write(file.get(), bytes.data(), bytes.size());
-    if (count < 0 && errno == EINTR) continue;
-    if (count < 0) PosixError(ErrorCode::Io, "Cannot write staged file");
-    if (!count) throw Error(ErrorCode::Io, "Zero bytes written to staged file");
-    bytes = bytes.subspan(static_cast<std::size_t>(count));
-  }
-  if (!SyncFile(file.get())) PosixError(ErrorCode::Io, "Cannot flush staged file");
+  WriteFileContents(staged, [&](const auto& write) { write(bytes); }, false);
   if (::rename(staged.c_str(), path.c_str()) != 0) PosixError(ErrorCode::Io, "Cannot commit staged file");
   // The rename is the commit point for the in-memory catalog.
   SyncFile(directory.get());

@@ -7,14 +7,16 @@
 /// factories with HPK_EXPORT_PLUGIN. In-process plugins use the host's HuxerUI application. Worker plugins run
 /// in a separate windowless HuxerUI application.
 
-#include <huxerui/file.h>
 #include <huxerui/app.h>
+#include <huxerui/file.h>
 #include <huxerui/pluginkit/detail/extension.h>
+#include <huxerui/resource.h>
 
 #include <algorithm>
 #include <array>
 #include <concepts>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -61,14 +63,23 @@ public:
   /// @return Reference valid for the lifetime of this context.
   const File& DataDirectory() const noexcept { return data_; }
 
+  /// @brief Returns the HuxerUI resource package shared by this activation's hooks and instances.
+  /// @return Reference valid through OnDeactivate(). Uncached raw assets need a live resource resolver.
+  /// @throws Error With NotFound if the plugin package has no resources directory.
+  const huxerui::Resources& Resources() const {
+    if (!resources_) throw Error(ErrorCode::NotFound, "The plugin has no HuxerUI resource package");
+    return *resources_;
+  }
+
 private:
   friend struct detail::PluginContextAccess;
-  PluginContext(PluginIdentity info, File bundle, File data)
-      : info_(std::move(info)), bundle_(std::move(bundle)), data_(std::move(data)) {}
+  PluginContext(PluginIdentity info, File bundle, File data, std::optional<huxerui::Resources> resources)
+      : info_(std::move(info)), bundle_(std::move(bundle)), data_(std::move(data)), resources_(std::move(resources)) {}
 
   PluginIdentity info_;
   File bundle_;
   File data_;
+  std::optional<huxerui::Resources> resources_;
 };
 
 /// @brief Synchronously obtains a typed handle for a host service.
@@ -156,9 +167,19 @@ inline const void* RuntimeIdentity() noexcept {
 
 struct PluginContextAccess {
   static std::unique_ptr<PluginContext> Create(const hpk_plugin_context_v1& context) {
+    File bundle(context.bundle_directory);
+    const auto directory = bundle.Child("resources");
+    const auto status = directory.Stat();
+    std::optional<Resources> resources;
+    if (status.Succeeded()) {
+      // Both execution modes create the same context before invoking the plugin's activation hook.
+      resources.emplace(Resources::OpenPackage(directory));
+    } else if (status.Error().code != IoErrorCode::NotFound) {
+      throw Error(ErrorCode::Io, status.Error().message);
+    }
     return std::unique_ptr<PluginContext>(new PluginContext(
         {context.id, context.version, context.digest},
-        File(context.bundle_directory), File(context.data_directory)));
+        std::move(bundle), File(context.data_directory), std::move(resources)));
   }
 };
 

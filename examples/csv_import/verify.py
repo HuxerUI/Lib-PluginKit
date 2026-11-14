@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import os
 import select
@@ -42,6 +43,12 @@ def check_error(reply, code):
 
 def plugin(listing, plugin_id):
     return next(item for item in listing["plugins"] if item["id"] == plugin_id)
+
+
+def installed_data(profile, plugin_id):
+    state = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
+    record = next(entry for entry in state["plugins"] if entry["manifest"]["id"] == plugin_id)
+    return profile / "data" / record["data"]
 
 
 def verify_default_profile(host, scratch):
@@ -156,14 +163,14 @@ def verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch, 
         ("list",),
     ])
     expected = [fault_id, "0.1.0", fault_digest, (profile / "packages" / fault_digest).as_posix(), data.as_posix()]
-    assert contexts["ok"] and contexts["first"] == contexts["second"] == expected + ["2", "2"], contexts
-    assert contexts["after_close"] == expected + ["2", "1"], contexts
+    assert contexts["ok"] and contexts["first"] == contexts["second"] == expected + ["2", "2", "200000"], contexts
+    assert contexts["after_close"] == expected + ["2", "1", "200000"], contexts
     disabled = plugin(inactive, fault_id)
     assert not disabled["enabled"] and disabled["worker_pid"] is None, inactive
     assert log.read_text().splitlines() == ["activate", "deactivate"]
 
     enabled, contexts = run(host, profile, commands=[("enable", fault_id), ("check-plugin-context", fault_id)])
-    assert enabled["ok"] and contexts["first"] == expected + ["2", "2"], contexts
+    assert enabled["ok"] and contexts["first"] == expected + ["2", "2", "200000"], contexts
     assert log.read_text().splitlines() == ["activate", "deactivate"] * 2
 
 
@@ -359,6 +366,47 @@ def verify_reopened_profile(host, package, worker_csv, scratch, sample):
         assert status["last_imported_rows"] == 2 and log.read_text().splitlines() == lifecycle * 2, status
 
 
+def verify_package_resources(host, package, scratch, sample, module_name):
+    source = scratch / "resource package"
+    shutil.copytree(package, source)
+    profile = scratch / "resource profile"
+    payload = next((source / "resources").rglob("cell-limit.txt"))
+    relative = payload.relative_to(source)
+    info = run(host, profile, "inspect", source)
+    files = [source / "plugin.json", source / module_name]
+    files.extend(path for path in (source / "resources").rglob("*") if path.is_file())
+    expected = hashlib.sha256()
+    for path in sorted(files, key=lambda path: path.relative_to(source).as_posix().encode("utf-8")):
+        expected.update(path.relative_to(source).as_posix().encode("utf-8") + b"\0")
+        expected.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+    assert info["digest"] == expected.hexdigest(), info
+
+    original = payload.read_bytes()
+    payload.write_bytes(b"40\n")
+    check_error(run(host, profile, "install", source, info["digest"], "worker_process", "status"), "approval_mismatch")
+    changed = run(host, profile, "inspect", source)
+    assert changed["digest"] != info["digest"], changed
+    payload.write_bytes(original)
+    payload.rename(payload.with_suffix(".renamed"))
+    renamed = run(host, profile, "inspect", source)
+    assert renamed["digest"] not in (changed["digest"], info["digest"]), renamed
+    payload.with_suffix(".renamed").rename(payload)
+
+    for mode in ("in_process", "worker_process"):
+        profile = scratch / f"modified resources {mode}"
+        assert run(host, profile, "install", source, info["digest"], mode, "status")["ok"]
+        installed = profile / "packages" / info["digest"] / relative
+        installed.write_bytes(b"40\n")
+        check_error(run(host, profile, "import", sample, info["id"]), "package_changed")
+        installed.unlink()
+        check_error(run(host, profile, "import", sample, info["id"]), "package_changed")
+        abandoned = profile / "packages" / ("staging-" + "0" * 64)
+        abandoned.mkdir()
+        assert run(host, profile, "install", source, info["digest"], mode, "status")["ok"]
+        assert installed.read_bytes() == original and not abandoned.exists()
+        assert run(host, profile, "import", sample, info["id"])["table"] is not None
+
+
 def verify_suffix_metadata(host, package, scratch, sample):
     source = scratch / "CSV suffix metadata"
     shutil.copytree(package, source)
@@ -415,12 +463,6 @@ def verify_local_lifetime(host, faults, digest, fault_id, scratch, valid):
     assert enabled["ok"] and recovered["ok"], (enabled, recovered)
 
 
-def installed_data(profile, plugin_id):
-    state = json.loads((profile / "profile.json").read_text(encoding="utf-8"))
-    record = next(entry for entry in state["plugins"] if entry["manifest"]["id"] == plugin_id)
-    return profile / "data" / record["data"]
-
-
 @contextmanager
 def defer_data_cleanup(directory):
     if sys.platform == "win32":
@@ -452,11 +494,11 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     for failure in ("fail-upgrade", "fail-exporter"):
         failed = data / failure
         failed.touch()
-        broken, unchanged, imported = run(host, profile, commands=[
-            ("upgrade", replacement, old, new), ("list",), ("import", valid, plugin_id),
+        broken, unchanged, context = run(host, profile, commands=[
+            ("upgrade", replacement, old, new), ("list",), ("check-plugin-context", plugin_id),
         ])
         check_error(broken, "plugin_failed")
-        assert plugin(unchanged, plugin_id)["digest"] == old and imported["ok"], (unchanged, imported)
+        assert plugin(unchanged, plugin_id)["digest"] == old and context["first"][-1] == "200000", (unchanged, context)
         assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
         assert not (profile / "packages" / new).exists()
         failed.unlink()
@@ -470,6 +512,7 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     assert changed["ok"] and changed["old_pid"] != changed["new_pid"], changed
     assert before["ok"] and after["ok"] and before["plugin_pid"] == after["plugin_pid"], (before, after)
     assert context["first"][1:3] == ["0.2.0", new], context
+    assert context["first"][-1] == "300000", context
     check_error(denied, "service_denied")
     migrated = installed_data(profile, plugin_id)
     assert migrated != data and not data.exists() and not (profile / "packages" / old).exists()
@@ -488,6 +531,7 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     (data / "last-write.txt").write_text("before restart", encoding="utf-8")
     context = run(host, local, "check-plugin-context", plugin_id)
     assert context["first"][1:3] == ["0.2.0", new], context
+    assert context["first"][-1] == "300000", context
     migrated = installed_data(local, plugin_id)
     assert (migrated / "last-write.txt").read_text() == "before restart"
     assert (migrated / "data-format").read_text() == "2" and not data.exists()
@@ -505,6 +549,7 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     assert (data / "data-format").read_text() == "1"
     recovered = run(host, rejected, "check-plugin-context", plugin_id)
     assert recovered["first"][1:3] == ["0.1.0", old], recovered
+    assert recovered["first"][-1] == "200000", recovered
     assert not (rejected / "packages" / new).exists()
 
     disabled = scratch / "disabled upgrade"
@@ -603,8 +648,11 @@ def verify_interrupted_upgrade(host, faults, replacement, scratch):
         assert entry["digest"] == old and entry["pending_upgrade"] is None, recovered
         assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
         assert not (profile / "packages" / new).exists()
-        imported, status = run(host, profile, commands=[("import", status_request, plugin_id), ("status",)])
+        imported, status, context = run(host, profile, commands=[
+            ("import", status_request, plugin_id), ("status",), ("check-plugin-context", plugin_id),
+        ])
         assert imported["ok"] and status["last_imported_rows"] == 41, (imported, status)
+        assert context["first"][-1] == "200000", context
         flag.unlink()
 
     profile = scratch / "committed upgrade"
@@ -795,6 +843,7 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
     verify_mixed(host, package, worker_csv, faults, scratch, sample, valid)
     verify_factory_table(host, package, scratch, valid)
     verify_reopened_profile(host, package, worker_csv, scratch, sample)
+    verify_package_resources(host, package, scratch, sample, module_name)
     verify_suffix_metadata(host, package, scratch, sample)
     verify_local_lifetime(host, faults, fault_digest, fault_id, scratch, valid)
     assert run(host, scratch / "in-process-only profile", "check-disable-during-create", package) == {

@@ -34,7 +34,7 @@ if (NOT cpp_abi MATCHES "^[0-9A-Za-z.+:=_-]+$")
     message(FATAL_ERROR "The published CSV SDK has an invalid C++ ABI stamp")
 endif ()
 
-function(add_csv_package target source plugin_id plugin_version)
+function(add_csv_package target source plugin_id plugin_version resource_root)
     add_library(${target} SHARED "${source}")
     target_include_directories(${target} PRIVATE "${CSV_IMPORT_SDK}")
     target_compile_features(${target} PRIVATE cxx_std_20)
@@ -50,14 +50,14 @@ function(add_csv_package target source plugin_id plugin_version)
         target_compile_options(${target} PRIVATE /W4 /permissive- /utf-8)
         target_compile_definitions(${target} PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
         set_target_properties(${target} PROPERTIES
-            RUNTIME_OUTPUT_DIRECTORY "${package_dir}"
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modules/${target}/$<CONFIG>"
             ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/imports/${target}/$<CONFIG>"
         )
     else ()
         target_link_libraries(${target} PRIVATE Threads::Threads)
         set_target_properties(${target} PROPERTIES
             CXX_VISIBILITY_PRESET hidden
-            LIBRARY_OUTPUT_DIRECTORY "${package_dir}"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/modules/${target}/$<CONFIG>"
         )
     endif ()
     set(secondary_importer "")
@@ -67,14 +67,32 @@ function(add_csv_package target source plugin_id plugin_version)
     set(manifest "${CMAKE_CURRENT_BINARY_DIR}/${target}.json")
     configure_file(plugin.json.in "${manifest}" @ONLY)
     file(GENERATE OUTPUT "${package_dir}/plugin.json" INPUT "${manifest}")
+
+    huxerui_add_resources(${target} ROOT "${resource_root}" NAMESPACE csv_resources)
+    get_target_property(resource_package ${target} HUXERUI_RESOURCE_PACKAGE)
+    set(resource_index "${resource_package}/huxerui/resources.bin")
+    set(staged_index "${package_dir}/resources/huxerui/resources.bin")
+    set(staged_module "${package_dir}/plugin${CMAKE_SHARED_LIBRARY_SUFFIX}")
+    add_custom_command(OUTPUT "${staged_index}"
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${package_dir}/resources"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${resource_package}" "${package_dir}/resources"
+        DEPENDS "${resource_index}"
+        VERBATIM
+    )
+    add_custom_command(OUTPUT "${staged_module}"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:${target}>" "${staged_module}"
+        DEPENDS ${target} "${staged_index}"
+        VERBATIM
+    )
+    add_custom_target(${target}-package ALL DEPENDS "${staged_module}")
 endfunction()
 
-add_csv_package(csv-importer csv_importer.cpp example.csv 0.1.0)
+add_csv_package(csv-importer csv_importer.cpp example.csv 0.1.0 resources)
 
 option(CSV_IMPORT_TEST_FIXTURES "Build the extra packages used by the CSV verification" OFF)
 if (CSV_IMPORT_TEST_FIXTURES)
-    add_csv_package(csv-importer-worker csv_importer.cpp example.csv-worker 0.1.0)
-    add_csv_package(csv-faults faults.cpp example.csv-faults 0.1.0)
-    add_csv_package(csv-faults-upgrade faults.cpp example.csv-faults 0.2.0)
+    add_csv_package(csv-importer-worker csv_importer.cpp example.csv-worker 0.1.0 resources)
+    add_csv_package(csv-faults faults.cpp example.csv-faults 0.1.0 resources)
+    add_csv_package(csv-faults-upgrade faults.cpp example.csv-faults 0.2.0 upgrade_resources)
     target_compile_definitions(csv-faults-upgrade PRIVATE CSV_IMPORT_UPGRADE)
 endif ()

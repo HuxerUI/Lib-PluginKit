@@ -58,7 +58,7 @@ The Kit ABI and protocol, application contract version, and plugin release versi
 | `ExtensionPoint<T>` | A named application extension point for a contract. Several points can use the same interface with different metadata and selection rules. |
 | `ExtensionInfo` | A factory declaration tied to an extension point and a package digest, returned by both package inspection and discovery. |
 | `ExtensionHandle<T>` | A typed, revocable handle to an opened extension instance. |
-| `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, and writable data directory. |
+| `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, optional HuxerUI resources, and writable data directory. |
 | `Task<T>` | Lazy operation whose coroutine runs on its owning thread. |
 | `Receiver<T>` | Typed proxy for a caller-owned callback interface, scoped to one invocation. |
 
@@ -80,13 +80,15 @@ The application owns one `huxerui::pluginkit::PluginManager` for each plugin pro
 
 A package activation owns a single `PluginContext` for all factories and their instances. The SDK passes it by const reference to optional `OnActivate` and `OnDeactivate` hooks and to each extension implementation that accepts it in its constructor. `OnActivate` runs once after validating the complete factory table and before the first instance is created. Orderly teardown destroys the instances before calling `OnDeactivate`. The bundle directory identifies the approved snapshot and the writable data directory is selected by the committed profile. Both are exposed as `huxerui::File`.
 
+The activation opens the installed `resources/` directory once with `huxerui::Resources::OpenPackage()`, before `OnActivate()`. `PluginContext::Resources()` exposes this independent package in both execution modes. Its owner survives through `OnDeactivate()`. Resource indices, keys, lazy payload reads, and resolved asset lifetimes follow the HuxerUI SDK.
+
 The host records service grants and execution mode with the approved package digest. During a call, `GetService<T>()` synchronously returns a typed handle. The service implementation resolves the grant from the invocation. The caller supplies a `Receiver<T>` as a shared C++ callback argument, with access scoped to that invocation. See the [CSV example](../README.md#sdk-and-runtime).
 
-The broader lifecycle design includes settings, read-only bundle resources, logging, and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
+The broader lifecycle design includes settings, logging, and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
 
 ## Packages, discovery, and resolution
 
-A local directory package contains `plugin.json` and one library for the selected target. The manifest identifies the plugin and release, available execution modes, C++ ABI identity, and extension factories. The broader package design includes publisher signatures, target variants, file inventories, dependencies, requested capabilities, and settings schemas.
+A local directory package contains `plugin.json`, one library for the selected target, and optionally the HuxerUI resource compiler's output under `resources/`. The manifest identifies the plugin and release, available execution modes, C++ ABI identity, and extension factories. The manager enumerates the resource files and hashes their relative paths and exact contents alongside the manifest and library. Installation verifies those files in a staging directory before publishing the approved snapshot. Archive extraction belongs to the caller. The broader package design includes publisher signatures, target variants, dependencies, requested capabilities, and settings schemas.
 
 The CSV example publishes two importers and one exporter in the same package.
 
@@ -110,7 +112,7 @@ The manifest parser assigns each factory a zero-based ordinal within its point. 
 
 At installation the manager checks that every point is registered and supports the selected mode. Before running `OnActivate`, the loader checks the full table of declared factories against the plugin's exports and compares each exported contract ID, version, and fingerprint with the host point's registered contract. The SDK generates this identity for remote interfaces.
 
-The planned `hpk pack` tool adds generated schema fingerprints and a signed inventory for the published artifact. Each selected target resolves to a verified entry inside the package. Published content is immutable for a release and target. The manager checks file sizes before installing content into its managed store.
+Published content is immutable for a release and target. The manager checks manifest and library sizes before installing content into its managed store. The planned `hpk pack` tool supports target selection and publisher signatures.
 
 Discovery reads manifests from explicit local sources and configured repositories. Package selection checks the operating system, architecture, artifact ABI, supported contracts, execution policy, and permissions before activation. The loader checks the plugin descriptor against the verified package. A contribution can advertise a command or file type before its implementation runs.
 
@@ -155,7 +157,7 @@ The broader management design can use `PlanChangesAsync` and `ApplyPlanAsync` fo
 | --- | --- |
 | `hpk gen` and `hpk check` | Generate the contract SDK and check ABI lock and version changes. |
 | `hpk new` | Scaffold a plugin project from a published application SDK. |
-| `hpk pack` and `hpk verify` | Package target artifacts and resources, sign the inventory, and verify the result. |
+| `hpk pack` and `hpk verify` | Stage and verify target artifacts and their HuxerUI resources for distribution. |
 | `hpk index` | Produce repository metadata for publishing packages. |
 | `hpk test` and `hpk doctor` | Exercise contract and lifecycle behavior. Explain compatibility, dependency, permission, and activation failures. |
 

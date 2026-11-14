@@ -9,10 +9,13 @@ namespace {
 
 using huxerui::pluginkit::PluginContext;
 std::uint32_t live_importers = 0;
+std::optional<huxerui::RawAsset> cell_limit;
 
 void OnActivate(const PluginContext& context) {
   if (fixture::active_context) throw std::runtime_error("The CSV package is already active");
+  auto limit = context.Resources().GetRawResource(csv_resources::raw::cell_limit_txt);
   fixture::Record(context, "activate");
+  cell_limit.emplace(std::move(limit));
   fixture::active_context = &context;
 }
 
@@ -20,7 +23,9 @@ void OnDeactivate(const PluginContext& context) {
   if (fixture::active_context != &context || live_importers || fixture::live_exporters) {
     throw std::runtime_error("Expected the original context after all CSV instances were destroyed");
   }
+  (void)fixture::ReadCellLimit(*cell_limit);
   fixture::Record(context, "deactivate");
+  cell_limit.reset();
   fixture::active_context = nullptr;
 }
 
@@ -31,7 +36,7 @@ ImportResult Failure(std::string code, std::uint32_t row, std::uint32_t column, 
 template<char Separator>
 class CsvImporter final : public TableImporter {
 public:
-  explicit CsvImporter(const PluginContext& context) : context_(context) {
+  explicit CsvImporter(const PluginContext& context) {
     if (fixture::active_context != &context) throw std::runtime_error("Expected the activation's context");
     ++live_importers;
   }
@@ -43,11 +48,7 @@ public:
 
   huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) override {
     co_await huxerui::Delay(std::chrono::milliseconds(1));
-    const auto manifest = co_await context_.BundleDirectory().Child("plugin.json").ReadStringAsync();
-    if (!manifest.Succeeded()) {
-      throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::Io, "Cannot read the installed CSV plugin manifest");
-    }
-    auto result = Parse(request);
+    auto result = Parse(request, fixture::ReadCellLimit(*cell_limit));
     if (result.table) {
       const auto rows = static_cast<std::uint32_t>(result.table->rows.size());
       if (receiver) co_await receiver->OnRows({rows});
@@ -59,9 +60,7 @@ public:
   }
 
 private:
-  const PluginContext& context_;
-
-  static ImportResult Parse(const ImportRequest& request) {
+  static ImportResult Parse(const ImportRequest& request, std::uint32_t limit) {
     std::string_view source = request.source;
     if (source.starts_with("\xef\xbb\xbf")) source.remove_prefix(3);
     if (source.empty()) return Failure("csv.empty", 1, 1, "Expected a header row");
@@ -73,7 +72,7 @@ private:
     for (std::uint32_t row_number = 1; cursor < source.size(); ++row_number) {
       std::vector<std::string> row;
       for (std::uint32_t column = 1;; ++column) {
-        if (++cells > 200000) return Failure("csv.cell_limit", row_number, column, "Too many cells");
+        if (++cells > limit) return Failure("csv.cell_limit", row_number, column, "Too many cells");
         std::string value;
         if (cursor < source.size() && source[cursor] == '"') {
           ++cursor;

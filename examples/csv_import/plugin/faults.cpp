@@ -16,12 +16,15 @@ using csv_import::fixture::Record;
 
 std::uint32_t created_instances = 0;
 std::uint32_t live_instances = 0;
+std::optional<huxerui::RawAsset> cell_limit;
 
 void OnActivate(const huxerui::pluginkit::PluginContext& context) {
   if (active_context || !context.BundleDirectory().Child("plugin.json").ReadString().Succeeded() ||
       context.DataDirectory().Child("fail-activation").Exists()) {
     throw std::runtime_error("Cannot activate the fixture");
   }
+  auto limit = context.Resources().GetRawResource(csv_resources::raw::cell_limit_txt);
+  (void)csv_import::fixture::ReadCellLimit(limit);
 #if defined(CSV_IMPORT_UPGRADE)
   const auto& data = context.DataDirectory();
   const auto format = data.Child("data-format");
@@ -37,6 +40,7 @@ void OnActivate(const huxerui::pluginkit::PluginContext& context) {
   if (data.Child("exit-upgrade").Exists()) std::_Exit(7);
 #endif
   Record(context, "activate");
+  cell_limit.emplace(std::move(limit));
   active_context = &context;
 }
 
@@ -44,7 +48,9 @@ void OnDeactivate(const huxerui::pluginkit::PluginContext& context) {
   if (active_context != &context || live_instances != 0 || csv_import::fixture::live_exporters != 0) {
     throw std::runtime_error("Expected the original context after all fixture instances were destroyed");
   }
+  (void)csv_import::fixture::ReadCellLimit(*cell_limit);
   Record(context, "deactivate");
+  cell_limit.reset();
   active_context = nullptr;
 }
 
@@ -72,9 +78,10 @@ public:
     if (request.source == "context") {
       const auto& info = context_.Info();
       co_return csv_import::ImportResult{csv_import::Table{
-          {"id", "version", "digest", "bundle", "data", "created", "live"},
+          {"id", "version", "digest", "bundle", "data", "created", "live", "cell_limit"},
           {{info.id, info.version, info.digest, context_.BundleDirectory().Path(), context_.DataDirectory().Path(),
-            std::to_string(created_instances), std::to_string(live_instances)}}}, {}};
+            std::to_string(created_instances), std::to_string(live_instances),
+            std::to_string(csv_import::fixture::ReadCellLimit(*cell_limit))}}}, {}};
     }
     if (request.source == "status") {
       co_await SetRows(40);
