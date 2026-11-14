@@ -83,8 +83,6 @@ enum class UninstallStatus {
 struct PackageExtension {
   /// Extension point registered by the host.
   std::string point;
-  /// Identifier of a contract listed in PackageInfo::provides.
-  std::string contract;
   /// Advertised file suffixes, including their leading dots.
   std::vector<std::string> file_extensions;
 };
@@ -100,8 +98,6 @@ struct PackageInfo {
   std::string version;
   /// Package digest to present for approval and pass to InstallPackage().
   std::string digest;
-  /// Exact identities of the contracts implemented by the package.
-  std::vector<PackageContract> provides;
   /// Factories in manifest order, up to HPK_MAX_EXTENSIONS. Several factories may implement the same point.
   std::vector<PackageExtension> extensions;
   /// Execution modes advertised by the package for this target. InstallPackage() approves one of them.
@@ -242,6 +238,7 @@ private:
 class PluginManager {
 public:
   /// @brief Creates or opens the profile and takes its exclusive lock.
+  /// Reopening the profile restores installed packages, approvals, and enablement.
   /// @param profile_directory Directory for the catalog and approved package snapshots.
   /// @param worker_executable Path to the platform's hpk-worker executable, started on demand. Pass
   /// std::nullopt to allow only in-process packages.
@@ -313,13 +310,14 @@ public:
   /// @brief Installs the approved package snapshot and its extension factories.
   ///
   /// A new installation starts enabled. The mode and service grants apply to future activations of this snapshot.
-  /// Every declared extension point must be registered with the exact contract and support the selected mode.
+  /// Every declared extension point must be registered and support the selected mode. The loader checks the
+  /// library's factory contracts against those registrations before activation.
   /// Reinstalling with the same digest and approval can repair the stored files and preserves enablement.
   /// @param directory Source directory containing the package files.
   /// @param approved_digest Digest from InspectPackage() that the caller approved.
   /// @param options Execution mode and host services included in the approval.
-  /// @throws Error With ApprovalMismatch if the source digest changed, ContractMismatch if the contract or
-  /// in-process SDK identity differs, or UnsupportedMode if the package or host cannot use the approved mode.
+  /// @throws Error With ApprovalMismatch if the source digest changed, ContractMismatch for an unregistered point
+  /// or a different in-process SDK identity, or UnsupportedMode if the selected mode is unavailable.
   /// @throws Error With InvalidArgument if a service grant is invalid or unavailable in the selected mode.
   /// @throws Error With AlreadyInstalled if the installed digest or approval differs, or Busy if the active
   /// plugin's snapshot needs repair. Disable the plugin before repairing it.
@@ -381,7 +379,10 @@ public:
   /// @see ListExtensions()
   std::vector<PluginInfo> ListPlugins() const;
 
-  /// @brief Lists candidates matching the point's exact registered contract without activating packages.
+  /// @brief Lists candidates declared at a registered extension point without activating packages.
+  ///
+  /// Discovery uses the manifest. The loader checks the complete factory table against the host contracts
+  /// when the package is first used.
   /// @tparam Interface Published interface with a Contract specialization.
   /// @param point Previously registered extension point.
   /// @return Candidates in plugin identifier order and manifest order within each available package.
@@ -397,6 +398,7 @@ public:
   /// With generated bindings, instance creation is deferred until the first synchronous method call or
   /// until the first Task method is awaited. For an unmarked in-process interface, this function creates
   /// the instance immediately so operator->() can expose the implementation directly.
+  /// Before activation, the loader checks every exported factory against the registered extension points.
   /// @tparam Interface Interface with contract metadata.
   /// @param point Previously registered extension point.
   /// @param candidate Factory selected from the point's current candidates.

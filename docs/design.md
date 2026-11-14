@@ -86,9 +86,9 @@ The broader lifecycle design includes settings, read-only bundle resources, logg
 
 ## Packages, discovery, and resolution
 
-A local directory package contains `plugin.json` and one library for the selected target. The manifest identifies the plugin and release, available execution modes, C++ ABI identity, provided contracts, and extension factories. The broader package design includes publisher signatures, target variants, file inventories, dependencies, requested capabilities, and settings schemas.
+A local directory package contains `plugin.json` and one library for the selected target. The manifest identifies the plugin and release, available execution modes, C++ ABI identity, and extension factories. The broader package design includes publisher signatures, target variants, file inventories, dependencies, requested capabilities, and settings schemas.
 
-The CSV example publishes two importers and one exporter in the same package. The build reads the fingerprints from the published SDK.
+The CSV example publishes two importers and one exporter in the same package.
 
 ```json
 {
@@ -98,21 +98,15 @@ The CSV example publishes two importers and one exporter in the same package. Th
   "target": "windows-x86_64-msvc",
   "execution_modes": ["in_process", "worker_process"],
   "cpp_abi": "release-0.4.0:msvc=145:iterators=0:dynamic-crt",
-  "provides": [
-    {"id": "example.table-importer", "version": 1,
-     "fingerprint": "2a7d0abe7e97ed99fbdde5b59eaf31be23fdfe009c83efa193dc4669ac2e71db"},
-    {"id": "example.table-exporter", "version": 1,
-     "fingerprint": "690162dd6dad5663f7a7552119a66c7dec9c8be0ee027fee65664978ae85d48d"}
-  ],
   "extensions": [
-    {"point": "example.table-importers", "contract": "example.table-importer", "metadata": {"extensions": [".csv"]}},
-    {"point": "example.table-importers", "contract": "example.table-importer", "metadata": {"extensions": [".ssv"]}},
-    {"point": "example.table-exporters", "contract": "example.table-exporter", "metadata": {"extensions": [".csv"]}}
+    {"point": "example.table-importers", "metadata": {"extensions": [".csv"]}},
+    {"point": "example.table-importers", "metadata": {"extensions": [".ssv"]}},
+    {"point": "example.table-exporters", "metadata": {"extensions": [".csv"]}}
   ]
 }
 ```
 
-Each factory matches the export table by point and zero-based declaration order within that point. The manifest may interleave points differently from the export table. Each extension references a contract in `provides`, and all factories for a given point use the same contract. The optional metadata lets the host select an implementation without starting it. Installation validates every extension against the registered points. The loader compares the complete export table with the approved manifest before running the package hook.
+Each factory matches the export table by point and zero-based declaration order within that point. The manifest may interleave points differently from the export table. Optional metadata lets the host select an implementation without starting it. At installation the manager checks that every point is registered and supports the selected mode. Before running `OnActivate`, the loader checks the full table of declared factories against the plugin's exports and compares each exported contract ID, version, and fingerprint with the host point's registered contract. The SDK generates this identity for remote interfaces.
 
 The planned `hpk pack` tool adds generated schema fingerprints and a signed inventory for the published artifact. Each selected target resolves to a verified entry inside the package. Published content is immutable for a release and target. The manager checks file sizes before installing content into its managed store.
 
@@ -143,7 +137,7 @@ Worker exit completes pending calls with a failure and marks the generation faul
 
 ## Management transactions and persisted state
 
-A profile records the selected local package, enabled flag, granted services, and data directory per installed plugin. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.
+A profile records the selected local package, enabled flag, granted services, and data directory per installed plugin. A new host process reopens the profile and uses the managed snapshot without reinstalling. Register its current extension points and service objects before using the installed plugins. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.
 
 `UpgradePackage` checks the installed and candidate digests and the complete approved grant list. The package keeps the plugin identifier, declares a different release version, and matches the registered points and installed execution mode. `UninstallPackage` checks the installed digest and removes its catalog entry, factories, grants, and pending upgrade. Current plugin data is retained by default and reused on reinstall. `PluginDataPolicy::Delete` records that the data can be removed after uninstall commits.
 

@@ -34,7 +34,11 @@ inline bool IsErrorCode(std::uint32_t code) {
 
 struct ExpectedExtension {
   std::string point;
-  PackageContract contract;
+  std::string contract_id;
+  std::uint32_t contract_version;
+  std::string contract_fingerprint;
+
+  ContractInfo Info() const noexcept { return {contract_id, contract_version, contract_fingerprint}; }
 };
 
 struct PluginStartup {
@@ -57,9 +61,9 @@ struct PluginStartup {
     for (const auto& extension : extensions) {
       writer.Array(4);
       writer.Text(extension.point);
-      writer.Text(extension.contract.id);
-      Codec<std::uint32_t>::Write(writer, extension.contract.version);
-      writer.Text(extension.contract.fingerprint);
+      writer.Text(extension.contract_id);
+      Codec<std::uint32_t>::Write(writer, extension.contract_version);
+      writer.Text(extension.contract_fingerprint);
     }
     return std::move(writer).Finish();
   }
@@ -73,7 +77,7 @@ struct PluginStartup {
     startup.extensions.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
       reader.Record(4);
-      startup.extensions.push_back({reader.Text(), {reader.Text(), Codec<std::uint32_t>::Read(reader), reader.Text()}});
+      startup.extensions.push_back({reader.Text(), reader.Text(), Codec<std::uint32_t>::Read(reader), reader.Text()});
     }
     reader.Finish();
     return startup;

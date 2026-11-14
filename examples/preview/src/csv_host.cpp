@@ -172,17 +172,14 @@ std::string ReadCsv(const File& path) {
 }
 
 Json Describe(const PackageInfo& package) {
-  auto provides = Json::array();
-  for (const auto& contract : package.provides) {
-    provides.push_back({{"id", contract.id}, {"version", contract.version}, {"fingerprint", contract.fingerprint}});
-  }
   auto extensions = Json::array();
   for (const auto& extension : package.extensions) {
-    extensions.push_back({{"point", extension.point}, {"contract", extension.contract},
-                          {"metadata", {{"extensions", extension.file_extensions}}}});
+    auto entry = Json{{"point", extension.point}};
+    if (!extension.file_extensions.empty()) entry["metadata"] = {{"extensions", extension.file_extensions}};
+    extensions.push_back(std::move(entry));
   }
   return {{"id", package.id}, {"version", package.version}, {"digest", package.digest},
-          {"provides", std::move(provides)}, {"extensions", std::move(extensions)}};
+          {"extensions", std::move(extensions)}};
 }
 
 Json List(PluginManager& manager) {
@@ -671,6 +668,18 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
     }
     PluginManager manager(File(profile.u8string()), File(csv_import::preview::WorkerPath().u8string()),
                           UseApplicationTaskScope());
+    if (args.size() == 3 && args[1] == "check-factory-contract") {
+      manager.RegisterExtensionPoint(Importers);
+      // Simulate a host SDK that binds the exporter point to another contract after a restart.
+      manager.RegisterExtensionPoint(ExtensionPoint<csv_import::TableImporter>{Exporters.id});
+      auto importers = manager.CreateExtensions(Importers, Utf8(args[2]));
+      if (importers.empty()) throw Error(ErrorCode::NotFound, "The contract check needs an installed importer");
+      const auto delimiter = importers.front()->Delimiter();
+      co_await manager.Shutdown();
+      Print({{"ok", true}, {"delimiter", delimiter}});
+      runtime.RequestShutdown();
+      co_return;
+    }
     auto status = std::make_shared<PreviewImportStatus>(manager);
     manager.ProvideService<csv_import::ImportStatus>(status);
     RegisterPoints(manager);

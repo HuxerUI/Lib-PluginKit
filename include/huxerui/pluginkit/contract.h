@@ -40,20 +40,6 @@ struct ContractInfo {
   bool operator==(const ContractInfo&) const = default;
 };
 
-/// @brief Contract identity owned by a package metadata snapshot.
-struct PackageContract {
-  /// Stable identifier published by the host SDK.
-  std::string id;
-  /// Exact contract version implemented by the plugin.
-  std::uint32_t version;
-  /// Lowercase SHA-256 fingerprint of the implemented contract.
-  std::string fingerprint;
-
-  /// @brief Borrows the identity for comparison with a registered contract.
-  /// @return Views valid for the lifetime of these strings.
-  ContractInfo Info() const noexcept { return {id, version, fingerprint}; }
-};
-
 /// @brief Describes the contract published by a C++ interface.
 ///
 /// For an HPK_REMOTE interface, hpk gen supplies the exact identity, typed adapter, and worker dispatch.

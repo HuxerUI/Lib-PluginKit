@@ -255,13 +255,26 @@ def verify_factory_table(host, package, scratch, valid):
     shutil.copytree(package, source)
     path = source / "plugin.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
-    assert len(manifest["provides"]) == 2 and len(manifest["extensions"]) == 3, manifest
-    assert all("id" not in extension for extension in manifest["extensions"]), manifest
-    manifest["extensions"][-1]["id"] = "export"
+    assert manifest["schema_version"] == 1 and "provides" not in manifest, manifest
+    assert len(manifest["extensions"]) == 3, manifest
+    assert all(set(extension) <= {"point", "metadata"} for extension in manifest["extensions"]), manifest
+    exporter = manifest["extensions"][-1]
+    profile = scratch / "manifest checks"
+    for record, field, value in ((manifest, "provides", []), (exporter, "contract", "example.table-exporter"),
+                                 (exporter, "id", "export")):
+        record[field] = value
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        check_error(run(host, profile, "inspect", source), "invalid_package")
+        del record[field]
+
+    point = exporter["point"]
+    exporter["point"] = "example.unregistered"
     path.write_text(json.dumps(manifest), encoding="utf-8")
-    check_error(run(host, scratch / "legacy extension id", "inspect", source), "invalid_package")
-    del manifest["extensions"][-1]["id"]
-    manifest["extensions"].append(manifest["extensions"][-1])
+    digest = run(host, profile, "inspect", source)["digest"]
+    check_error(run(host, profile, "install", source, digest, "worker_process"), "contract_mismatch")
+
+    exporter["point"] = point
+    manifest["extensions"].append(exporter)
     path.write_text(json.dumps(manifest), encoding="utf-8")
     for mode in ("in_process", "worker_process"):
         profile = scratch / f"mismatched table {mode}"
@@ -269,6 +282,42 @@ def verify_factory_table(host, package, scratch, valid):
         assert run(host, profile, "install", source, package_info["digest"], mode, "status")["ok"]
         check_error(run(host, profile, "import", valid, package_info["id"]), "contract_mismatch")
         assert not (installed_data(profile, package_info["id"]) / "lifecycle.log").exists()
+
+
+def verify_reopened_profile(host, package, scratch, sample):
+    sample_ssv = sample.with_suffix(".ssv")
+    for mode in ("in_process", "worker_process"):
+        source = scratch / f"original package {mode}"
+        shutil.copytree(package, source)
+        path = source / "plugin.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        del manifest["extensions"][-1]["metadata"]
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        profile = scratch / f"reopened {mode}"
+        info = run(host, profile, "inspect", source)
+        assert info["extensions"] == manifest["extensions"], info
+        plugin_id = info["id"]
+        installed, imported, status = run(host, profile, commands=[
+            ("install", source, info["digest"], mode, "status"), ("import", sample, plugin_id), ("status",),
+        ])
+        assert installed["ok"] and imported["ok"] and status["last_imported_rows"] == 2, (installed, imported, status)
+        log = installed_data(profile, plugin_id) / "lifecycle.log"
+        lifecycle = ["activate", "deactivate"]
+        assert log.read_text().splitlines() == lifecycle
+        source.rename(scratch / f"moved package {mode}")
+
+        mismatch = run(host, profile, "check-factory-contract", plugin_id)
+        check_error(mismatch, "contract_mismatch")
+        assert "example.table-exporters" in mismatch["message"], mismatch
+        assert log.read_text().splitlines() == lifecycle
+
+        listed, round_trip, status = run(host, profile, commands=[
+            ("list",), ("round-trip", sample, sample_ssv, plugin_id), ("status",),
+        ])
+        entry = plugin(listed, plugin_id)
+        assert entry["enabled"] and entry["digest"] == info["digest"] and entry["mode"] == mode, entry
+        assert round_trip["ok"] and round_trip["package_importers"] == 2 and round_trip["format"] == "csv", round_trip
+        assert status["last_imported_rows"] == 2 and log.read_text().splitlines() == lifecycle * 2, status
 
 
 def verify_local_lifetime(host, faults, digest, fault_id, scratch, valid):
@@ -567,14 +616,6 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
     for mode in ("worker_process", "in_process"):
         verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch, mode)
     check_error(run(host, profile, "install", package, "0" * 64, "worker_process"), "approval_mismatch")
-    wrong_contract = scratch / "wrong contract"
-    wrong_contract.mkdir()
-    shutil.copyfile(package / module_name, wrong_contract / module_name)
-    manifest = json.loads((package / "plugin.json").read_text(encoding="utf-8"))
-    manifest["provides"][1]["fingerprint"] = "0" * 64
-    (wrong_contract / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
-    wrong_digest = run(host, profile, "inspect", wrong_contract)["digest"]
-    check_error(run(host, profile, "install", wrong_contract, wrong_digest, "worker_process"), "contract_mismatch")
 
     replies = run(host, profile, commands=[
         ("install", package, digest, "worker_process", "status"),
@@ -686,6 +727,7 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
 
     verify_mixed(host, package, worker_csv, faults, scratch, sample, valid)
     verify_factory_table(host, package, scratch, valid)
+    verify_reopened_profile(host, package, scratch, sample)
     verify_local_lifetime(host, faults, fault_digest, fault_id, scratch, valid)
     assert run(host, scratch / "in-process-only profile", "check-disable-during-create", package) == {
         "ok": True, "delimiter": ",",

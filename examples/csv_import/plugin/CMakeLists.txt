@@ -17,8 +17,7 @@ else ()
 endif ()
 
 set(CSV_IMPORT_SDK "" CACHE PATH "Published CSV example SDK directory")
-if (NOT EXISTS "${CSV_IMPORT_SDK}/contract.json" OR NOT EXISTS "${CSV_IMPORT_SDK}/csv_contract.bindings.h" OR
-    NOT EXISTS "${CSV_IMPORT_SDK}/exporters/contract.json" OR
+if (NOT EXISTS "${CSV_IMPORT_SDK}/csv_contract.bindings.h" OR
     NOT EXISTS "${CSV_IMPORT_SDK}/exporters/export_contract.bindings.h" OR
     NOT EXISTS "${CSV_IMPORT_SDK}/cpp-abi.txt" OR NOT EXISTS "${CSV_IMPORT_SDK}/csv_sdk.h" OR
     NOT EXISTS "${CSV_IMPORT_SDK}/receivers/import_progress.bindings.h" OR
@@ -26,18 +25,10 @@ if (NOT EXISTS "${CSV_IMPORT_SDK}/contract.json" OR NOT EXISTS "${CSV_IMPORT_SDK
     NOT EXISTS "${CSV_IMPORT_SDK}/huxerui/pluginkit/plugin.h")
     message(FATAL_ERROR "Set CSV_IMPORT_SDK to the SDK published by the host build")
 endif ()
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CSV_IMPORT_SDK}/contract.json" "${CSV_IMPORT_SDK}/exporters/contract.json" "${CSV_IMPORT_SDK}/cpp-abi.txt")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CSV_IMPORT_SDK}/cpp-abi.txt")
 if (NOT WIN32)
     find_package(Threads REQUIRED)
 endif ()
-file(READ "${CSV_IMPORT_SDK}/contract.json" import_contract)
-file(READ "${CSV_IMPORT_SDK}/exporters/contract.json" export_contract)
-foreach (field IN ITEMS id version fingerprint)
-    string(JSON import_${field} GET "${import_contract}" ${field})
-    string(JSON export_${field} GET "${export_contract}" ${field})
-endforeach ()
-
 file(READ "${CSV_IMPORT_SDK}/cpp-abi.txt" cpp_abi)
 if (NOT cpp_abi MATCHES "^[0-9A-Za-z.+:=_-]+$")
     message(FATAL_ERROR "The published CSV SDK has an invalid C++ ABI stamp")
@@ -45,8 +36,6 @@ endif ()
 
 function(add_csv_package target source plugin_id plugin_version)
     add_library(${target} SHARED "${source}")
-    set_source_files_properties("${source}" PROPERTIES OBJECT_DEPENDS
-        "${CSV_IMPORT_SDK}/contract.json;${CSV_IMPORT_SDK}/exporters/contract.json")
     target_include_directories(${target} PRIVATE "${CSV_IMPORT_SDK}")
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_link_libraries(${target} PRIVATE HuxerUI::huxerui)
@@ -73,8 +62,7 @@ function(add_csv_package target source plugin_id plugin_version)
     endif ()
     set(secondary_importer "")
     if (source STREQUAL "csv_importer.cpp")
-        string(CONCAT secondary_importer "\n    {\"point\": \"example.table-importers\", \"contract\": \"${import_id}\", "
-            "\"metadata\": {\"extensions\": [\".ssv\"]}},")
+        set(secondary_importer "\n    {\"point\": \"example.table-importers\", \"metadata\": {\"extensions\": [\".ssv\"]}},")
     endif ()
     set(manifest "${CMAKE_CURRENT_BINARY_DIR}/${target}.json")
     configure_file(plugin.json.in "${manifest}" @ONLY)

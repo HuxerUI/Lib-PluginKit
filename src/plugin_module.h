@@ -54,9 +54,9 @@ inline void ValidatePluginDescriptor(const hpk_plugin_v1& binding, std::span<con
   std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
   for (const auto& extension : expected) {
     const auto* found = FindExtension(binding, extension.point, ordinals[extension.point]++);
-    if (!found || extension.contract.Info() !=
+    if (!found || extension.Info() !=
         ContractInfo{found->contract_id, found->contract_version, found->contract_fingerprint}) {
-      throw Error(ErrorCode::ContractMismatch, "The module factory table differs from the approved package");
+      throw Error(ErrorCode::ContractMismatch, "The module factory does not match the host extension point " + extension.point);
     }
     if (mode == HPK_WORKER_PROCESS && !found->invoke) {
       throw Error(ErrorCode::UnsupportedMode, "The module has a factory without worker dispatch");
