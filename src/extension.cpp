@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <deque>
+#include <map>
 
 namespace huxerui::pluginkit::detail {
 namespace {
@@ -29,8 +30,8 @@ struct RemoteInstance {
 class WorkerExtension final : public ExtensionTarget, public std::enable_shared_from_this<WorkerExtension> {
 public:
   WorkerExtension(std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start,
-                  std::chrono::milliseconds timeout, std::stop_token admission)
-      : start_(std::move(start)), timeout_(timeout), admission_(admission) {}
+                  std::chrono::milliseconds timeout, std::stop_token admission, Bytes factory)
+      : start_(std::move(start)), timeout_(timeout), admission_(admission), factory_(std::move(factory)) {}
 
   ExecutionMode Mode() const noexcept override { return ExecutionMode::WorkerProcess; }
 
@@ -108,7 +109,9 @@ private:
     };
     try {
       auto worker = start_(deadline, stop);
-      const auto reply = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, {}}, Remaining(deadline),
+      worker->Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, Remaining(deadline), nullptr,
+                      stop, !synchronous);
+      const auto reply = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, factory_}, Remaining(deadline),
                                          nullptr, stop, !synchronous);
       RemoteInstance created{std::move(worker), reply.instance};
       lock.lock();
@@ -164,6 +167,7 @@ private:
   const std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start_;
   const std::chrono::milliseconds timeout_;
   const std::stop_token admission_;
+  const Bytes factory_;
   std::atomic_bool released_{false};
   mutable std::mutex mutex_;
   std::condition_variable_any ready_;
@@ -173,13 +177,17 @@ private:
 };
 
 struct LocalInstance {
+  LocalInstance(std::string point, std::uint32_t ordinal) : point(std::move(point)), ordinal(ordinal) {}
+
+  const std::string point;
+  const std::uint32_t ordinal;
   void* object = nullptr;
-  const hpk_plugin_v1* binding = nullptr;
+  const hpk_extension_v1* factory = nullptr;
   bool released = false;
   bool borrowed = false;
 
   void Close() noexcept {
-    if (object) binding->close(std::exchange(object, nullptr));
+    if (object) factory->close(std::exchange(object, nullptr));
   }
   ~LocalInstance() { Close(); }
 };
@@ -219,18 +227,29 @@ public:
     Check(instance);
     if (instance.object) return instance.object;
     if (!activation_) {
+      const auto& binding = load_();
+      ValidatePluginDescriptor(binding, startup_.extensions, HPK_IN_PROCESS);
       PreparePluginData(startup_);
-      binding_ = &load_();
-      activation_ = ActivatePlugin(*binding_, startup_);
+      activation_ = ActivatePlugin(binding, startup_);
+      binding_ = &binding;
     }
-    instance.binding = binding_;
-    const auto status = binding_->create(activation_, &instance.object);
+    instance.factory = FindExtension(*binding_, instance.point, instance.ordinal);
+    if (!instance.factory) throw Error(ErrorCode::NotFound, "The plugin has no such factory at this extension point");
+    const auto status = instance.factory->create(activation_, &instance.object);
     if (status != HPK_OK) {
       instance.Close();
       CheckPluginStatus(status);
     }
     if (!instance.object) throw Error(ErrorCode::Protocol, "The plugin returned an empty instance");
     return instance.object;
+  }
+
+  void ValidateFactories() {
+    std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
+    for (const auto& entry : startup_.extensions) {
+      LocalInstance instance(entry.point, ordinals[entry.point]++);
+      (void)Ensure(instance);
+    }
   }
 
   void* Borrow(const std::shared_ptr<LocalInstance>& instance) {
@@ -471,8 +490,9 @@ private:
 
 class LocalExtension final : public ExtensionTarget {
 public:
-  LocalExtension(std::shared_ptr<LocalPlugin> plugin, std::chrono::milliseconds timeout)
-      : plugin_(std::move(plugin)), instance_(std::make_shared<LocalInstance>()), timeout_(timeout) {
+  LocalExtension(std::shared_ptr<LocalPlugin> plugin, std::string point, std::uint32_t ordinal,
+                 std::chrono::milliseconds timeout)
+      : plugin_(std::move(plugin)), instance_(std::make_shared<LocalInstance>(std::move(point), ordinal)), timeout_(timeout) {
     plugin_->Check(*instance_);
     plugin_->instances.push_back(instance_);
   }
@@ -518,19 +538,18 @@ void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin) { plugin->Be
 Task<void> FinishLocalShutdown(std::shared_ptr<LocalPlugin> plugin) { co_await plugin->FinishShutdown(); }
 
 void ValidateLocalPlugin(const std::shared_ptr<LocalPlugin>& plugin) {
-  LocalInstance instance;
-  (void)plugin->Ensure(instance);
+  plugin->ValidateFactories();
 }
 
 std::shared_ptr<ExtensionTarget> MakeLocalExtension(std::shared_ptr<LocalPlugin> plugin,
-                                                     std::chrono::milliseconds timeout) {
-  return std::make_shared<LocalExtension>(std::move(plugin), timeout);
+    std::string point, std::uint32_t ordinal, std::chrono::milliseconds timeout) {
+  return std::make_shared<LocalExtension>(std::move(plugin), std::move(point), ordinal, timeout);
 }
 
 std::shared_ptr<ExtensionTarget> MakeWorkerExtension(
     std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start, std::chrono::milliseconds timeout,
-    std::stop_token admission) {
-  return std::make_shared<WorkerExtension>(std::move(start), timeout, admission);
+    std::stop_token admission, Bytes factory) {
+  return std::make_shared<WorkerExtension>(std::move(start), timeout, admission, std::move(factory));
 }
 
 void* ExtensionTarget::BorrowLocal() { throw Error(ErrorCode::UnsupportedMode, "The extension is not in process"); }

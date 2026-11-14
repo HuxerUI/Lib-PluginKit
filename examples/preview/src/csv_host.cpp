@@ -2,6 +2,7 @@
 #include "windowless_runtime.h"
 
 #include "csv_contract.host.h"
+#include "exporters/export_contract.host.h"
 #include "services/import_status.bindings.h"
 
 #include <huxerui/pluginkit.h>
@@ -37,11 +38,19 @@ using huxerui::pluginkit::detail::WindowlessRuntime;
 static_assert(!std::is_copy_constructible_v<PluginManager>);
 static_assert(!std::is_copy_assignable_v<PluginManager>);
 
-constexpr ExtensionPoint<csv_import::TableImporter> Importers{"example.table-importers"};
+using csv_import::Exporters;
+using csv_import::Importers;
+
 constexpr char CommandHelp[] =
     "inspect <package>, install <package> <digest> <in_process|worker_process> [status], list, "
     "upgrade <package> <installed-digest> <approved-digest> [status], uninstall <id> <digest> [delete-data], "
-    "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], quit";
+    "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], "
+    "round-trip <csv-file> <ssv-file> <plugin-id>, quit";
+
+void RegisterPoints(PluginManager& manager) {
+  manager.RegisterExtensionPoint(Importers);
+  manager.RegisterExtensionPoint(Exporters);
+}
 
 std::uint32_t ProcessId() {
 #if defined(_WIN32)
@@ -163,8 +172,17 @@ std::string ReadCsv(const File& path) {
 }
 
 Json Describe(const PackageInfo& package) {
+  auto provides = Json::array();
+  for (const auto& contract : package.provides) {
+    provides.push_back({{"id", contract.id}, {"version", contract.version}, {"fingerprint", contract.fingerprint}});
+  }
+  auto extensions = Json::array();
+  for (const auto& extension : package.extensions) {
+    extensions.push_back({{"point", extension.point}, {"contract", extension.contract},
+                          {"metadata", {{"extensions", extension.file_extensions}}}});
+  }
   return {{"id", package.id}, {"version", package.version}, {"digest", package.digest},
-          {"contribution", package.contribution}, {"extensions", package.extensions}};
+          {"provides", std::move(provides)}, {"extensions", std::move(extensions)}};
 }
 
 Json List(PluginManager& manager) {
@@ -177,12 +195,14 @@ Json List(PluginManager& manager) {
     record["pending_upgrade"] = plugin.pending_upgrade ? Describe(*plugin.pending_upgrade) : Json(nullptr);
     plugins.push_back(std::move(record));
   }
-  auto importers = Json::array();
-  for (const auto& extension : manager.ListExtensions(Importers)) {
-    importers.push_back({{"plugin", extension.id.plugin}, {"id", extension.id.contribution},
-                         {"extensions", extension.extensions}});
-  }
-  return {{"plugins", std::move(plugins)}, {"importers", std::move(importers)}};
+  const auto describe = [&manager](auto point) {
+    auto result = Json::array();
+    for (const auto& extension : manager.ListExtensions(point)) {
+      result.push_back({{"plugin", extension.plugin_id}, {"extensions", extension.file_extensions}});
+    }
+    return result;
+  };
+  return {{"plugins", std::move(plugins)}, {"importers", describe(Importers)}, {"exporters", describe(Exporters)}};
 }
 
 Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) {
@@ -191,12 +211,12 @@ Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) 
   for (auto& character : suffix) {
     if (character >= 'A' && character <= 'Z') character = static_cast<char>(character - 'A' + 'a');
   }
-  std::optional<ExtensionId> selected;
+  std::optional<ExtensionInfo> selected;
   for (const auto& extension : manager.ListExtensions(Importers)) {
-    if (args.size() >= 3 && extension.id.plugin != args[2]) continue;
-    if (std::ranges::find(extension.extensions, suffix) == extension.extensions.end()) continue;
-    if (selected) throw Error(ErrorCode::InvalidArgument, "Several importers match this file. Specify a plugin ID.");
-    selected = extension.id;
+    if (args.size() >= 3 && extension.plugin_id != args[2]) continue;
+    if (std::ranges::find(extension.file_extensions, suffix) == extension.file_extensions.end()) continue;
+    if (selected) throw Error(ErrorCode::Ambiguous, "Several importers match this file");
+    selected = extension;
   }
   if (!selected) throw Error(ErrorCode::NotFound, "No enabled importer matches the file");
   auto timeout = DefaultTimeout;
@@ -228,11 +248,64 @@ Task<Json> Import(PluginManager& manager, const std::vector<std::string>& args) 
           {"progress_rows", progress->rows ? Json(*progress->rows) : Json(nullptr)}};
 }
 
+Task<Json> RoundTrip(PluginManager& manager, const std::vector<std::string>& args) {
+  const auto& plugin = args[3];
+  const auto all_importers = manager.CreateExtensions(Importers).size();
+  auto importers = manager.CreateExtensions(Importers, plugin);
+  if (importers.size() != 2 || importers[0]->Delimiter() != "," || importers[1]->Delimiter() != ";") {
+    throw Error(ErrorCode::PluginFailed, "Expected comma and semicolon importers in manifest order");
+  }
+  try {
+    (void)manager.CreateExtension(Importers, plugin);
+    throw Error(ErrorCode::PluginFailed, "A plugin ID unexpectedly selected one of several factories");
+  } catch (const Error& error) {
+    if (error.Code() != ErrorCode::Ambiguous) throw;
+  }
+  const auto candidates = manager.ListExtensions(Importers);
+  const auto candidate = std::ranges::find_if(candidates, [&](const auto& entry) {
+    return entry.plugin_id == plugin && std::ranges::find(entry.file_extensions, ".ssv") != entry.file_extensions.end();
+  });
+  if (candidate == candidates.end()) throw Error(ErrorCode::NotFound, "No semicolon importer for this package");
+  auto exporter = manager.CreateExtension(Exporters, plugin);
+  const auto pid = importers[0]->ProcessId();
+  if (importers[1]->ProcessId() != pid || exporter->ProcessId() != pid) {
+    throw Error(ErrorCode::PluginFailed, "Factories from the same package must share a process");
+  }
+
+  const auto parse = [](auto& importer, std::string source) -> Task<csv_import::Table> {
+    const csv_import::ImportRequest request{std::move(source)};
+    auto result = co_await importer->Import(request, nullptr);
+    if (!result.table) throw Error(ErrorCode::PluginFailed, "Cannot parse the round-trip input");
+    co_return std::move(*result.table);
+  };
+  const auto csv = co_await huxerui::RunWorker(ReadCsv, File(args[1]));
+  const auto ssv = co_await huxerui::RunWorker(ReadCsv, File(args[2]));
+  const auto table = co_await parse(importers[0], csv);
+  {
+    auto semicolon = manager.CreateExtension(Importers, *candidate);
+    if (semicolon->Delimiter() != ";" || semicolon->ProcessId() != pid) {
+      throw Error(ErrorCode::PluginFailed, "The candidate did not select the semicolon importer");
+    }
+    const auto other = co_await parse(semicolon, ssv);
+    if (table.header != other.header || table.rows != other.rows) {
+      throw Error(ErrorCode::PluginFailed, "CSV and semicolon input did not produce the same table");
+    }
+  }
+  const csv_import::ExportRequest request{table.header, table.rows};
+  auto exported = co_await exporter->Export(request);
+  const auto round_trip = co_await parse(importers[0], exported);
+  if (table.header != round_trip.header || table.rows != round_trip.rows) {
+    throw Error(ErrorCode::PluginFailed, "The exported CSV did not preserve the input table");
+  }
+  co_return Json{{"all_importers", all_importers}, {"package_importers", importers.size()},
+                 {"format", exporter->Format()}, {"plugin_pid", pid}, {"csv", std::move(exported)}};
+}
+
 Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
   for (const auto& extension : manager.ListExtensions(Importers)) {
-    if (extension.id.plugin != plugin) continue;
+    if (extension.plugin_id != plugin) continue;
     const auto tasks = UseApplicationTaskScope();
-    auto importer = manager.CreateExtension(Importers, extension.id);
+    auto importer = manager.CreateExtension(Importers, extension);
     auto first = std::make_shared<PreviewProgress>();
     auto second = std::make_shared<PreviewProgress>();
     const csv_import::ImportRequest remember{"remember"};
@@ -255,7 +328,7 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     co_await Delay(std::chrono::milliseconds(20));
     queued_task.Cancel();
     try {
-      auto short_call = manager.CreateExtension(Importers, extension.id, std::chrono::milliseconds(30));
+      auto short_call = manager.CreateExtension(Importers, extension, std::chrono::milliseconds(30));
       (void)co_await short_call->Import(remember, second);
       throw Error(ErrorCode::PluginFailed, "A queued invocation exceeded its deadline without failing");
     } catch (const Error& error) {
@@ -268,7 +341,7 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
 
     // A lazy call retains its arguments, while closing the instance revokes its call target.
     auto pending = [&] {
-      auto unused = manager.CreateExtension(Importers, extension.id);
+      auto unused = manager.CreateExtension(Importers, extension);
       return unused->Import(remember, second);
     }();
     try {
@@ -288,7 +361,7 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
     cancelled->complete->Complete(9);
     if (outcome->done) throw Error(ErrorCode::PluginFailed, "A cancelled invocation resumed");
 
-    auto restarted = manager.CreateExtension(Importers, extension.id, DefaultTimeout * 2);
+    auto restarted = manager.CreateExtension(Importers, extension, DefaultTimeout * 2);
     auto disabled = std::make_shared<ProgressGate>();
     auto interrupted = std::make_shared<ImportOutcome>();
     (void)tasks.Launch(ObserveImport(
@@ -315,8 +388,8 @@ Task<Json> CheckReceiverLifetime(PluginManager& manager, std::string plugin) {
 
 Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool disable) {
   for (const auto& extension : manager.ListExtensions(Importers)) {
-    if (extension.id.plugin != plugin) continue;
-    auto second = manager.CreateExtension(Importers, extension.id);
+    if (extension.plugin_id != plugin) continue;
+    auto second = manager.CreateExtension(Importers, extension);
     const auto context = [](auto& importer) -> Task<std::vector<std::string>> {
       const csv_import::ImportRequest request{"context"};
       auto result = co_await importer->Import(request, std::make_shared<PreviewProgress>());
@@ -328,7 +401,7 @@ Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool d
     std::vector<std::string> first_context;
     std::vector<std::string> second_context;
     {
-      auto first = manager.CreateExtension(Importers, extension.id);
+      auto first = manager.CreateExtension(Importers, extension);
       (void)first->Delimiter();
       (void)second->Delimiter();
       first_context = co_await context(first);
@@ -362,7 +435,7 @@ Task<Json> CheckPluginContext(PluginManager& manager, std::string plugin, bool d
 Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
   const auto tasks = UseApplicationTaskScope();
   auto manager = std::make_shared<PluginManager>(profile, std::nullopt, tasks);
-  manager->RegisterExtensionPoint(Importers);
+  RegisterPoints(*manager);
   const auto info = PluginManager::InspectPackage(package);
   try {
     manager->InstallPackage(package, info.digest);
@@ -372,7 +445,7 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
   }
   manager->InstallPackage(package, info.digest, {.mode = ExecutionMode::InProcess, .services = {}});
 
-  const ExtensionId id{info.id, info.contribution};
+  const auto candidate = manager->ListExtensions(Importers).front();
   for (int attempt = 0; attempt < 20; ++attempt) {
     struct Outcome {
       std::optional<ExtensionHandle<csv_import::TableImporter>> handle;
@@ -381,19 +454,19 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
       bool disabled = false;
     };
     const auto outcome = std::make_shared<Outcome>();
-    (void)tasks.Launch([manager, outcome, id]() -> Task<void> {
+    (void)tasks.Launch([manager, outcome, id = info.id]() -> Task<void> {
       try {
-        co_await manager->SetEnabled(id.plugin, false);
+        co_await manager->SetEnabled(id, false);
       } catch (...) {
         outcome->error = std::current_exception();
       }
       outcome->disabled = true;
     });
     // The second post lets the disable Task start before this call tries to create the first handle.
-    tasks.Post([tasks, manager, outcome, id] {
-      tasks.Post([manager, outcome, id] {
+    tasks.Post([tasks, manager, outcome, candidate] {
+      tasks.Post([manager, outcome, candidate] {
         try {
-          outcome->handle.emplace(manager->CreateExtension(Importers, id));
+          outcome->handle.emplace(manager->CreateExtension(Importers, candidate));
         } catch (const Error& error) {
           if (error.Code() != ErrorCode::Disabled) outcome->error = std::current_exception();
         } catch (...) {
@@ -404,7 +477,7 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
     });
     co_await WaitFor([outcome] { return outcome->disabled && outcome->created; });
     if (outcome->error) std::rethrow_exception(outcome->error);
-    if (!manager->ListExtensions(Importers).empty()) {
+    if (!manager->CreateExtensions(Importers).empty() || !manager->CreateExtensions(Exporters, info.id).empty()) {
       throw Error(ErrorCode::PluginFailed, "The disabled CSV plugin is still listed");
     }
     if (outcome->handle) {
@@ -415,9 +488,9 @@ Task<Json> CheckDisableDuringCreate(const File& profile, const File& package) {
         if (error.Code() != ErrorCode::Closed) throw;
       }
     }
-    co_await manager->SetEnabled(id.plugin, true);
+    co_await manager->SetEnabled(info.id, true);
   }
-  auto importer = manager->CreateExtension(Importers, id);
+  auto importer = manager->CreateExtension(Importers, candidate);
   const auto delimiter = importer->Delimiter();
   co_await manager->Shutdown();
   co_return Json{{"delimiter", delimiter}};
@@ -432,43 +505,62 @@ Task<UpgradeStatus> Upgrade(PluginManager& manager, const std::vector<std::strin
 
 Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::string>& args) {
   const auto package = PluginManager::InspectPackage(File(args[1]));
-  const ExtensionId id{package.id, package.contribution};
+  const auto& id = package.id;
+  const auto exporters = manager.ListExtensions(Exporters);
+  const auto candidate = std::ranges::find(exporters, id, &ExtensionInfo::plugin_id);
+  if (candidate == exporters.end()) throw Error(ErrorCode::NotFound, "The upgrade fixture has no exporter");
   auto previous = manager.CreateExtension(Importers, id);
+  auto previous_exporter = manager.CreateExtension(Exporters, *candidate);
   auto pending = manager.CreateExtension(Importers, id);
   const auto old_pid = previous->ProcessId();
+  if (previous_exporter->ProcessId() != old_pid) throw Error(ErrorCode::PluginFailed, "Expected one worker per package");
   if (co_await Upgrade(manager, args) != UpgradeStatus::Applied) {
     throw Error(ErrorCode::PluginFailed, "The worker upgrade requires a restart");
   }
-  for (auto* old : {&previous, &pending}) {
+  const auto check_closed = [](auto& old) {
     try {
-      (void)(*old)->Delimiter();
+      (void)old->ProcessId();
       throw Error(ErrorCode::PluginFailed, "An old handle followed the worker upgrade");
     } catch (const Error& error) {
       if (error.Code() != ErrorCode::Closed) throw;
     }
+  };
+  check_closed(previous);
+  check_closed(previous_exporter);
+  check_closed(pending);
+  try {
+    (void)manager.CreateExtension(Exporters, *candidate);
+    throw Error(ErrorCode::PluginFailed, "An old candidate selected an exporter in a new release");
+  } catch (const Error& error) {
+    if (error.Code() != ErrorCode::PackageChanged) throw;
   }
   auto next = manager.CreateExtension(Importers, id);
+  auto exporter = manager.CreateExtension(Exporters, id);
   const auto new_pid = next->ProcessId();
+  if (exporter->ProcessId() != new_pid) throw Error(ErrorCode::PluginFailed, "Expected one replacement worker");
   co_return Json{{"old_pid", old_pid}, {"new_pid", new_pid}};
 }
 
 Task<Json> CheckInProcessUpgrade(const File& profile, const std::vector<std::string>& args) {
   const auto package = PluginManager::InspectPackage(File(args[1]));
-  const ExtensionId id{package.id, package.contribution};
+  const auto& id = package.id;
   const auto tasks = UseApplicationTaskScope();
   {
     PluginManager manager(profile, std::nullopt, tasks);
-    manager.RegisterExtensionPoint(Importers);
+    RegisterPoints(manager);
     auto handle = manager.CreateExtension(Importers, id);
+    auto exporter = manager.CreateExtension(Exporters, id);
     (void)handle->Delimiter();
+    (void)exporter->Format();
     if (co_await Upgrade(manager, args) != UpgradeStatus::RestartRequired) {
       throw Error(ErrorCode::PluginFailed, "The in-process upgrade applied without a restart");
     }
     (void)handle->Delimiter();
+    (void)exporter->Format();
     co_await manager.Shutdown();
   }
   PluginManager reopened(profile, std::nullopt, tasks);
-  reopened.RegisterExtensionPoint(Importers);
+  RegisterPoints(reopened);
   const auto changes = co_await reopened.ApplyPendingChanges();
   if (!changes.empty()) throw Error(ErrorCode::PluginFailed, "Reopening the manager applied the in-process upgrade");
   const auto installed = reopened.ListPlugins();
@@ -528,6 +620,7 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
   }
   if (name == "list" && args.size() == 1) co_return List(manager);
   if (name == "import" && args.size() >= 2 && args.size() <= 4) co_return co_await Import(manager, args);
+  if (name == "round-trip" && args.size() == 4) co_return co_await RoundTrip(manager, args);
   throw Error(ErrorCode::InvalidArgument, CommandHelp);
 }
 
@@ -580,7 +673,7 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
                           UseApplicationTaskScope());
     auto status = std::make_shared<PreviewImportStatus>(manager);
     manager.ProvideService<csv_import::ImportStatus>(status);
-    manager.RegisterExtensionPoint(Importers);
+    RegisterPoints(manager);
     for (const auto& change : co_await manager.ApplyPendingChanges()) {
       if (!change.error) continue;
       std::cerr << "Plugin upgrade failed for " << change.plugin_id << " (" << ErrorName(*change.error) << ") "

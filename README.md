@@ -38,6 +38,7 @@ $CsvInfo
 @(
     'import ".\examples\csv_import\sample.csv" example.csv'
     'status'
+    'round-trip ".\examples\csv_import\sample.csv" ".\examples\csv_import\sample.ssv" example.csv'
 ) | & $CsvHostExe $CsvProfileDir
 ```
 
@@ -88,7 +89,9 @@ The macOS preview locates `hpk-worker` in `Contents/MacOS` beside the host. Its 
 
 ### Host commands
 
-Run the host with just a profile directory for a session that accepts one command per line. Each command produces a JSON response. `list` shows the installed packages, their execution modes, enabled importers, and active worker process IDs. `enable <id>` and `disable <id>` persist across sessions. `import <file> [plugin-id] [timeout-ms]` selects an enabled importer from the manifest suffixes and reports the delimiter, plugin process ID, and parsed rows. The CSV plugin uses the first record as the header and reports malformed input with one-based row and column numbers.
+Run the host with just a profile directory for a session that accepts one command per line. Each command produces a JSON response. `list` shows installed packages, available importers and exporters, execution modes, and active worker process IDs. `enable <id>` and `disable <id>` change the whole package and persist across sessions. `import <file> [plugin-id] [timeout-ms]` selects an importer by its manifest suffix and reports the delimiter, plugin process ID, and parsed rows. The CSV plugin uses the first record as the header and reports malformed input with one-based row and column numbers.
+
+`round-trip <csv-file> <ssv-file> <plugin-id>` uses the comma and semicolon importers from one package to parse equivalent inputs. It exports the resulting table as CSV and reimports it to verify the fields. The reply includes the CSV text and the process ID shared by all three factories.
 
 Use `install <package> <approved-digest> <in_process|worker_process> [status]` to select the mode and grant access to the registered `ImportStatus` service. The approval persists in the profile. For `sample.csv`, the import reply reports `progress_rows` as 2 and the `status` command reports `last_imported_rows` as 2.
 
@@ -114,9 +117,9 @@ python examples/csv_import/verify.py $CsvHostExe $CsvPackageDir .\build\csv-plug
   .\build\csv-plugin\packages\csv-importer-worker\Release .\build\csv-plugin\packages\csv-faults-upgrade\Release
 ```
 
-The script installs two builds of the same CSV implementation in one profile, checks their process IDs, and calls both through the same synchronous and Task methods. It checks the native path with a request above the IPC size limit. It also covers service approval, receiver lifetime, catalog queries during callbacks, cancellation, activation and deactivation, profile recovery, and worker exit and timeout recovery. On Linux and macOS it checks that the worker exits when the host is killed during a pending call.
+The script installs two builds of the same CSV package in one profile, one per execution mode. It verifies ordered batch creation, ambiguous plugin ID lookup, candidate selection, and a round trip through the package's two importers and one exporter. It checks that the factories share a process and context, activate once, and are enabled or disabled together. The script also checks requests above the IPC size limit, service approval, receiver lifetime, catalog queries during callbacks, cancellation, and worker recovery. On Linux and macOS it checks that the worker exits when the host is killed during a pending call.
 
-The upgrade fixture keeps the same plugin identifier and contract and changes the release version. The script checks hot switching, restart switching, retained and deleted data, candidate activation failure, interruption during validation, and cleanup of files left after a commit.
+The upgrade fixture keeps the same plugin identifier and contracts and changes the release version. The script checks hot switching, restart switching, stale candidates, retained and deleted data, failures in activation and factory construction, interrupted validation, and cleanup after a commit.
 
 ## SDK and runtime
 
@@ -130,20 +133,33 @@ Mark each IPC-capable interface class with `HPK_REMOTE`. `hpk gen` takes its sel
 
 The generator preserves synchronous value or `void` results and asynchronous `huxerui::Task<T>` results. Methods may have no request or one value request. Synchronous methods also accept a const-reference request. A Task method may take a second argument of type `Receiver<T>`, an alias of `std::shared_ptr<T>`. Generate its Task-returning receiver interface from a separate header. Wire values include fixed-width integers, `bool`, `std::string`, vectors, optional values, and aggregate records. Both sides check the exact contract fingerprint.
 
-Register the extension point and its host services with an application-scoped `PluginManager`. Choose the mode and service grants when approving installation. Calls on a single plugin are serialized across instances.
+Register each extension point and the host services with an application-scoped `PluginManager`. Choose one execution mode and a set of service grants when approving the package. Managed calls on a package are serialized across its instances.
 
 ```cpp
 plugins.RegisterExtensionPoint(Importers);
+plugins.RegisterExtensionPoint(Exporters);
 plugins.ProvideService<ImportStatus>(status);
 plugins.InstallPackage(package, digest, {
     .mode = ExecutionMode::InProcess,
     .services = {std::string(Contract<ImportStatus>::Info.id)},
 });
 
-auto importer = plugins.CreateExtension(Importers, selected_id);
+auto candidates = plugins.ListExtensions(Importers);
+auto selected = std::ranges::find_if(candidates, [](const auto& candidate) {
+    return candidate.plugin_id == "example.csv" &&
+        std::ranges::find(candidate.file_extensions, ".csv") != candidate.file_extensions.end();
+});
+if (selected == candidates.end()) throw Error(ErrorCode::NotFound, "CSV importer unavailable");
+auto importer = plugins.CreateExtension(Importers, *selected);
 auto delimiter = importer->Delimiter();
 auto result = co_await importer->Import(request, progress);
+
+auto all_importers = plugins.CreateExtensions(Importers);
+auto package_importers = plugins.CreateExtensions(Importers, "example.csv");
+auto exporter = plugins.CreateExtension(Exporters, "example.csv");
 ```
+
+Candidates refer to the approved package digest. Query again after upgrading. `CreateExtension(point, plugin_id)` reports `Ambiguous` when the plugin provides several factories for that point. `CreateExtensions` returns handles in plugin ID order and in manifest order within each package.
 
 The handle releases the instance at scope exit. The first managed method starts the plugin and creates the instance. In-process calls invoke the real C++ object on the host's application thread with typed values. Worker calls encode values over IPC, and the worker calls the same implementation in a windowless Runtime. A synchronous IPC method blocks until it receives a result or reaches its deadline. It reports `Busy` if another business exchange is in progress and `CallbackUnavailable` if the method requests a host callback. Use Task methods for callbacks and work that needs to suspend.
 
@@ -155,14 +171,17 @@ Every activation owns one `PluginContext`. `Info()` supplies the manifest ID, re
 void OnActivate(const huxerui::pluginkit::PluginContext& context);
 void OnDeactivate(const huxerui::pluginkit::PluginContext& context);
 
-HPK_EXPORT_PLUGIN(csv_import::TableImporter, CsvImporter, OnActivate, OnDeactivate)
+HPK_EXPORT_PLUGIN(OnActivate, OnDeactivate,
+    huxerui::pluginkit::BindExtension<TableImporter, CsvImporter>(Importers),
+    huxerui::pluginkit::BindExtension<TableImporter, SemicolonImporter>(Importers),
+    huxerui::pluginkit::BindExtension<TableExporter, CsvExporter>(Exporters))
 ```
 
-Supply either hook as needed. Use `nullptr` for an omitted activation hook when supplying only deactivation. `OnActivate` runs once per activation before the first instance is constructed. On disable, uninstall, or shutdown, PluginKit stops admitting calls, drains active local work, destroys the instances, and calls `OnDeactivate` on orderly teardown. In-process libraries stay mapped until host exit. Worker teardown has a bounded deadline. Native-only contracts can publish `Contract<T>::Info` and use the same factory without generated code. Their handles borrow the real interface. Release those handles after their own work finishes and before awaiting plugin disable, uninstall, or shutdown.
+Use `nullptr` for each omitted hook. PluginKit validates the whole factory table before running `OnActivate` once for the package. All factories in a worker package share one worker. On disable, uninstall, or shutdown, PluginKit stops admitting calls, drains active local work, destroys the instances, and calls `OnDeactivate` on orderly teardown. In-process libraries stay mapped until host exit. Worker teardown has a bounded deadline. Native-only contracts can publish `Contract<T>::Info` and use `BindExtension` without generated code. A package needs generated dispatch for every factory to run in a worker. Release handles to native-only interfaces after their own work finishes and before awaiting plugin disable, uninstall, or shutdown.
 
 Register the host services and extension points, then await `ApplyPendingChanges()` before creating extensions. Inspect the results to report failed in-process upgrades. Call `UpgradePackage(directory, approval)` with the installed digest, the inspected replacement digest, and the full list of services approved for that release. The selected execution mode and enablement carry over. Open a new extension handle after the upgrade takes effect.
 
-An enabled replacement validates its activation and constructor on a private data copy. Plugins migrate their own format in `OnActivate`. Read the format marker before migrating so the same hook can run on later activations. A successful commit selects the replacement package, its data copy, and its grants together. A failed or interrupted validation leaves the last committed state selected. A disabled replacement stays disabled and activates on its first subsequent use. The profile owns these directories. Use `PluginContext::DataDirectory()` for the current activation's path.
+An enabled replacement runs `OnActivate` and exercises every factory's constructor on a private data copy. Plugins migrate their own format in `OnActivate`. Read the format marker before migrating so the same hook can run on later activations. A successful commit selects the replacement package, its data copy, and its grants together. A failed or interrupted validation leaves the last committed state selected. A disabled replacement stays disabled and activates on its first subsequent use. The profile owns these directories. Use `PluginContext::DataDirectory()` for the current activation's path.
 
 `UninstallPackage(id, digest)` preserves the last committed data. Use `PluginDataPolicy::Delete` to remove it. Reinstalling with the same identifier reuses retained data and requires a new grant approval. `CleanupPending` means uninstall committed and file cleanup will be retried when the profile is reopened. In-process libraries may require host exit before their files can be removed.
 
@@ -173,6 +192,8 @@ The host passes a `std::shared_ptr<T>` as the receiver argument. The plugin call
 `ListPlugins()` and `ListExtensions()` read catalog snapshots during callbacks. Other manager and worker operations are subject to reentry checks and can fail with `ReentrantCall`. Keep handlers bounded. A synchronous handler can run beyond the deadline, and any changes it already applied remain in effect.
 
 A directory package contains `plugin.json` and a platform-specific shared library. Use `plugin.dylib` for `macos-arm64`, `plugin.so` for `linux-x86_64-gnu`, and `plugin.dll` for `windows-x86_64-msvc`. The manifest lists `execution_modes` and carries the `cpp_abi` stamp for in-process packages. The SDK produced by the example publishes this stamp in `cpp-abi.txt`. Its digest is the SHA-256 of the concatenated lowercase hexadecimal SHA-256 digests of the raw manifest and library, in that order. The profile stores the approved snapshot, its mode, its service grants, and its enablement state.
+
+In the [CSV manifest](examples/csv_import/plugin/plugin.json.in), top-level `provides` lists the contract ID, version, and fingerprint from each generated `contract.json`. Top-level `extensions` declares one entry per factory with its `point`, `contract`, and optional `metadata.extensions` file suffixes. Repeat a point to publish several implementations of its contract. Keep their order the same in the manifest and `HPK_EXPORT_PLUGIN`. The relative order of different points can vary.
 
 On Linux each worker starts in a dedicated process group, receives the verified library file descriptor, and serves requests over a private Unix socket. A thread in the worker watches for host disconnects even during a plugin call. PluginKit owns the worker's exit status and reaps it while the host is running. Workers run under the application's user account and provide process fault isolation for trusted plugins.
 

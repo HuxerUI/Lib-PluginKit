@@ -3,8 +3,8 @@
 /// @file
 /// @brief Entry points shared by plugin libraries, in-process hosts, and workers.
 ///
-/// The loader resolves pluginkit_query_v1 and checks the descriptor size, ABI version, exact contract
-/// identity, and execution mode before activation. In-process loading also checks the C++ and HuxerUI
+/// The loader resolves pluginkit_query_v1 and checks the descriptor size, ABI version, factory table,
+/// and execution mode before activation. In-process loading also checks the C++ and HuxerUI
 /// application identities before using native interface pointers.
 
 #include <stdint.h>
@@ -28,6 +28,9 @@
 
 /// @brief Maximum size in bytes of an encoded request or response.
 #define HPK_MAX_PAYLOAD (8u * 1024u * 1024u)
+
+/// @brief Maximum number of factories published by one plugin library.
+#define HPK_MAX_EXTENSIONS 256u
 
 /// @brief Flag for native C++ calls in the host application.
 #define HPK_IN_PROCESS 1u
@@ -113,36 +116,21 @@ typedef struct hpk_plugin_context_v1 {
   const char* data_directory;
 } hpk_plugin_context_v1;
 
-/// @brief Descriptor and callbacks for one contract.
+/// @brief Factory and call bindings for one implementation of an extension point.
 ///
-/// Keep the descriptor and its strings valid while the library is loaded. Lifecycle callbacks run on the
-/// loading process's application thread. Report failures from status-returning callbacks with hpk_status_v1.
-typedef struct hpk_plugin_v1 {
-  /// Size of this descriptor in bytes.
-  uint32_t struct_size;
-  /// PluginKit ABI version.
-  uint32_t abi_version;
+/// Keep the entry and its strings valid while the library is loaded. Entries for the same point appear in
+/// manifest order. The host checks the exact identity of each entry before activating the package.
+typedef struct hpk_extension_v1 {
+  /// Identifier of the registered extension point in UTF-8.
+  const char* point;
+  /// Length of the extension point identifier in bytes.
+  uint32_t point_size;
   /// Null-terminated contract identifier.
   const char* contract_id;
   /// Declared contract version.
   uint32_t contract_version;
   /// Null-terminated lowercase SHA-256 of the generated schema.
   const char* contract_fingerprint;
-  /// Bitmask of supported execution modes. See HPK_IN_PROCESS and HPK_WORKER_PROCESS.
-  uint32_t execution_modes;
-  /// Null-terminated identity of the shared HuxerUI SDK and C++ build configuration for in-process calls.
-  const char* cpp_abi;
-
-  /// @brief Identifies the active HuxerUI application seen by the plugin on this thread.
-  /// @return Borrowed opaque application address or null when no application is active. The host compares
-  /// this value with its own application address before making in-process calls.
-  const void* (HPK_CALL *runtime_identity)(void);
-
-  /// @brief Initializes one plugin activation before creating any instances.
-  /// @param context Host-supplied values valid for the duration of the callback.
-  /// @param[out] activation Plugin-owned token shared by all instance creations. Set it to null on failure.
-  /// @return HPK_OK with a valid token or an error from hpk_status_v1.
-  int32_t (HPK_CALL *activate)(const hpk_plugin_context_v1* context, void** activation);
 
   /// @brief Creates a plugin-owned instance.
   /// @param activation Token from the successful activate callback.
@@ -166,6 +154,41 @@ typedef struct hpk_plugin_v1 {
                             uint32_t receiver, uint32_t operation, const uint8_t* data, uint32_t size,
                             hpk_complete_v1 complete, void* user);
 
+  /// @brief Destroys an instance allocated by this factory.
+  /// @param instance Instance returned by create.
+  void (HPK_CALL *close)(void* instance);
+} hpk_extension_v1;
+
+/// @brief Package-wide activation callbacks and all factories exported by one plugin library.
+///
+/// Keep this descriptor, its strings, and the factory table valid while the library is loaded.
+/// Lifecycle callbacks run on the loading process's application thread. Report failures from
+/// status-returning callbacks with hpk_status_v1.
+typedef struct hpk_plugin_v1 {
+  /// Size of this descriptor in bytes.
+  uint32_t struct_size;
+  /// PluginKit ABI version.
+  uint32_t abi_version;
+  /// Bitmask of supported execution modes. See HPK_IN_PROCESS and HPK_WORKER_PROCESS.
+  uint32_t execution_modes;
+  /// Null-terminated identity of the shared HuxerUI SDK and C++ build configuration for in-process calls.
+  const char* cpp_abi;
+  /// Number of entries in extensions, from one through HPK_MAX_EXTENSIONS.
+  uint32_t extension_count;
+  /// Read-only factory table owned by the library.
+  const hpk_extension_v1* extensions;
+
+  /// @brief Identifies the active HuxerUI application seen by the plugin on this thread.
+  /// @return Borrowed opaque application address or null when no application is active. The host compares
+  /// this value with its own application address before making in-process calls.
+  const void* (HPK_CALL *runtime_identity)(void);
+
+  /// @brief Initializes one plugin activation before creating any instances.
+  /// @param context Host-supplied values valid for the duration of the callback.
+  /// @param[out] activation Plugin-owned token shared by all factories. Set it to null on failure.
+  /// @return HPK_OK with a valid token or an error from hpk_status_v1.
+  int32_t (HPK_CALL *activate)(const hpk_plugin_context_v1* context, void** activation);
+
   /// @brief Sets the plugin library's thread-local context for a synchronous in-process call.
   /// @param context Borrowed C++ invocation context valid until the previous value is restored. Pass null to clear it.
   /// @return Previous context. Restore it on the same application thread when the call exits.
@@ -179,10 +202,6 @@ typedef struct hpk_plugin_v1 {
   /// @brief Removes the invocation registration and releases its token.
   /// @param registration Token returned by attach_invocation. Remove it before destroying the borrowed context.
   void (HPK_CALL *detach_invocation)(void* registration);
-
-  /// @brief Destroys an instance allocated by this library.
-  /// @param instance Instance returned by create.
-  void (HPK_CALL *close)(void* instance);
 
   /// @brief Releases the activation after all instances have been destroyed.
   /// @param activation Token returned by activate. Release it even if cleanup reports failure.

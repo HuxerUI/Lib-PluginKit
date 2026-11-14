@@ -64,7 +64,7 @@ def verify_default_profile(host, scratch):
         timeout=30,
     )
     assert process.returncode == 0, process
-    assert json.loads(process.stdout) == {"ok": True, "plugins": [], "importers": []}, process
+    assert json.loads(process.stdout) == {"ok": True, "plugins": [], "importers": [], "exporters": []}, process
     assert (profile / "profile.lock").is_file()
 
 
@@ -167,7 +167,7 @@ def verify_plugin_context(host, faults, fault_id, fault_digest, valid, scratch, 
     assert log.read_text().splitlines() == ["activate", "deactivate"] * 2
 
 
-def verify_mixed(host, package, worker_csv, faults, scratch, sample):
+def verify_mixed(host, package, worker_csv, faults, scratch, sample, valid):
     profile = scratch / "mixed profile"
     local_id = "example.csv"
     worker_id = "example.csv-worker"
@@ -186,6 +186,8 @@ def verify_mixed(host, package, worker_csv, faults, scratch, sample):
     data = installed_data(profile, fault_id)
     data.mkdir(parents=True)
     (data / "sync-service").touch()
+    ssv = scratch / "quoted cells.ssv"
+    ssv.write_bytes('name;city;note\r\n"Chen, Lin";上海;"first\r\nsecond ""line"""\r\n'.encode("utf-8"))
     replies = run(host, profile, commands=[
         ("pid",), ("list",),
         ("import", sample, local_id), ("status",), ("reset-status",),
@@ -207,6 +209,28 @@ def verify_mixed(host, package, worker_csv, faults, scratch, sample):
     assert big_local["ok"] and len(big_local["table"]["rows"][0][0]) == 8 * 1024 * 1024
     check_error(big_worker, "payload_too_large")
     check_error(sync_callback, "callback_unavailable")
+
+    for plugin_id, mode in ((local_id, "in_process"), (worker_id, "worker_process")):
+        log = installed_data(profile, plugin_id) / "lifecycle.log"
+        previous = log.read_text().splitlines()
+        pid, round_trip, live, disabled, hidden, enabled, visible = run(host, profile, commands=[
+            ("pid",), ("round-trip", valid, ssv, plugin_id), ("list",),
+            ("disable", plugin_id), ("list",), ("enable", plugin_id), ("list",),
+        ])
+        assert round_trip["ok"] and round_trip["all_importers"] == 5 and round_trip["package_importers"] == 2, round_trip
+        assert round_trip["format"] == "csv" and round_trip["csv"] == (
+            '"name","city","note"\r\n"Chen, Lin","上海","first\r\nsecond ""line"""\r\n'
+        ), round_trip
+        if mode == "in_process":
+            assert round_trip["plugin_pid"] == pid["pid"], round_trip
+        else:
+            assert round_trip["plugin_pid"] == plugin(live, plugin_id)["worker_pid"] != pid["pid"], live
+        assert disabled["ok"] and enabled["ok"] and plugin(hidden, plugin_id)["worker_pid"] is None, hidden
+        assert all(item["plugin"] != plugin_id for point in ("importers", "exporters") for item in hidden[point]), hidden
+        assert [item["extensions"] for item in visible["importers"] if item["plugin"] == plugin_id] == [[".csv"], [".ssv"]]
+        assert [item["extensions"] for item in visible["exporters"] if item["plugin"] == plugin_id] == [[".csv"]]
+        assert log.read_text().splitlines() == previous + ["activate", "deactivate"]
+
     assert run(host, profile, "import", sample, local_id)["table"] == local["table"]
     assert run(host, profile, "import", sample, worker_id)["table"] == worker["table"]
     check_error(run(host, profile, "install", package, local_digest, "worker_process", "status"), "already_installed")
@@ -224,6 +248,27 @@ def verify_mixed(host, package, worker_csv, faults, scratch, sample):
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     wrong_digest = run(host, denied_profile, "inspect", wrong_abi)["digest"]
     check_error(run(host, denied_profile, "install", wrong_abi, wrong_digest, "in_process"), "contract_mismatch")
+
+
+def verify_factory_table(host, package, scratch, valid):
+    source = scratch / "mismatched factory table"
+    shutil.copytree(package, source)
+    path = source / "plugin.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    assert len(manifest["provides"]) == 2 and len(manifest["extensions"]) == 3, manifest
+    assert all("id" not in extension for extension in manifest["extensions"]), manifest
+    manifest["extensions"][-1]["id"] = "export"
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    check_error(run(host, scratch / "legacy extension id", "inspect", source), "invalid_package")
+    del manifest["extensions"][-1]["id"]
+    manifest["extensions"].append(manifest["extensions"][-1])
+    path.write_text(json.dumps(manifest), encoding="utf-8")
+    for mode in ("in_process", "worker_process"):
+        profile = scratch / f"mismatched table {mode}"
+        package_info = run(host, profile, "inspect", source)
+        assert run(host, profile, "install", source, package_info["digest"], mode, "status")["ok"]
+        check_error(run(host, profile, "import", valid, package_info["id"]), "contract_mismatch")
+        assert not (installed_data(profile, package_info["id"]) / "lifecycle.log").exists()
 
 
 def verify_local_lifetime(host, faults, digest, fault_id, scratch, valid):
@@ -288,16 +333,17 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     (data / "retained.txt").write_text("user data", encoding="utf-8")
     check_error(run(host, profile, "upgrade", replacement, "0" * 64, new), "approval_mismatch")
     check_error(run(host, profile, "upgrade", replacement, old, "0" * 64), "approval_mismatch")
-    failed = data / "fail-upgrade"
-    failed.touch()
-    broken, unchanged, imported = run(host, profile, commands=[
-        ("upgrade", replacement, old, new), ("list",), ("import", valid, plugin_id),
-    ])
-    check_error(broken, "plugin_failed")
-    assert plugin(unchanged, plugin_id)["digest"] == old and imported["ok"], (unchanged, imported)
-    assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
-    assert not (profile / "packages" / new).exists()
-    failed.unlink()
+    for failure in ("fail-upgrade", "fail-exporter"):
+        failed = data / failure
+        failed.touch()
+        broken, unchanged, imported = run(host, profile, commands=[
+            ("upgrade", replacement, old, new), ("list",), ("import", valid, plugin_id),
+        ])
+        check_error(broken, "plugin_failed")
+        assert plugin(unchanged, plugin_id)["digest"] == old and imported["ok"], (unchanged, imported)
+        assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
+        assert not (profile / "packages" / new).exists()
+        failed.unlink()
 
     status_request = scratch / "upgrade status.csv"
     status_request.write_bytes(b"status")
@@ -335,10 +381,10 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     data = installed_data(rejected, plugin_id)
     data.mkdir(parents=True)
     (data / "data-format").write_text("1", encoding="utf-8")
-    (data / "fail-upgrade").touch()
+    (data / "fail-exporter").touch()
     assert run(host, rejected, "upgrade", replacement, old, new)["result"] == "restart_required"
     listed, blocked = run(host, rejected, commands=[("list",), ("import", valid, plugin_id)])
-    assert plugin(listed, plugin_id)["digest"] == old and not listed["importers"], listed
+    assert plugin(listed, plugin_id)["digest"] == old and not listed["importers"] and not listed["exporters"], listed
     check_error(blocked, "not_found")
     assert (data / "data-format").read_text() == "1"
     recovered = run(host, rejected, "check-plugin-context", plugin_id)
@@ -353,7 +399,7 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     (data / "data-format").write_text("1", encoding="utf-8")
     assert run(host, disabled, "upgrade", replacement, old, new)["result"] == "applied"
     listed = run(host, disabled, "list")
-    assert not listed["importers"] and not plugin(listed, plugin_id)["enabled"], listed
+    assert not listed["importers"] and not listed["exporters"] and not plugin(listed, plugin_id)["enabled"], listed
     assert (installed_data(disabled, plugin_id) / "data-format").read_text() == "1"
     assert run(host, disabled, "enable", plugin_id)["ok"]
     assert run(host, disabled, "import", valid, plugin_id)["ok"]
@@ -375,7 +421,7 @@ def verify_uninstall(host, faults, replacement, scratch, valid):
         ("import", valid, plugin_id), ("uninstall", plugin_id, old), ("list",),
     ])
     assert imported["ok"] and removed["result"] == "removed", (imported, removed)
-    assert not listed["plugins"] and not listed["importers"], listed
+    assert not listed["plugins"] and not listed["importers"] and not listed["exporters"], listed
     assert not (profile / "packages" / old).exists() and (data / "retained.txt").exists()
     assert run(host, profile, "install", faults, old, "worker_process")["ok"]
     assert installed_data(profile, plugin_id) == data
@@ -525,7 +571,7 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
     wrong_contract.mkdir()
     shutil.copyfile(package / module_name, wrong_contract / module_name)
     manifest = json.loads((package / "plugin.json").read_text(encoding="utf-8"))
-    manifest["contract"]["fingerprint"] = "0" * 64
+    manifest["provides"][1]["fingerprint"] = "0" * 64
     (wrong_contract / "plugin.json").write_text(json.dumps(manifest), encoding="utf-8")
     wrong_digest = run(host, profile, "inspect", wrong_contract)["digest"]
     check_error(run(host, profile, "install", wrong_contract, wrong_digest, "worker_process"), "contract_mismatch")
@@ -638,7 +684,8 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
     repaired = run(host, modified_profile, "import", valid, csv_id)
     assert repaired["ok"] and repaired["table"] == expected
 
-    verify_mixed(host, package, worker_csv, faults, scratch, sample)
+    verify_mixed(host, package, worker_csv, faults, scratch, sample, valid)
+    verify_factory_table(host, package, scratch, valid)
     verify_local_lifetime(host, faults, fault_digest, fault_id, scratch, valid)
     assert run(host, scratch / "in-process-only profile", "check-disable-during-create", package) == {
         "ok": True, "delimiter": ",",

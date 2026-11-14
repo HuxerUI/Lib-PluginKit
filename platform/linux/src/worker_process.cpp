@@ -32,7 +32,7 @@ Handle DuplicateForSpawn(int fd) {
   return copy;
 }
 
-pid_t Spawn(const std::filesystem::path& executable, int socket, int module, ContractInfo contract) {
+pid_t Spawn(const std::filesystem::path& executable, int socket, int module) {
   const auto socket_copy = DuplicateForSpawn(socket);
   const auto module_copy = DuplicateForSpawn(module);
   SpawnActions actions;
@@ -56,10 +56,7 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, int module, Con
              "Cannot set worker spawn flags");
 
   auto program = executable.native();
-  std::string id(contract.id);
-  auto version = std::to_string(contract.version);
-  std::string fingerprint(contract.fingerprint);
-  char* args[]{program.data(), id.data(), version.data(), fingerprint.data(), nullptr};
+  char* args[]{program.data(), nullptr};
   pid_t child = 0;
   CheckSpawn(::posix_spawn(&child, executable.c_str(), &actions.value, &attributes.value, args, environ),
              "Cannot start hpk-worker");
@@ -69,7 +66,7 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, int module, Con
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path&, const Handle& verified_module,
-               ContractInfo contract, std::vector<Service> services, TaskScope callbacks, PluginStartup startup)
+               std::vector<Service> services, TaskScope callbacks, PluginStartup startup)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(startup)) {
   int sockets[2];
   if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) != 0) {
@@ -77,7 +74,7 @@ Worker::Worker(const std::filesystem::path& executable, const std::filesystem::p
   }
   socket_.reset(sockets[0]);
   Handle peer(sockets[1]);
-  const auto child = Spawn(executable, peer.get(), verified_module.get(), contract);
+  const auto child = Spawn(executable, peer.get(), verified_module.get());
   peer.reset();
   StartReaper(child);
 }

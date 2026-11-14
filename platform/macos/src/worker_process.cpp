@@ -25,8 +25,7 @@ struct SpawnAttributes {
   posix_spawnattr_t value{};
 };
 
-pid_t Spawn(const std::filesystem::path& executable, int socket, const std::filesystem::path& module,
-            ContractInfo contract) {
+pid_t Spawn(const std::filesystem::path& executable, int socket, const std::filesystem::path& module) {
   Handle socket_copy(::fcntl(socket, F_DUPFD_CLOEXEC, WorkerSocket + 1));
   if (!socket_copy) PosixError(ErrorCode::Io, "Cannot duplicate worker socket");
 
@@ -48,10 +47,7 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, const std::file
 
   auto program = executable.native();
   auto module_path = module.native();
-  std::string id(contract.id);
-  auto version = std::to_string(contract.version);
-  std::string fingerprint(contract.fingerprint);
-  char* args[]{program.data(), id.data(), version.data(), fingerprint.data(), module_path.data(), nullptr};
+  char* args[]{program.data(), module_path.data(), nullptr};
 
   // Use the approved package path without dyld environment overrides.
   std::vector<char*> environment;
@@ -69,7 +65,7 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, const std::file
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               ContractInfo contract, std::vector<Service> services, TaskScope callbacks, PluginStartup startup)
+               std::vector<Service> services, TaskScope callbacks, PluginStartup startup)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(startup)) {
   int sockets[2];
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
@@ -84,7 +80,7 @@ Worker::Worker(const std::filesystem::path& executable, const std::filesystem::p
       PosixError(ErrorCode::Io, "Cannot configure worker socket");
     }
   }
-  const auto child = Spawn(executable, peer.get(), module, contract);
+  const auto child = Spawn(executable, peer.get(), module);
   peer.reset();
   StartReaper(child);
 }

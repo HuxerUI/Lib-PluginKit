@@ -36,8 +36,10 @@ Json ParseJson(std::span<const std::byte> bytes, int max_depth, ErrorCode error)
   });
 }
 
-bool Matches(const PackageInfo& info, ContractInfo contract) {
-  return ContractInfo{info.contract_id, info.contract_version, info.contract_fingerprint} == contract;
+const PackageContract& ProvidedContract(const PackageInfo& info, std::string_view id) {
+  const auto found = std::ranges::find(info.provides, id, &PackageContract::id);
+  if (found == info.provides.end()) throw Error(ErrorCode::InvalidPackage, "An extension references an undeclared contract");
+  return *found;
 }
 
 std::string_view ModeName(ExecutionMode mode) {
@@ -60,21 +62,53 @@ PackageInfo ParseManifest(const Json& manifest, std::string digest) {
         manifest.at("target") != PackageTarget) {
       throw Error(ErrorCode::InvalidPackage, "The package schema or target is unsupported");
     }
-    const auto& contract = manifest.at("contract");
-    const auto& extension = manifest.at("extension");
-    const auto& version = contract.at("version");
-    if (!version.is_number_unsigned() || version == 0 || version > UINT32_MAX) {
-      throw Error(ErrorCode::InvalidPackage, "The contract version must be a positive 32-bit integer");
-    }
     PackageInfo info{
         manifest.at("id").get<std::string>(), manifest.at("version").get<std::string>(), std::move(digest),
-        contract.at("id").get<std::string>(), version.get<std::uint32_t>(),
-        contract.at("fingerprint").get<std::string>(), extension.at("point").get<std::string>(),
-        extension.at("id").get<std::string>(), extension.at("extensions").get<std::vector<std::string>>(), {},
-        manifest.at("cpp_abi").get<std::string>()};
-    if (!IsId(info.id) || !IsId(info.version) || !IsId(info.contract_id) || !IsId(info.point) ||
-        !IsId(info.contribution) || !IsDigest(info.contract_fingerprint) || info.extensions.size() > 32) {
-      throw Error(ErrorCode::InvalidPackage, "Invalid plugin identity, contract, or extension metadata");
+        {}, {}, {}, manifest.at("cpp_abi").get<std::string>()};
+    if (!IsId(info.id) || !IsId(info.version)) throw Error(ErrorCode::InvalidPackage, "Invalid plugin identity");
+    const auto& provides = manifest.at("provides");
+    const auto& extensions = manifest.at("extensions");
+    if (!provides.is_array() || provides.empty() || provides.size() > HPK_MAX_EXTENSIONS ||
+        !extensions.is_array() || extensions.empty() || extensions.size() > HPK_MAX_EXTENSIONS) {
+      throw Error(ErrorCode::InvalidPackage, "Invalid provided contract or extension list");
+    }
+    for (const auto& contract : provides) {
+      const auto& version = contract.at("version");
+      PackageContract entry{contract.at("id").get<std::string>(), 0, contract.at("fingerprint").get<std::string>()};
+      if (!IsId(entry.id) || !IsDigest(entry.fingerprint) || !version.is_number_unsigned() ||
+          version == 0 || version > UINT32_MAX ||
+          std::ranges::find(info.provides, entry.id, &PackageContract::id) != info.provides.end()) {
+        throw Error(ErrorCode::InvalidPackage, "Invalid or duplicate provided contract");
+      }
+      entry.version = version.get<std::uint32_t>();
+      info.provides.push_back(std::move(entry));
+    }
+    for (const auto& extension : extensions) {
+      if (extension.contains("id")) throw Error(ErrorCode::InvalidPackage, "An extension is identified by its point and order");
+      PackageExtension entry{extension.at("point").get<std::string>(), extension.at("contract").get<std::string>(), {}};
+      if (const auto metadata = extension.find("metadata"); metadata != extension.end()) {
+        if (!metadata->is_object()) throw Error(ErrorCode::InvalidPackage, "Invalid extension metadata");
+        entry.file_extensions = metadata->value("extensions", std::vector<std::string>{});
+      }
+      if (!IsId(entry.point) || entry.file_extensions.size() > 32) {
+        throw Error(ErrorCode::InvalidPackage, "Invalid extension point or metadata");
+      }
+      (void)ProvidedContract(info, entry.contract);
+      for (const auto& suffix : entry.file_extensions) {
+        if (!suffix.starts_with('.') || !IsId(std::string_view(suffix).substr(1))) {
+          throw Error(ErrorCode::InvalidPackage, "Invalid file suffix in the manifest");
+        }
+      }
+      const auto same_point = std::ranges::find(info.extensions, entry.point, &PackageExtension::point);
+      if (same_point != info.extensions.end() && same_point->contract != entry.contract) {
+        throw Error(ErrorCode::InvalidPackage, "Factories at one extension point must use the same contract");
+      }
+      info.extensions.push_back(std::move(entry));
+    }
+    for (const auto& contract : info.provides) {
+      if (std::ranges::find(info.extensions, contract.id, &PackageExtension::contract) == info.extensions.end()) {
+        throw Error(ErrorCode::InvalidPackage, "A provided contract has no extension factory");
+      }
     }
     const auto modes = manifest.at("execution_modes").get<std::vector<std::string>>();
     if (modes.empty() || modes.size() > 2) throw Error(ErrorCode::InvalidPackage, "Invalid execution mode list");
@@ -88,11 +122,6 @@ PackageInfo ParseManifest(const Json& manifest, std::string digest) {
     if (std::ranges::find(info.execution_modes, ExecutionMode::InProcess) != info.execution_modes.end() &&
         (info.cpp_abi.empty() || info.cpp_abi.size() > 256 || info.cpp_abi.find('\0') != std::string::npos)) {
       throw Error(ErrorCode::InvalidPackage, "Missing or invalid in-process ABI identity");
-    }
-    for (const auto& suffix : info.extensions) {
-      if (!suffix.starts_with('.') || !IsId(std::string_view(suffix).substr(1))) {
-        throw Error(ErrorCode::InvalidPackage, "Invalid file suffix in the manifest");
-      }
     }
     return info;
   } catch (const Json::exception& error) {
@@ -590,6 +619,7 @@ std::string_view ErrorName(ErrorCode code) noexcept {
     case ErrorCode::UnsupportedMode: return "unsupported_mode";
     case ErrorCode::CallbackUnavailable: return "callback_unavailable";
     case ErrorCode::Busy: return "busy";
+    case ErrorCode::Ambiguous: return "ambiguous";
   }
   return "unknown";
 }
@@ -665,13 +695,18 @@ void PluginManager::Provide(ContractInfo contract, std::shared_ptr<void> impleme
 }
 
 void PluginManager::Impl::ValidatePackage(const PackageInfo& info, InstallOptions& options) const {
-  const auto point = points.find(info.point);
-  if (point == points.end() || !Matches(info, point->second.Info())) {
-    throw Error(ErrorCode::ContractMismatch, "The package does not match a registered extension point");
-  }
   if (std::ranges::find(info.execution_modes, options.mode) == info.execution_modes.end() ||
-      (options.mode == ExecutionMode::WorkerProcess && (!point->second.remote || !worker_executable))) {
-    throw Error(ErrorCode::UnsupportedMode, "The package or extension point cannot use the selected execution mode");
+      (options.mode == ExecutionMode::WorkerProcess && !worker_executable)) {
+    throw Error(ErrorCode::UnsupportedMode, "The package or host cannot use the selected execution mode");
+  }
+  for (const auto& extension : info.extensions) {
+    const auto point = points.find(extension.point);
+    if (point == points.end() || ProvidedContract(info, extension.contract).Info() != point->second.Info()) {
+      throw Error(ErrorCode::ContractMismatch, "The package does not match extension point " + extension.point);
+    }
+    if (options.mode == ExecutionMode::WorkerProcess && !point->second.remote) {
+      throw Error(ErrorCode::UnsupportedMode, "The extension point cannot use a worker: " + extension.point);
+    }
   }
   if (options.mode == ExecutionMode::InProcess && info.cpp_abi != CppAbi) {
     throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
@@ -943,11 +978,7 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     auto package = co_await RunTransport(prepare);
     if (replacement->enabled && replacement->approval.mode == ExecutionMode::WorkerProcess) {
       worker = MakeWorker(*replacement, package, std::move(granted));
-      co_await RunTransport([worker](std::stop_token stop) {
-        const auto instance = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, {}}, DefaultTimeout,
-                                              nullptr, stop).instance;
-        worker->Request({static_cast<std::uint32_t>(Command::Close), instance, 0, {}}, DefaultTimeout, nullptr, stop);
-      });
+      co_await RunTransport([worker](std::stop_token stop) { worker->ValidateFactories(stop); });
     } else if (replacement->enabled) {
       local = MakeLocal(*replacement);
       ValidateLocalPlugin(local);
@@ -1123,21 +1154,27 @@ std::vector<PluginInfo> PluginManager::ListPlugins() const {
   return result;
 }
 
-std::vector<ExtensionInfo> PluginManager::List(std::string_view point, ContractInfo contract) const {
+std::vector<ExtensionInfo> PluginManager::List(std::string_view point, ContractInfo contract,
+                                               std::optional<std::string_view> plugin_id) const {
   std::lock_guard lock(impl_->mutex);
   impl_->RequirePoint(point, contract);
   std::vector<ExtensionInfo> result;
   for (const auto& [id, plugin] : impl_->profile_state.plugins) {
-    if (plugin.enabled && plugin.info.point == point && Matches(plugin.info, contract) &&
-        !impl_->IsPluginBusy(id, plugin)) {
-      result.push_back({{id, plugin.info.contribution}, plugin.info.extensions});
+    if ((plugin_id && id != *plugin_id) || !plugin.enabled || impl_->IsPluginBusy(id, plugin)) continue;
+    std::uint32_t ordinal = 0;
+    for (const auto& extension : plugin.info.extensions) {
+      if (extension.point != point) continue;
+      if (ProvidedContract(plugin.info, extension.contract).Info() == contract) {
+        result.push_back(ExtensionInfo(id, extension, plugin.info.digest, ordinal));
+      }
+      ++ordinal;
     }
   }
   return result;
 }
 
 std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, ContractInfo contract,
-                                                         const ExtensionId& id, std::chrono::milliseconds timeout) {
+    std::string_view plugin_id, const ExtensionInfo* candidate, std::chrono::milliseconds timeout) {
   if (timeout <= std::chrono::milliseconds::zero() || timeout > std::chrono::hours(24)) {
     throw Error(ErrorCode::InvalidArgument, "Extension timeout must be between 1 ms and 24 hours");
   }
@@ -1145,33 +1182,52 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
   if (impl_->closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
   const auto& registered = impl_->RequirePoint(point, contract);
   const auto& plugins = impl_->profile_state.plugins;
-  const auto plugin = plugins.find(id.plugin);
-  if (plugin == plugins.end() || plugin->second.info.point != point ||
-      plugin->second.info.contribution != id.contribution) {
-    throw Error(ErrorCode::NotFound, "The extension is not installed at this point");
-  }
+  const auto plugin = plugins.find(plugin_id);
+  if (plugin == plugins.end()) throw Error(ErrorCode::NotFound, "The plugin is not installed");
   const auto& installed = plugin->second;
+  // An ordinal only identifies the same factory within one approved package snapshot.
+  if (candidate && candidate->digest_ != installed.info.digest) {
+    throw Error(ErrorCode::PackageChanged, "Query the extension candidates again after a package change");
+  }
   if (!installed.enabled) throw Error(ErrorCode::Disabled, "The plugin is disabled");
-  if (!Matches(installed.info, contract)) throw Error(ErrorCode::ContractMismatch, "The installed contract differs");
-  if (impl_->IsPluginBusy(id.plugin, installed)) {
+  if (impl_->IsPluginBusy(plugin_id, installed)) {
     throw Error(ErrorCode::Busy, "The plugin has a pending version change, restart, or uninstall");
   }
+  const auto& extensions = installed.info.extensions;
+  if (candidate && candidate->point_ != point) {
+    throw Error(ErrorCode::NotFound, "The candidate belongs to a different extension point");
+  }
+  bool selected = false;
+  std::uint32_t ordinal = 0;
+  for (const auto& extension : extensions) {
+    if (extension.point != point) continue;
+    if (candidate && ordinal != candidate->ordinal_) {
+      ++ordinal;
+      continue;
+    }
+    if (selected) throw Error(ErrorCode::Ambiguous, "The plugin provides multiple factories at this extension point");
+    if (ProvidedContract(installed.info, extension.contract).Info() != contract) {
+      throw Error(ErrorCode::ContractMismatch, "The installed contract differs from the requested contract");
+    }
+    selected = true;
+    if (candidate) break;
+  }
+  if (!selected) throw Error(ErrorCode::NotFound, "The plugin has no such factory at this extension point");
 
   if (installed.approval.mode == ExecutionMode::WorkerProcess) {
     if (!registered.remote || !impl_->worker_executable) {
       throw Error(ErrorCode::UnsupportedMode, "The extension cannot use a worker");
     }
-    const auto admission = impl_->admissions.try_emplace(id.plugin).first->second.get_token();
-    return MakeWorkerExtension([impl = impl_, id = id.plugin, admission](Deadline deadline, std::stop_token stop) {
+    const auto admission = impl_->admissions.try_emplace(plugin->first).first->second.get_token();
+    return MakeWorkerExtension([impl = impl_, id = plugin->first, admission](Deadline deadline, std::stop_token stop) {
       return impl->StartWorker(id, admission, deadline, stop);
-    }, timeout, admission);
+    }, timeout, admission, ExtensionPayload(point, ordinal));
   }
 
-  const auto running = impl_->local_plugins.find(id.plugin);
-  if (running != impl_->local_plugins.end()) return MakeLocalExtension(running->second, timeout);
-  auto local = impl_->MakeLocal(installed);
-  impl_->local_plugins.emplace(id.plugin, local);
-  return MakeLocalExtension(std::move(local), timeout);
+  const auto running = impl_->local_plugins.find(plugin_id);
+  auto local = running == impl_->local_plugins.end() ? impl_->MakeLocal(installed) : running->second;
+  if (running == impl_->local_plugins.end()) impl_->local_plugins.emplace(plugin->first, local);
+  return MakeLocalExtension(std::move(local), std::string(point), ordinal, timeout);
 }
 
 std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& installed) {
@@ -1183,9 +1239,7 @@ std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& ins
     }
     auto package = impl->VerifyPackage(installed);
     const auto module = impl->PackageDirectory(package.info.digest) / ModuleName;
-    const ContractInfo contract{installed.info.contract_id, installed.info.contract_version,
-                                installed.info.contract_fingerprint};
-    const auto* binding = &LoadInProcessModule(module, std::move(package.module_file), contract, impl->profile,
+    const auto* binding = &LoadInProcessModule(module, std::move(package.module_file), impl->profile,
                                                installed.info.id, installed.info.digest);
     const auto* runtime = RuntimeIdentity();
     if (!runtime || !binding->cpp_abi || installed.info.cpp_abi != binding->cpp_abi || !binding->runtime_identity ||
@@ -1213,7 +1267,12 @@ PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
   const auto& info = installed.info;
   const auto directory = PackageDirectory(info.digest);
   const auto data = DataDirectory(installed.data);
-  return {info.id, info.version, info.digest, PathText(directory), PathText(data)};
+  PluginStartup startup{info.id, info.version, info.digest, PathText(directory), PathText(data), {}};
+  startup.extensions.reserve(info.extensions.size());
+  for (const auto& extension : info.extensions) {
+    startup.extensions.push_back({extension.point, ProvidedContract(info, extension.contract)});
+  }
+  return startup;
 }
 
 std::vector<Worker::Service> PluginManager::Impl::WorkerServices(const Installed& installed) const {
@@ -1229,8 +1288,7 @@ std::shared_ptr<Worker> PluginManager::Impl::MakeWorker(const Installed& install
                                                         std::vector<Worker::Service> granted) {
   const auto& info = installed.info;
   return std::make_shared<Worker>(*worker_executable, PackageDirectory(info.digest) / ModuleName, package.module_file,
-      ContractInfo{info.contract_id, info.contract_version, info.contract_fingerprint}, std::move(granted), callbacks,
-      Startup(installed));
+      std::move(granted), callbacks, Startup(installed));
 }
 
 std::shared_ptr<Worker> PluginManager::Impl::StartWorker(const std::string& id, const std::stop_token& admission,

@@ -3,14 +3,16 @@
 /// @file
 /// @brief Plugin context, host services, and export bindings for plugin implementations.
 ///
-/// Include the generated bindings for the implemented HPK_REMOTE interface and export its implementation
-/// with HPK_EXPORT_PLUGIN. In-process plugins use the host's HuxerUI application. Worker plugins run
+/// Include the generated bindings for each implemented HPK_REMOTE interface and publish the package's
+/// factories with HPK_EXPORT_PLUGIN. In-process plugins use the host's HuxerUI application. Worker plugins run
 /// in a separate windowless HuxerUI application.
 
 #include <huxerui/file.h>
 #include <huxerui/app.h>
 #include <huxerui/pluginkit/detail/extension.h>
 
+#include <algorithm>
+#include <array>
 #include <concepts>
 #include <memory>
 #include <string>
@@ -182,61 +184,86 @@ Task<void> DispatchPlugin(Interface& instance, const hpk_host_v1* host, std::uin
   }
 }
 
-} // namespace detail
+inline std::int32_t PluginStatus(const Error& error) noexcept {
+  switch (error.Code()) {
+    case ErrorCode::PayloadTooLarge: return HPK_PAYLOAD_TOO_LARGE;
+    case ErrorCode::Protocol: return HPK_INVALID_REQUEST;
+    case ErrorCode::ServiceDenied: return HPK_SERVICE_DENIED;
+    case ErrorCode::ServiceUnavailable: return HPK_SERVICE_UNAVAILABLE;
+    case ErrorCode::ReentrantCall: return HPK_REENTRANT_CALL;
+    case ErrorCode::ReceiverClosed: return HPK_RECEIVER_CLOSED;
+    case ErrorCode::ContractMismatch: return HPK_CONTRACT_MISMATCH;
+    case ErrorCode::Closed: return HPK_CLOSED;
+    case ErrorCode::CallbackUnavailable: return HPK_CALLBACK_UNAVAILABLE;
+    case ErrorCode::Busy: return HPK_BUSY;
+    default: return HPK_PLUGIN_FAILED;
+  }
+}
 
-/// @brief Builds the ABI descriptor for a published contract and its implementation.
-///
-/// The descriptor creates and destroys instances inside the library. HPK_REMOTE bindings also publish
-/// worker dispatch and lend encoded result buffers to completion callbacks. Both modes create a single
-/// PluginContext for each activation. If both constructors are available, the context overload is used.
-/// @tparam Interface Interface with a public virtual destructor and a Contract specialization.
-/// @tparam Implementation Public implementation constructible from const PluginContext& or by default.
-/// @tparam OnActivate Optional initialization hook called before creating any instances. An exception fails activation.
-/// @tparam OnDeactivate Optional cleanup hook called during orderly teardown after all instances are destroyed.
-/// @note Hooks run on the loading process's application thread. A terminated worker may skip teardown.
-/// @return Reference to a descriptor that remains valid while the plugin library is loaded.
-template<class Interface, class Implementation,
-         void (*OnActivate)(const PluginContext&) = nullptr, void (*OnDeactivate)(const PluginContext&) = nullptr>
-  requires std::derived_from<Implementation, Interface> &&
-           std::has_virtual_destructor_v<Interface> &&
-           (std::constructible_from<Implementation, const PluginContext&> || std::default_initializable<Implementation>)
-const hpk_plugin_v1& Bind() noexcept {
-  static constexpr auto status = [](const Error& error) noexcept -> std::int32_t {
-    switch (error.Code()) {
-      case ErrorCode::PayloadTooLarge: return HPK_PAYLOAD_TOO_LARGE;
-      case ErrorCode::Protocol: return HPK_INVALID_REQUEST;
-      case ErrorCode::ServiceDenied: return HPK_SERVICE_DENIED;
-      case ErrorCode::ServiceUnavailable: return HPK_SERVICE_UNAVAILABLE;
-      case ErrorCode::ReentrantCall: return HPK_REENTRANT_CALL;
-      case ErrorCode::ReceiverClosed: return HPK_RECEIVER_CLOSED;
-      case ErrorCode::ContractMismatch: return HPK_CONTRACT_MISMATCH;
-      case ErrorCode::Closed: return HPK_CLOSED;
-      case ErrorCode::CallbackUnavailable: return HPK_CALLBACK_UNAVAILABLE;
-      case ErrorCode::Busy: return HPK_BUSY;
-      default: return HPK_PLUGIN_FAILED;
-    }
-  };
-  constexpr bool remote = requires(Interface& instance, Bytes request, detail::DispatchContext context) {
-    Contract<Interface>::Dispatch(instance, std::uint32_t{}, std::move(request), context);
-  };
-  static const hpk_plugin_v1 binding{
-      sizeof(hpk_plugin_v1), HPK_ABI_VERSION, Contract<Interface>::Info.id.data(),
-      Contract<Interface>::Info.version, Contract<Interface>::Info.fingerprint.data(),
-      HPK_IN_PROCESS | (remote ? HPK_WORKER_PROCESS : 0u), detail::CppAbi, detail::RuntimeIdentity,
+template<void (*OnActivate)(const PluginContext&), void (*OnDeactivate)(const PluginContext&), std::size_t Count>
+constexpr hpk_plugin_v1 BindPlugin(const std::array<hpk_extension_v1, Count>& extensions) noexcept {
+  static_assert(Count > 0 && Count <= HPK_MAX_EXTENSIONS);
+  return {
+      sizeof(hpk_plugin_v1), HPK_ABI_VERSION,
+      HPK_IN_PROCESS | (std::ranges::all_of(extensions, [](const auto& entry) { return entry.invoke != nullptr; })
+          ? HPK_WORKER_PROCESS : 0u),
+      CppAbi, static_cast<std::uint32_t>(Count), extensions.data(), RuntimeIdentity,
       [](const hpk_plugin_context_v1* input, void** activation) noexcept -> std::int32_t {
         *activation = nullptr;
         try {
-          auto context = detail::PluginContextAccess::Create(*input);
+          auto context = PluginContextAccess::Create(*input);
           if constexpr (OnActivate != nullptr) OnActivate(*context);
-          // Publish the context only after the activation hook succeeds.
           *activation = context.release();
           return HPK_OK;
         } catch (const Error& error) {
-          return status(error);
+          return PluginStatus(error);
         } catch (...) {
           return HPK_PLUGIN_FAILED;
         }
       },
+      [](const void* context) noexcept -> const void* {
+        return std::exchange(synchronous_invocation, static_cast<const Invocation*>(context));
+      },
+      [](const void* context) -> void* {
+        return new InvocationScope(*static_cast<const Invocation*>(context));
+      },
+      [](void* registration) noexcept { delete static_cast<InvocationScope*>(registration); },
+      [](void* activation) noexcept -> std::int32_t {
+        const std::unique_ptr<PluginContext> context(static_cast<PluginContext*>(activation));
+        try {
+          if constexpr (OnDeactivate != nullptr) OnDeactivate(*context);
+          return HPK_OK;
+        } catch (const Error& error) {
+          return PluginStatus(error);
+        } catch (...) {
+          return HPK_PLUGIN_FAILED;
+        }
+      },
+  };
+}
+
+} // namespace detail
+
+/// @brief Binds one factory to a point in the plugin's exported table.
+///
+/// Repeat the point to publish another factory for the same contract. Supply the factories for that
+/// point in manifest order. Each instance is created and destroyed by the plugin library. If both
+/// constructors are available, the one taking the shared PluginContext is used.
+/// @tparam Interface Interface with a public virtual destructor and a Contract specialization.
+/// @tparam Implementation Public implementation constructible from const PluginContext& or by default.
+/// @param point Extension point declared in the manifest. Its identifier must refer to static storage.
+/// @return Factory descriptor for use in HPK_EXPORT_PLUGIN.
+template<class Interface, class Implementation>
+  requires std::derived_from<Implementation, Interface> &&
+           std::has_virtual_destructor_v<Interface> &&
+           (std::constructible_from<Implementation, const PluginContext&> || std::default_initializable<Implementation>)
+constexpr hpk_extension_v1 BindExtension(ExtensionPoint<Interface> point) noexcept {
+  constexpr bool remote = requires(Interface& instance, Bytes request, detail::DispatchContext context) {
+    Contract<Interface>::Dispatch(instance, std::uint32_t{}, std::move(request), context);
+  };
+  return {
+      point.id.data(), static_cast<std::uint32_t>(point.id.size()), Contract<Interface>::Info.id.data(),
+      Contract<Interface>::Info.version, Contract<Interface>::Info.fingerprint.data(),
       []([[maybe_unused]] const void* activation, void** instance) noexcept -> std::int32_t {
         *instance = nullptr;
         try {
@@ -247,7 +274,7 @@ const hpk_plugin_v1& Bind() noexcept {
           }
           return HPK_OK;
         } catch (const Error& error) {
-          return status(error);
+          return detail::PluginStatus(error);
         } catch (...) {
           return HPK_PLUGIN_FAILED;
         }
@@ -266,37 +293,18 @@ const hpk_plugin_v1& Bind() noexcept {
             }
             (void)UseApplicationTaskScope().Launch(detail::DispatchPlugin<Interface>(
                 *static_cast<Interface*>(instance), host, invocation, receiver, operation, std::move(request),
-                complete, user, status));
+                complete, user, detail::PluginStatus));
             return HPK_OK;
           } catch (const Error& error) {
-            return status(error);
+            return detail::PluginStatus(error);
           } catch (...) {
             return HPK_PLUGIN_FAILED;
           }
         }
         return HPK_INVALID_REQUEST;
       } : nullptr,
-      [](const void* context) noexcept -> const void* {
-        return std::exchange(detail::synchronous_invocation, static_cast<const detail::Invocation*>(context));
-      },
-      [](const void* context) -> void* {
-        return new detail::InvocationScope(*static_cast<const detail::Invocation*>(context));
-      },
-      [](void* registration) noexcept { delete static_cast<detail::InvocationScope*>(registration); },
       [](void* instance) noexcept { delete static_cast<Interface*>(instance); },
-      [](void* activation) noexcept -> std::int32_t {
-        const std::unique_ptr<PluginContext> context(static_cast<PluginContext*>(activation));
-        try {
-          if constexpr (OnDeactivate != nullptr) OnDeactivate(*context);
-          return HPK_OK;
-        } catch (const Error& error) {
-          return status(error);
-        } catch (...) {
-          return HPK_PLUGIN_FAILED;
-        }
-      },
   };
-  return binding;
 }
 
 } // namespace huxerui::pluginkit
@@ -308,14 +316,23 @@ const hpk_plugin_v1& Bind() noexcept {
 #define HPK_EXPORT __attribute__((visibility("default")))
 #endif
 
-/// @brief Defines pluginkit_query_v1. Use once at global scope in the plugin library.
-/// @param ... Published interface and implementation type, followed by optional activation and deactivation
-/// function pointers. Each hook takes const PluginContext& and returns void.
-/// @see Bind()
+/// @brief Exports the package's factory table as pluginkit_query_v1. Use once at global scope.
+///
+/// Both hooks take const PluginContext& and return void. They run on the loading application's thread.
+/// The package can run in a worker when every factory supplies a generated dispatcher.
+/// @param OnActivate Initialization function, called before any instances are created, or nullptr.
+/// @param OnDeactivate Cleanup function, called after all instances are destroyed, or nullptr.
+/// @param ... Factory descriptors from BindExtension(). Include every factory in the manifest.
+/// @see BindExtension()
 /// @code{.cpp}
-/// HPK_EXPORT_PLUGIN(csv_import::TableImporter, csv_import::CsvImporter)
+/// constexpr huxerui::pluginkit::ExtensionPoint<TableImporter> Importers{"example.table-importers"};
+/// HPK_EXPORT_PLUGIN(nullptr, nullptr,
+///     huxerui::pluginkit::BindExtension<TableImporter, CsvImporter>(Importers))
 /// @endcode
-#define HPK_EXPORT_PLUGIN(...)                                                                  \
-  extern "C" HPK_EXPORT const hpk_plugin_v1* HPK_CALL pluginkit_query_v1() noexcept {             \
-    return &::huxerui::pluginkit::Bind<__VA_ARGS__>();                                                     \
+#define HPK_EXPORT_PLUGIN(OnActivate, OnDeactivate, ...)                                             \
+  extern "C" HPK_EXPORT const hpk_plugin_v1* HPK_CALL pluginkit_query_v1() noexcept {                  \
+    static constexpr ::std::array extensions{__VA_ARGS__};                                            \
+    static constexpr auto binding =                                                                  \
+        ::huxerui::pluginkit::detail::BindPlugin<OnActivate, OnDeactivate>(extensions);                 \
+    return &binding;                                                                                 \
   }

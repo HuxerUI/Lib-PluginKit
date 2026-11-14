@@ -21,9 +21,9 @@ Task<void> FinishLocalShutdown(std::shared_ptr<LocalPlugin> plugin);
 void ValidateLocalPlugin(const std::shared_ptr<LocalPlugin>& plugin);
 
 std::shared_ptr<ExtensionTarget> MakeLocalExtension(std::shared_ptr<LocalPlugin> plugin,
-                                                     std::chrono::milliseconds timeout);
+    std::string point, std::uint32_t ordinal, std::chrono::milliseconds timeout);
 std::shared_ptr<ExtensionTarget> MakeWorkerExtension(
     std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start, std::chrono::milliseconds timeout,
-    std::stop_token admission);
+    std::stop_token admission, Bytes factory);
 
 } // namespace huxerui::pluginkit::detail

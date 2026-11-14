@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
 
 namespace huxerui::pluginkit::detail {
 namespace {
@@ -160,6 +161,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
   }
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   const bool shutdown = request.code == static_cast<std::uint32_t>(Command::Shutdown);
+  const bool activate = request.code == static_cast<std::uint32_t>(Command::Activate);
   {
     std::unique_lock lock(requests_);
     if (!wait_for_slot && request_active_ && request_maintenance_) {
@@ -187,9 +189,9 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     throw Error(ErrorCode::WorkerExited, "The plugin worker exited");
   }
 
+  // Several handles can ask for the same activation. Check under the worker request slot.
+  if (activate && activated_) return {};
   Frame reply{};
-  const bool create = request.code == static_cast<std::uint32_t>(Command::Create);
-  if (create && !created_) request.payload = startup_.Encode();
   try {
     // A caller cancellation retires an active exchange. External worker shutdown also wakes any callback wait.
     std::stop_callback interrupt(stop, [this] {
@@ -208,6 +210,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     }
     request.call = ++next_call_;
     request.receiver = receiver ? 1u : 0u;
+    if (activate) request.payload = startup_.Encode();
     reply = Exchange(request, deadline, generation_stop_.get_token(), receiver);
     CheckExchange(deadline, generation_stop_.get_token());
   } catch (const Error& error) {
@@ -235,19 +238,33 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
   if (reply.kind == FrameKind::Reply && reply.call == request.call && !reply.callback && !reply.operation &&
       !reply.receiver && !reply.synchronous) {
     if (reply.code == 0) {
-      if (shutdown ? reply.instance == 0 && reply.payload.empty()
-                   : reply.instance != 0 && (request.instance == 0 || request.instance == reply.instance)) {
-        if (create) created_ = true;
+      const auto valid = (shutdown || activate)
+          ? reply.instance == 0 && reply.payload.empty()
+          : reply.instance != 0 && (request.instance == 0 || request.instance == reply.instance);
+      if (valid) {
+        if (activate) activated_ = true;
         return reply;
       }
     } else if (IsErrorCode(reply.code) && reply.instance == 0 &&
                IsUtf8(AsText(reply.payload))) {
-      if (create && !created_) Stop();
+      if (activate) Stop();
       throw Error(static_cast<ErrorCode>(reply.code), std::string(AsText(reply.payload)));
     }
   }
   Stop();
   throw Error(ErrorCode::Protocol, "Invalid worker response");
+}
+
+void Worker::ValidateFactories(std::stop_token stop) {
+  Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, DefaultTimeout, nullptr, stop);
+  // Exercise each factory on the candidate's activation before the manager commits the package.
+  std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
+  for (const auto& extension : startup_.extensions) {
+    auto factory = ExtensionPayload(extension.point, ordinals[extension.point]++);
+    const auto reply = Request({static_cast<std::uint32_t>(Command::Create), 0, 0, std::move(factory)},
+                               DefaultTimeout, nullptr, stop);
+    Request({static_cast<std::uint32_t>(Command::Close), reply.instance, 0, {}}, DefaultTimeout, nullptr, stop);
+  }
 }
 
 void Worker::BeginShutdown() noexcept {

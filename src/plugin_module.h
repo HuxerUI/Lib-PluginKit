@@ -31,8 +31,40 @@ inline void CheckPluginStatus(std::int32_t status) {
   }
 }
 
-inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path, ContractInfo contract,
-                                            std::uint32_t mode) {
+inline const hpk_extension_v1* FindExtension(const hpk_plugin_v1& plugin, std::string_view point,
+                                             std::uint32_t ordinal) noexcept {
+  for (const auto& entry : std::span(plugin.extensions, plugin.extension_count)) {
+    if (point != std::string_view(entry.point, entry.point_size)) continue;
+    if (ordinal == 0) return &entry;
+    --ordinal;
+  }
+  return nullptr;
+}
+
+inline void ValidatePluginDescriptor(const hpk_plugin_v1& binding, std::span<const ExpectedExtension> expected,
+                                     std::uint32_t mode) {
+  if (!(binding.execution_modes & mode) ||
+      (mode == HPK_IN_PROCESS && (!binding.set_invocation || !binding.attach_invocation || !binding.detach_invocation))) {
+    throw Error(ErrorCode::UnsupportedMode, "The module does not support the approved execution mode");
+  }
+  if (binding.extension_count != expected.size()) {
+    throw Error(ErrorCode::ContractMismatch, "The module factory count differs from the approved package");
+  }
+  // Factories at other points may be interleaved differently in the manifest and library.
+  std::map<std::string_view, std::uint32_t, std::less<>> ordinals;
+  for (const auto& extension : expected) {
+    const auto* found = FindExtension(binding, extension.point, ordinals[extension.point]++);
+    if (!found || extension.contract.Info() !=
+        ContractInfo{found->contract_id, found->contract_version, found->contract_fingerprint}) {
+      throw Error(ErrorCode::ContractMismatch, "The module factory table differs from the approved package");
+    }
+    if (mode == HPK_WORKER_PROCESS && !found->invoke) {
+      throw Error(ErrorCode::UnsupportedMode, "The module has a factory without worker dispatch");
+    }
+  }
+}
+
+inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path) {
   // Keep modules mapped for SDK operations and C++ objects that can outlive a particular activation.
 #if defined(_WIN32)
   const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
@@ -54,14 +86,15 @@ inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path, 
   if (!address) throw Error(ErrorCode::ContractMismatch, "Missing pluginkit_query_v1 export");
   const auto* binding = reinterpret_cast<hpk_query_v1>(address)();
   if (!binding || binding->struct_size != sizeof(hpk_plugin_v1) || binding->abi_version != HPK_ABI_VERSION ||
-      !binding->contract_id || !binding->contract_fingerprint || contract.id != binding->contract_id ||
-      contract.version != binding->contract_version || contract.fingerprint != binding->contract_fingerprint ||
-      !binding->activate || !binding->create || !binding->close || !binding->deactivate) {
-    throw Error(ErrorCode::ContractMismatch, "The module descriptor does not match the installed contract");
+      !binding->extensions || !binding->extension_count || binding->extension_count > HPK_MAX_EXTENSIONS ||
+      !binding->activate || !binding->deactivate) {
+    throw Error(ErrorCode::ContractMismatch, "The module has an invalid plugin descriptor");
   }
-  if (!(binding->execution_modes & mode) || (mode == HPK_WORKER_PROCESS && !binding->invoke) ||
-      (mode == HPK_IN_PROCESS && (!binding->set_invocation || !binding->attach_invocation || !binding->detach_invocation))) {
-    throw Error(ErrorCode::UnsupportedMode, "The module does not support the approved execution mode");
+  for (const auto& entry : std::span(binding->extensions, binding->extension_count)) {
+    if (!entry.point || !entry.point_size || !entry.contract_id || !entry.contract_version || !entry.contract_fingerprint ||
+        !entry.create || !entry.close) {
+      throw Error(ErrorCode::ContractMismatch, "The module has an invalid extension factory");
+    }
   }
   return *binding;
 }
@@ -99,7 +132,7 @@ inline bool InProcessVersionRequiresRestart(const std::filesystem::path& profile
 }
 
 inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& path, [[maybe_unused]] Handle verified,
-                                               ContractInfo contract, const std::filesystem::path& profile,
+                                               const std::filesystem::path& profile,
                                                std::string_view id, std::string_view digest) {
   // A mapped module can own deferred SDK work. Cache its descriptor for the lifetime of this process.
   auto& state = LoadedModules();
@@ -126,7 +159,7 @@ inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& pat
 #else
   const auto& load_path = path;
 #endif
-  const auto& binding = LoadPluginModule(load_path, contract, HPK_IN_PROCESS);
+  const auto& binding = LoadPluginModule(load_path);
   {
     std::lock_guard lock(state.mutex);
     entry->binding = &binding;

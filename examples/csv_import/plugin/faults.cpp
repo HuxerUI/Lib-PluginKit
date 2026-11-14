@@ -1,6 +1,6 @@
 #include "csv_contract.bindings.h"
+#include "csv_package.h"
 #include "csv_sdk.h"
-#include "process_id.h"
 #include <huxerui/app.h>
 
 #include <chrono>
@@ -11,15 +11,11 @@
 
 namespace {
 
-const huxerui::pluginkit::PluginContext* active_context = nullptr;
+using csv_import::fixture::active_context;
+using csv_import::fixture::Record;
+
 std::uint32_t created_instances = 0;
 std::uint32_t live_instances = 0;
-
-void Record(const huxerui::pluginkit::PluginContext& context, std::string_view event) {
-  if (!context.DataDirectory().Child("lifecycle.log").AppendString(std::string(event) + '\n')) {
-    throw std::runtime_error("Cannot write the fixture lifecycle log");
-  }
-}
 
 void OnActivate(const huxerui::pluginkit::PluginContext& context) {
   if (active_context || !context.BundleDirectory().Child("plugin.json").ReadString().Succeeded() ||
@@ -45,7 +41,7 @@ void OnActivate(const huxerui::pluginkit::PluginContext& context) {
 }
 
 void OnDeactivate(const huxerui::pluginkit::PluginContext& context) {
-  if (active_context != &context || live_instances != 0) {
+  if (active_context != &context || live_instances != 0 || csv_import::fixture::live_exporters != 0) {
     throw std::runtime_error("Expected the original context after all fixture instances were destroyed");
   }
   Record(context, "deactivate");
@@ -144,4 +140,8 @@ private:
 
 } // namespace
 
-HPK_EXPORT_PLUGIN(csv_import::TableImporter, FaultImporter, OnActivate, OnDeactivate)
+using huxerui::pluginkit::BindExtension;
+
+HPK_EXPORT_PLUGIN(OnActivate, OnDeactivate,
+    BindExtension<csv_import::TableImporter, FaultImporter>(csv_import::Importers),
+    BindExtension<csv_import::TableExporter, csv_import::fixture::CsvExporter>(csv_import::Exporters))

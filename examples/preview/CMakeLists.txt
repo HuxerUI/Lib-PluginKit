@@ -45,11 +45,15 @@ endif ()
 set(sdk_dir "${CMAKE_CURRENT_BINARY_DIR}/sdk")
 set(csv_framework_includes "$<TARGET_PROPERTY:HuxerUI::huxerui,INTERFACE_INCLUDE_DIRECTORIES>")
 set(contract_header "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_contract.h")
+set(export_header "${CMAKE_CURRENT_SOURCE_DIR}/src/export_contract.h")
 set(status_header "${CMAKE_CURRENT_SOURCE_DIR}/src/import_status.h")
 set(progress_header "${CMAKE_CURRENT_SOURCE_DIR}/src/receivers/import_progress.h")
-set(sdk_inputs "${contract_header}" "${status_header}" "${progress_header}" "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_sdk.h")
+set(sdk_inputs "${contract_header}" "${export_header}" "${status_header}" "${progress_header}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_sdk.h")
 set(sdk_outputs "${sdk_dir}/csv_contract.h" "${sdk_dir}/csv_contract.bindings.h"
     "${sdk_dir}/csv_contract.host.h" "${sdk_dir}/contract.json"
+    "${sdk_dir}/exporters/export_contract.h" "${sdk_dir}/exporters/export_contract.bindings.h"
+    "${sdk_dir}/exporters/export_contract.host.h" "${sdk_dir}/exporters/contract.json"
     "${sdk_dir}/receivers/import_progress.h" "${sdk_dir}/receivers/import_progress.bindings.h"
     "${sdk_dir}/receivers/import_progress.host.h" "${sdk_dir}/receivers/contract.json"
     "${sdk_dir}/services/import_status.h" "${sdk_dir}/services/import_status.bindings.h"
@@ -73,6 +77,9 @@ add_custom_command(OUTPUT ${sdk_outputs}
         "-I$<JOIN:${csv_framework_includes},;-I>"
     COMMAND "$<TARGET_FILE:hpk>" gen "${contract_header}"
         csv_import::TableImporter example.table-importer 1 "${sdk_dir}" -- "-I${kit_root}/include"
+        "-I$<JOIN:${csv_framework_includes},;-I>"
+    COMMAND "$<TARGET_FILE:hpk>" gen "${export_header}"
+        csv_import::TableExporter example.table-exporter 1 "${sdk_dir}/exporters" -- "-I${kit_root}/include"
         "-I$<JOIN:${csv_framework_includes},;-I>"
     COMMAND "$<TARGET_FILE:hpk>" gen "${status_header}"
         csv_import::ImportStatus example.import-status 1 "${sdk_dir}/services" -- "-I${kit_root}/include"

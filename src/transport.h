@@ -9,7 +9,7 @@
 
 namespace huxerui::pluginkit::detail {
 
-enum class Command : std::uint32_t { Create = 1, Invoke, Close, Shutdown };
+enum class Command : std::uint32_t { Activate = 1, Create, Invoke, Close, Shutdown };
 enum class FrameKind : std::uint32_t { Request = 1, Reply, ServiceCall, ServiceReply };
 
 struct Frame {
@@ -29,8 +29,13 @@ using Deadline = std::chrono::steady_clock::time_point;
 
 inline bool IsErrorCode(std::uint32_t code) {
   return code >= static_cast<std::uint32_t>(ErrorCode::InvalidArgument) &&
-         code <= static_cast<std::uint32_t>(ErrorCode::Busy);
+         code <= static_cast<std::uint32_t>(ErrorCode::Ambiguous);
 }
+
+struct ExpectedExtension {
+  std::string point;
+  PackageContract contract;
+};
 
 struct PluginStartup {
   std::string id;
@@ -38,26 +43,50 @@ struct PluginStartup {
   std::string digest;
   std::string bundle_directory;
   std::string data_directory;
+  std::vector<ExpectedExtension> extensions;
 
   Bytes Encode() const {
     Writer writer;
-    writer.Array(5);
+    writer.Array(6);
     writer.Text(id);
     writer.Text(version);
     writer.Text(digest);
     writer.Text(bundle_directory);
     writer.Text(data_directory);
+    writer.Array(extensions.size());
+    for (const auto& extension : extensions) {
+      writer.Array(4);
+      writer.Text(extension.point);
+      writer.Text(extension.contract.id);
+      Codec<std::uint32_t>::Write(writer, extension.contract.version);
+      writer.Text(extension.contract.fingerprint);
+    }
     return std::move(writer).Finish();
   }
 
   static PluginStartup Decode(std::span<const std::byte> payload) {
     Reader reader(payload);
-    reader.Record(5);
-    PluginStartup startup{reader.Text(), reader.Text(), reader.Text(), reader.Text(), reader.Text()};
+    reader.Record(6);
+    PluginStartup startup{reader.Text(), reader.Text(), reader.Text(), reader.Text(), reader.Text(), {}};
+    const auto count = reader.Array();
+    if (!count || count > HPK_MAX_EXTENSIONS) throw Error(ErrorCode::Protocol, "Invalid startup factory count");
+    startup.extensions.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      reader.Record(4);
+      startup.extensions.push_back({reader.Text(), {reader.Text(), Codec<std::uint32_t>::Read(reader), reader.Text()}});
+    }
     reader.Finish();
     return startup;
   }
 };
+
+inline Bytes ExtensionPayload(std::string_view point, std::uint32_t ordinal) {
+  Writer writer;
+  writer.Array(2);
+  writer.Text(point);
+  Codec<std::uint32_t>::Write(writer, ordinal);
+  return std::move(writer).Finish();
+}
 
 inline void PreparePluginData(const PluginStartup& startup) {
   const auto& text = startup.data_directory;

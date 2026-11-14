@@ -73,4 +73,7 @@ public:
   virtual huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) = 0;
 };
 
+/// @brief Extension point for importers that produce a table from delimited text.
+inline constexpr huxerui::pluginkit::ExtensionPoint<TableImporter> Importers{"example.table-importers"};
+
 } // namespace csv_import

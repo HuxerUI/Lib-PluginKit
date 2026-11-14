@@ -1,19 +1,44 @@
 #include "csv_contract.bindings.h"
+#include "csv_package.h"
 #include "csv_sdk.h"
-#include "process_id.h"
+
+#include <array>
 
 namespace csv_import {
 namespace {
+
+using huxerui::pluginkit::PluginContext;
+std::uint32_t live_importers = 0;
+
+void OnActivate(const PluginContext& context) {
+  if (fixture::active_context) throw std::runtime_error("The CSV package is already active");
+  fixture::Record(context, "activate");
+  fixture::active_context = &context;
+}
+
+void OnDeactivate(const PluginContext& context) {
+  if (fixture::active_context != &context || live_importers || fixture::live_exporters) {
+    throw std::runtime_error("Expected the original context after all CSV instances were destroyed");
+  }
+  fixture::Record(context, "deactivate");
+  fixture::active_context = nullptr;
+}
 
 ImportResult Failure(std::string code, std::uint32_t row, std::uint32_t column, std::string message) {
   return {std::nullopt, {{std::move(code), row, column, std::move(message)}}};
 }
 
+template<char Separator>
 class CsvImporter final : public TableImporter {
 public:
-  explicit CsvImporter(const huxerui::pluginkit::PluginContext& context) : context_(context) {}
+  explicit CsvImporter(const PluginContext& context) : context_(context) {
+    if (fixture::active_context != &context) throw std::runtime_error("Expected the activation's context");
+    ++live_importers;
+  }
 
-  std::string Delimiter() const override { return ","; }
+  ~CsvImporter() override { --live_importers; }
+
+  std::string Delimiter() const override { return std::string(1, Separator); }
   std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
 
   huxerui::Task<ImportResult> Import(ImportRequest request, ImportReceiver receiver) override {
@@ -34,12 +59,13 @@ public:
   }
 
 private:
-  const huxerui::pluginkit::PluginContext& context_;
+  const PluginContext& context_;
 
   static ImportResult Parse(const ImportRequest& request) {
     std::string_view source = request.source;
     if (source.starts_with("\xef\xbb\xbf")) source.remove_prefix(3);
     if (source.empty()) return Failure("csv.empty", 1, 1, "Expected a header row");
+    constexpr std::array delimiters{Separator, '\r', '\n', '"'};
 
     Table table;
     std::size_t cursor = 0;
@@ -60,11 +86,11 @@ private:
             value.push_back('"');
             ++cursor;
           }
-          if (cursor < source.size() && source[cursor] != ',' && source[cursor] != '\r' && source[cursor] != '\n') {
-            return Failure("csv.after_quote", row_number, column, "Expected a comma or line break after the closing quote");
+          if (cursor < source.size() && source[cursor] != Separator && source[cursor] != '\r' && source[cursor] != '\n') {
+            return Failure("csv.after_quote", row_number, column, "Expected a separator or line break after the closing quote");
           }
         } else {
-          const auto end = source.find_first_of(",\r\n\"", cursor);
+          const auto end = source.find_first_of(std::string_view(delimiters.data(), delimiters.size()), cursor);
           if (end != source.npos && source[end] == '"') {
             return Failure("csv.unexpected_quote", row_number, column, "A quote must start a field");
           }
@@ -72,7 +98,7 @@ private:
           cursor = end == source.npos ? source.size() : end;
         }
         row.push_back(std::move(value));
-        if (cursor == source.size() || source[cursor] != ',') break;
+        if (cursor == source.size() || source[cursor] != Separator) break;
         ++cursor;
       }
 
@@ -95,4 +121,9 @@ private:
 } // namespace
 } // namespace csv_import
 
-HPK_EXPORT_PLUGIN(csv_import::TableImporter, csv_import::CsvImporter)
+using huxerui::pluginkit::BindExtension;
+
+HPK_EXPORT_PLUGIN(csv_import::OnActivate, csv_import::OnDeactivate,
+    BindExtension<csv_import::TableImporter, csv_import::CsvImporter<','>>(csv_import::Importers),
+    BindExtension<csv_import::TableExporter, csv_import::fixture::CsvExporter>(csv_import::Exporters),
+    BindExtension<csv_import::TableImporter, csv_import::CsvImporter<';'>>(csv_import::Importers))

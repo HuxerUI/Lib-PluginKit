@@ -5,14 +5,12 @@
   "target": "@package_target@",
   "execution_modes": ["in_process", "worker_process"],
   "cpp_abi": "@cpp_abi@",
-  "contract": {
-    "id": "@contract_id@",
-    "version": @contract_version@,
-    "fingerprint": "@contract_fingerprint@"
-  },
-  "extension": {
-    "point": "example.table-importers",
-    "id": "@contribution@",
-    "extensions": [".csv"]
-  }
+  "provides": [
+    {"id": "@import_id@", "version": @import_version@, "fingerprint": "@import_fingerprint@"},
+    {"id": "@export_id@", "version": @export_version@, "fingerprint": "@export_fingerprint@"}
+  ],
+  "extensions": [
+    {"point": "example.table-importers", "contract": "@import_id@", "metadata": {"extensions": [".csv"]}},@secondary_importer@
+    {"point": "example.table-exporters", "contract": "@export_id@", "metadata": {"extensions": [".csv"]}}
+  ]
 }

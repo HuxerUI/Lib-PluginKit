@@ -54,7 +54,7 @@ private:
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               ContractInfo contract, std::vector<Service> services, TaskScope callbacks, PluginStartup plugin)
+               std::vector<Service> services, TaskScope callbacks, PluginStartup plugin)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(plugin)) {
   auto request = CreateWorkerPipe(true);
   auto response = CreateWorkerPipe(false);
@@ -74,9 +74,7 @@ Worker::Worker(const std::filesystem::path& executable, const std::filesystem::p
 
   std::wstring command = L"\"" + executable.native() + L"\" " +
       std::to_wstring(reinterpret_cast<std::uintptr_t>(handles[0])) + L" " +
-      std::to_wstring(reinterpret_cast<std::uintptr_t>(handles[1])) + L" \"" + module.native() + L"\" " +
-      std::wstring(contract.id.begin(), contract.id.end()) + L" " + std::to_wstring(contract.version) + L" " +
-      std::wstring(contract.fingerprint.begin(), contract.fingerprint.end());
+      std::to_wstring(reinterpret_cast<std::uintptr_t>(handles[1])) + L" \"" + module.native() + L"\"";
   PROCESS_INFORMATION created{};
   const auto working_directory = executable.parent_path();
   // Attach the suspended worker to the kill-on-close job before it can load the plugin.

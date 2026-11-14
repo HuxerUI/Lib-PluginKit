@@ -79,12 +79,14 @@ enum class UninstallStatus {
   CleanupPending,
 };
 
-/// @brief Identifies a contribution within an installed plugin.
-struct ExtensionId {
-  /// Plugin identifier from the manifest.
-  std::string plugin;
-  /// Contribution identifier from the manifest.
-  std::string contribution;
+/// @brief Manifest metadata for one factory provided by a package.
+struct PackageExtension {
+  /// Extension point registered by the host.
+  std::string point;
+  /// Identifier of a contract listed in PackageInfo::provides.
+  std::string contract;
+  /// Advertised file suffixes, including their leading dots.
+  std::vector<std::string> file_extensions;
 };
 
 /// @brief Metadata from a directory package and the digest of its exact contents.
@@ -98,18 +100,10 @@ struct PackageInfo {
   std::string version;
   /// Package digest to present for approval and pass to InstallPackage().
   std::string digest;
-  /// Identifier of the contract implemented by the contribution.
-  std::string contract_id;
-  /// Declared version of that contract.
-  std::uint32_t contract_version;
-  /// Fingerprint declared in the manifest and checked against the host's registered contract.
-  std::string contract_fingerprint;
-  /// Extension point to which the plugin contributes.
-  std::string point;
-  /// Identifier of the contribution within the plugin.
-  std::string contribution;
-  /// Advertised file suffixes, including their leading dots.
-  std::vector<std::string> extensions;
+  /// Exact identities of the contracts implemented by the package.
+  std::vector<PackageContract> provides;
+  /// Factories in manifest order, up to HPK_MAX_EXTENSIONS. Several factories may implement the same point.
+  std::vector<PackageExtension> extensions;
   /// Execution modes advertised by the package for this target. InstallPackage() approves one of them.
   std::vector<ExecutionMode> execution_modes;
   /// Shared SDK and C++ build identity checked for in-process execution. Ignored for worker execution.
@@ -130,12 +124,26 @@ struct PluginInfo {
   std::optional<PackageInfo> pending_upgrade;
 };
 
-/// @brief Manifest metadata for an enabled contribution that matches a registered contract.
+/// @brief Candidate returned by PluginManager::ListExtensions() for one approved factory.
+///
+/// The candidate identifies a factory in a specific package snapshot and extension point. Query again
+/// after a package upgrade to select from the replacement's factories.
 struct ExtensionInfo {
-  /// Identifier to pass to CreateExtension().
-  ExtensionId id;
+  /// Plugin identifier from the installed package.
+  std::string plugin_id;
   /// Advertised file suffixes, including their leading dots.
-  std::vector<std::string> extensions;
+  std::vector<std::string> file_extensions;
+
+private:
+  friend class PluginManager;
+  ExtensionInfo(std::string_view plugin, const PackageExtension& extension, std::string_view digest,
+                std::uint32_t ordinal)
+      : plugin_id(plugin), file_extensions(extension.file_extensions), point_(extension.point), digest_(digest),
+        ordinal_(ordinal) {}
+
+  std::string point_;
+  std::string digest_;
+  std::uint32_t ordinal_;
 };
 
 /// @brief Move-only owner of one extension instance in the package's approved execution mode.
@@ -223,11 +231,10 @@ private:
 /// #include "csv_contract.host.h"
 ///
 /// huxerui::Task<csv_import::ImportResult> ReadTable(huxerui::pluginkit::PluginManager& plugins,
-///                                                const huxerui::pluginkit::ExtensionId& id,
+///                                                const huxerui::pluginkit::ExtensionInfo& candidate,
 ///                                                std::shared_ptr<csv_import::ImportProgress> progress,
 ///                                                const std::string& csv) {
-///   constexpr huxerui::pluginkit::ExtensionPoint<csv_import::TableImporter> importers{"example.table-importers"};
-///   auto importer = plugins.CreateExtension(importers, id);
+///   auto importer = plugins.CreateExtension(csv_import::Importers, candidate);
 ///   co_return co_await importer->Import({csv}, std::move(progress));
 /// }
 /// @endcode
@@ -303,9 +310,10 @@ public:
     Provide(Contract<Interface>::Info, std::move(implementation), std::move(dispatch));
   }
 
-  /// @brief Installs the approved snapshot for a registered extension point.
+  /// @brief Installs the approved package snapshot and its extension factories.
   ///
   /// A new installation starts enabled. The mode and service grants apply to future activations of this snapshot.
+  /// Every declared extension point must be registered with the exact contract and support the selected mode.
   /// Reinstalling with the same digest and approval can repair the stored files and preserves enablement.
   /// @param directory Source directory containing the package files.
   /// @param approved_digest Digest from InspectPackage() that the caller approved.
@@ -322,8 +330,9 @@ public:
   /// @brief Replaces an installed plugin with an approved package from a local directory.
   ///
   /// Use the same plugin identifier, a different release version, and the installed execution mode.
-  /// An enabled worker is retired before the candidate is validated on a copy of the plugin data. The
-  /// package, grants, and data are selected together at commit. Disabled plugins stay disabled and
+  /// The current generation is retired before validating an enabled candidate on a copy of the plugin data.
+  /// Validation runs OnActivate once and constructs an instance from each factory. The package, grants,
+  /// and data are selected together at commit. Disabled plugins stay disabled and
   /// activate when next used. The data copy accepts regular files and directories. An in-process upgrade
   /// is applied after a host process restart.
   /// @param directory Local package directory. The Task reads it when it runs.
@@ -362,7 +371,7 @@ public:
   /// and waits for handles that expose a native interface directly. Release those handles before disabling.
   /// Worker teardown allows up to DefaultTimeout for the running exchange and shutdown before termination.
   /// @param plugin_id Installed plugin identifier.
-  /// @param enabled True to make the contribution available for subsequent creation, false to disable it.
+  /// @param enabled True to make all of the package's factories available, false to disable them.
   /// @return Lazy task that completes after persisting the change and finishing any teardown.
   /// @throws Error With NotFound if the plugin is absent, Closed after shutdown, or ReentrantCall from a host callback.
   Task<void> SetEnabled(std::string_view plugin_id, bool enabled);
@@ -372,10 +381,10 @@ public:
   /// @see ListExtensions()
   std::vector<PluginInfo> ListPlugins() const;
 
-  /// @brief Lists enabled contributions matching the point's exact registered contract.
+  /// @brief Lists candidates matching the point's exact registered contract without activating packages.
   /// @tparam Interface Published interface with a Contract specialization.
   /// @param point Previously registered extension point.
-  /// @return Manifest metadata for matching contributions, including those that have yet to activate.
+  /// @return Candidates in plugin identifier order and manifest order within each available package.
   /// @throws Error With NotFound for an unregistered point or ContractMismatch for a different contract.
   /// @see ListPlugins()
   template<class Interface>
@@ -383,34 +392,69 @@ public:
     return List(point.id, Contract<Interface>::Info);
   }
 
-  /// @brief Synchronously creates a handle to one contribution in its approved execution mode.
+  /// @brief Synchronously creates a handle to a candidate from ListExtensions().
   ///
   /// With generated bindings, instance creation is deferred until the first synchronous method call or
   /// until the first Task method is awaited. For an unmarked in-process interface, this function creates
   /// the instance immediately so operator->() can expose the implementation directly.
   /// @tparam Interface Interface with contract metadata.
   /// @param point Previously registered extension point.
-  /// @param id Contribution to instantiate, as returned by ListExtensions().
+  /// @param candidate Factory selected from the point's current candidates.
   /// @param timeout Time budget for each managed call, from 1 ms through 24 hours, including time in the queue.
   /// An unmarked in-process interface runs under the caller's ordinary C++ lifetime and timing rules.
   /// @return A move-only handle exposing Interface through operator->.
-  /// @throws Error With NotFound, Disabled, or ContractMismatch if the contribution is unavailable for this point,
+  /// @throws Error With PackageChanged if the package digest differs, or NotFound, Disabled, or ContractMismatch
+  /// if the factory is unavailable for this point. Also reports Busy during a package change,
   /// InvalidArgument for an invalid timeout, Closed after shutdown, or UnsupportedMode if a worker is unavailable
   /// for the approved mode. Unmarked interfaces can also report activation or construction failures here.
   template<class Interface>
-  ExtensionHandle<Interface> CreateExtension(ExtensionPoint<Interface> point, const ExtensionId& id,
+  ExtensionHandle<Interface> CreateExtension(ExtensionPoint<Interface> point, const ExtensionInfo& candidate,
                                              std::chrono::milliseconds timeout = DefaultTimeout) {
-    return ExtensionHandle<Interface>(Create(point.id, Contract<Interface>::Info, id, timeout));
+    return ExtensionHandle<Interface>(Create(point.id, Contract<Interface>::Info, candidate.plugin_id,
+                                             &candidate, timeout));
+  }
+
+  /// @brief Synchronously creates a handle to the sole factory from a plugin at this extension point.
+  /// @tparam Interface Published interface with contract metadata.
+  /// @param point Previously registered extension point.
+  /// @param plugin_id Installed plugin that provides the factory.
+  /// @param timeout Time budget for each managed call, including time in the queue.
+  /// @return Move-only handle exposing Interface through operator->.
+  /// @throws Error With Ambiguous if the enabled plugin provides several factories at this point. Use ListExtensions()
+  /// to select one or CreateExtensions() to obtain them all. Other failures follow the candidate overload.
+  template<class Interface>
+  ExtensionHandle<Interface> CreateExtension(ExtensionPoint<Interface> point, std::string_view plugin_id,
+                                             std::chrono::milliseconds timeout = DefaultTimeout) {
+    return ExtensionHandle<Interface>(Create(point.id, Contract<Interface>::Info, plugin_id, nullptr, timeout));
+  }
+
+  /// @brief Synchronously creates one handle per available factory at a registered extension point.
+  /// @tparam Interface Published interface with contract metadata.
+  /// @param point Previously registered extension point.
+  /// @param plugin_id Optional installed plugin identifier to filter by.
+  /// @param timeout Time budget for each managed call, including time in the queue.
+  /// @return Handles in plugin identifier order and manifest order within each package. An empty match
+  /// returns an empty vector. Instance creation follows the same rules as CreateExtension().
+  /// @throws Error If querying candidates or creating any handle fails. Already created handles are released.
+  template<class Interface>
+  std::vector<ExtensionHandle<Interface>> CreateExtensions(ExtensionPoint<Interface> point,
+      std::optional<std::string_view> plugin_id = std::nullopt, std::chrono::milliseconds timeout = DefaultTimeout) {
+    const auto candidates = List(point.id, Contract<Interface>::Info, plugin_id);
+    std::vector<ExtensionHandle<Interface>> handles;
+    handles.reserve(candidates.size());
+    for (const auto& candidate : candidates) handles.push_back(CreateExtension(point, candidate, timeout));
+    return handles;
   }
 
 private:
   void Provide(ContractInfo contract, std::shared_ptr<void> implementation, detail::ServiceDispatch dispatch);
   void Register(std::string_view point, ContractInfo contract, bool remote);
-  std::vector<ExtensionInfo> List(std::string_view point, ContractInfo contract) const;
+  std::vector<ExtensionInfo> List(std::string_view point, ContractInfo contract,
+                                  std::optional<std::string_view> plugin_id = std::nullopt) const;
   struct Impl;
   static Task<void> ShutdownManager(std::shared_ptr<Impl> impl);
   std::shared_ptr<detail::ExtensionTarget> Create(std::string_view point, ContractInfo contract,
-                                                  const ExtensionId& id, std::chrono::milliseconds timeout);
+      std::string_view plugin_id, const ExtensionInfo* candidate, std::chrono::milliseconds timeout);
 
   // A pending task can retain the implementation until its transport work finishes.
   std::shared_ptr<Impl> impl_;

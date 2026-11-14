@@ -24,13 +24,14 @@ public:
   };
 
   Worker(const std::filesystem::path& executable, const std::filesystem::path& module_path,
-         const Handle& verified_module, ContractInfo contract, std::vector<Service> services, TaskScope callbacks,
+         const Handle& verified_module, std::vector<Service> services, TaskScope callbacks,
          PluginStartup startup);
   ~Worker();
 
   std::optional<std::uint32_t> Pid() const noexcept;
   Frame Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver = nullptr,
                 std::stop_token stop = {}, bool wait_for_slot = true);
+  void ValidateFactories(std::stop_token stop);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
   /// Waits for the process to exit after shutdown, including when handles still reference this Worker.
   void WaitForExit(std::chrono::milliseconds timeout = DefaultTimeout);
@@ -73,7 +74,7 @@ private:
   const std::vector<Service> services_;
   const TaskScope callbacks_;
   const PluginStartup startup_;
-  bool created_ = false;
+  bool activated_ = false;
   std::uint32_t next_call_ = 0;
   std::atomic_bool active_{true};
   std::mutex requests_;

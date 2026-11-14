@@ -21,7 +21,10 @@
 namespace huxerui::pluginkit::detail {
 namespace {
 
-using Instance = std::unique_ptr<void, decltype(hpk_plugin_v1::close)>;
+struct Instance {
+  const hpk_extension_v1& factory;
+  std::unique_ptr<void, decltype(hpk_extension_v1::close)> object;
+};
 
 struct Outgoing {
   Frame frame;
@@ -118,7 +121,7 @@ constexpr hpk_host_v1 HostCallbacks{CallHost};
 
 class Server {
 public:
-  Server(std::filesystem::path path, ContractInfo contract) : path_(std::move(path)), contract_(contract) {}
+  explicit Server(std::filesystem::path path) : path_(std::move(path)) {}
 
   std::optional<Frame> Dispatch(ServiceChannel& channel) {
     const auto& request = channel.request;
@@ -127,26 +130,29 @@ public:
       Shutdown();
       return Frame{};
     }
+    if (request.code == static_cast<std::uint32_t>(Command::Activate)) {
+      if (binding_ || request.instance || request.operation || request.receiver || request.synchronous) InvalidRequest();
+      Activate(PluginStartup::Decode(request.payload));
+      return Frame{};
+    }
     if (request.code == static_cast<std::uint32_t>(Command::Create)) {
-      const bool first_creation = !binding_;
-      if (request.instance || request.operation || request.receiver || request.synchronous ||
-          (first_creation ? request.payload.empty() : !request.payload.empty())) {
-        InvalidRequest();
-      }
-      if (first_creation) Load(PluginStartup::Decode(request.payload));
+      if (!binding_ || request.instance || request.operation || request.receiver || request.synchronous) InvalidRequest();
+      Reader reader(request.payload);
+      reader.Record(2);
+      const auto point = reader.Text();
+      const auto ordinal = Codec<std::uint32_t>::Read(reader);
+      reader.Finish();
+      const auto* factory = FindExtension(*binding_, point, ordinal);
+      if (!factory) InvalidRequest();
       if (instances_.size() >= 256 || next_instance_ == 0) {
         throw Error(ErrorCode::PluginFailed, "Worker instance limit reached");
       }
       void* raw = nullptr;
       const auto id = next_instance_++;
-      const auto status = binding_->create(activation_, &raw);
-      Instance instance(raw, binding_->close);
-      if (status != HPK_OK && first_creation) {
-        instance.reset();
-        Shutdown();
-      }
+      const auto status = factory->create(activation_, &raw);
+      Instance instance{*factory, {raw, factory->close}};
       CheckPluginStatus(status);
-      if (!instance) throw Error(ErrorCode::Protocol, "The plugin returned an empty instance");
+      if (!instance.object) throw Error(ErrorCode::Protocol, "The plugin returned an empty instance");
       instances_.emplace(id, std::move(instance));
       return Frame{0, id, 0, {}};
     }
@@ -163,10 +169,12 @@ public:
       InvalidRequest();
     }
 
+    // Operation numbers are local to the instance's contract.
+    auto& target = instance->second;
     current_service_channel = &channel;
-    CheckPluginStatus(binding_->invoke(instance->second.get(), &HostCallbacks, request.call, request.receiver,
-                                 request.operation, reinterpret_cast<const std::uint8_t*>(request.payload.data()),
-                                 static_cast<std::uint32_t>(request.payload.size()), FinishInvoke, &channel));
+    CheckPluginStatus(target.factory.invoke(target.object.get(), &HostCallbacks, request.call, request.receiver,
+        request.operation, reinterpret_cast<const std::uint8_t*>(request.payload.data()),
+        static_cast<std::uint32_t>(request.payload.size()), FinishInvoke, &channel));
     return std::nullopt;
   }
 
@@ -183,15 +191,15 @@ private:
     CheckPluginStatus(status);
   }
 
-  void Load(const PluginStartup& startup) {
+  void Activate(const PluginStartup& startup) {
+    const auto& binding = LoadPluginModule(path_);
+    ValidatePluginDescriptor(binding, startup.extensions, HPK_WORKER_PROCESS);
     PreparePluginData(startup);
-    const auto& binding = LoadPluginModule(path_, contract_, HPK_WORKER_PROCESS);
     activation_ = ActivatePlugin(binding, startup);
     binding_ = &binding;
   }
 
   std::filesystem::path path_;
-  ContractInfo contract_;
   const hpk_plugin_v1* binding_ = nullptr;
   void* activation_ = nullptr;
   std::unordered_map<std::uint32_t, Instance> instances_;
@@ -285,14 +293,11 @@ int wmain(int argc, wchar_t** argv) {
   using namespace huxerui::pluginkit;
   using namespace huxerui::pluginkit::detail;
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
-  if (argc != 7) return 1;
+  if (argc != 4) return 1;
   try {
     Handle input(reinterpret_cast<HANDLE>(ParseInteger<std::uintptr_t>(Utf8(argv[1]), "input handle")));
     Handle output(reinterpret_cast<HANDLE>(ParseInteger<std::uintptr_t>(Utf8(argv[2]), "output handle")));
-    const auto id = Utf8(argv[4]);
-    const auto version = ParseInteger<std::uint32_t>(Utf8(argv[5]), "contract version");
-    const auto fingerprint = Utf8(argv[6]);
-    Server server(argv[3], {id, version, fingerprint});
+    Server server(argv[3]);
     Run([&input](std::span<std::byte> bytes) {
       ReadAll(input.get(), bytes, ErrorCode::WorkerExited, "Cannot read worker frame");
     }, [&output](std::span<const std::byte> bytes) {
@@ -305,23 +310,22 @@ int wmain(int argc, wchar_t** argv) {
   }
 }
 #else
-int main(int argc, char** argv) {
+int main(int argc, [[maybe_unused]] char** argv) {
   using namespace huxerui::pluginkit;
   using namespace huxerui::pluginkit::detail;
   if (::getpid() != ::getpgrp() || ::fcntl(WorkerSocket, F_SETFD, FD_CLOEXEC) < 0) return 1;
   try {
 #if defined(__APPLE__)
-    if (argc != 5) return 1;
-    std::filesystem::path module(argv[4]);
+    if (argc != 2) return 1;
+    std::filesystem::path module(argv[1]);
     if (!module.is_absolute()) return 1;
     StartHostWatch();
 #else
-    if (argc != 4 || ::fcntl(WorkerModule, F_SETFD, FD_CLOEXEC) < 0) return 1;
+    if (argc != 1 || ::fcntl(WorkerModule, F_SETFD, FD_CLOEXEC) < 0) return 1;
     const auto module = "/proc/self/fd/" + std::to_string(WorkerModule);
     std::thread(WatchHost).detach();
 #endif
-    const auto version = ParseInteger<std::uint32_t>(argv[2], "contract version");
-    Server server(module, {argv[1], version, argv[3]});
+    Server server(module);
     const SocketStream stream(WorkerSocket);
     Run([&stream](std::span<std::byte> bytes) { stream.Read(bytes); },
         [&stream](std::span<const std::byte> bytes) { stream.Write(bytes); }, server);

@@ -16,8 +16,10 @@ else ()
     message(FATAL_ERROR "The CSV plugin targets Windows x64 (MSVC), Linux x86_64 (glibc), and macOS arm64")
 endif ()
 
-set(CSV_IMPORT_SDK "" CACHE PATH "Published CSV importer SDK directory")
+set(CSV_IMPORT_SDK "" CACHE PATH "Published CSV example SDK directory")
 if (NOT EXISTS "${CSV_IMPORT_SDK}/contract.json" OR NOT EXISTS "${CSV_IMPORT_SDK}/csv_contract.bindings.h" OR
+    NOT EXISTS "${CSV_IMPORT_SDK}/exporters/contract.json" OR
+    NOT EXISTS "${CSV_IMPORT_SDK}/exporters/export_contract.bindings.h" OR
     NOT EXISTS "${CSV_IMPORT_SDK}/cpp-abi.txt" OR NOT EXISTS "${CSV_IMPORT_SDK}/csv_sdk.h" OR
     NOT EXISTS "${CSV_IMPORT_SDK}/receivers/import_progress.bindings.h" OR
     NOT EXISTS "${CSV_IMPORT_SDK}/services/import_status.bindings.h" OR
@@ -25,23 +27,26 @@ if (NOT EXISTS "${CSV_IMPORT_SDK}/contract.json" OR NOT EXISTS "${CSV_IMPORT_SDK
     message(FATAL_ERROR "Set CSV_IMPORT_SDK to the SDK published by the host build")
 endif ()
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CSV_IMPORT_SDK}/contract.json" "${CSV_IMPORT_SDK}/cpp-abi.txt")
+    "${CSV_IMPORT_SDK}/contract.json" "${CSV_IMPORT_SDK}/exporters/contract.json" "${CSV_IMPORT_SDK}/cpp-abi.txt")
 if (NOT WIN32)
     find_package(Threads REQUIRED)
 endif ()
-file(READ "${CSV_IMPORT_SDK}/contract.json" contract)
-string(JSON contract_id GET "${contract}" id)
-string(JSON contract_version GET "${contract}" version)
-string(JSON contract_fingerprint GET "${contract}" fingerprint)
+file(READ "${CSV_IMPORT_SDK}/contract.json" import_contract)
+file(READ "${CSV_IMPORT_SDK}/exporters/contract.json" export_contract)
+foreach (field IN ITEMS id version fingerprint)
+    string(JSON import_${field} GET "${import_contract}" ${field})
+    string(JSON export_${field} GET "${export_contract}" ${field})
+endforeach ()
 
 file(READ "${CSV_IMPORT_SDK}/cpp-abi.txt" cpp_abi)
 if (NOT cpp_abi MATCHES "^[0-9A-Za-z.+:=_-]+$")
     message(FATAL_ERROR "The published CSV SDK has an invalid C++ ABI stamp")
 endif ()
 
-function(add_importer target source plugin_id contribution plugin_version)
+function(add_csv_package target source plugin_id plugin_version)
     add_library(${target} SHARED "${source}")
-    set_source_files_properties("${source}" PROPERTIES OBJECT_DEPENDS "${CSV_IMPORT_SDK}/contract.json")
+    set_source_files_properties("${source}" PROPERTIES OBJECT_DEPENDS
+        "${CSV_IMPORT_SDK}/contract.json;${CSV_IMPORT_SDK}/exporters/contract.json")
     target_include_directories(${target} PRIVATE "${CSV_IMPORT_SDK}")
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_link_libraries(${target} PRIVATE HuxerUI::huxerui)
@@ -66,17 +71,22 @@ function(add_importer target source plugin_id contribution plugin_version)
             LIBRARY_OUTPUT_DIRECTORY "${package_dir}"
         )
     endif ()
+    set(secondary_importer "")
+    if (source STREQUAL "csv_importer.cpp")
+        string(CONCAT secondary_importer "\n    {\"point\": \"example.table-importers\", \"contract\": \"${import_id}\", "
+            "\"metadata\": {\"extensions\": [\".ssv\"]}},")
+    endif ()
     set(manifest "${CMAKE_CURRENT_BINARY_DIR}/${target}.json")
     configure_file(plugin.json.in "${manifest}" @ONLY)
     file(GENERATE OUTPUT "${package_dir}/plugin.json" INPUT "${manifest}")
 endfunction()
 
-add_importer(csv-importer csv_importer.cpp example.csv csv 0.1.0)
+add_csv_package(csv-importer csv_importer.cpp example.csv 0.1.0)
 
 option(CSV_IMPORT_TEST_FIXTURES "Build the extra packages used by the CSV verification" OFF)
 if (CSV_IMPORT_TEST_FIXTURES)
-    add_importer(csv-importer-worker csv_importer.cpp example.csv-worker csv 0.1.0)
-    add_importer(csv-faults faults.cpp example.csv-faults faults 0.1.0)
-    add_importer(csv-faults-upgrade faults.cpp example.csv-faults faults 0.2.0)
+    add_csv_package(csv-importer-worker csv_importer.cpp example.csv-worker 0.1.0)
+    add_csv_package(csv-faults faults.cpp example.csv-faults 0.1.0)
+    add_csv_package(csv-faults-upgrade faults.cpp example.csv-faults 0.2.0)
     target_compile_definitions(csv-faults-upgrade PRIVATE CSV_IMPORT_UPGRADE)
 endif ()
