@@ -226,6 +226,42 @@ struct Codec<std::string, Interface> {
   static std::string Read(Reader& reader) { return reader.Text(); }
 };
 
+// Activation settings use one encoded value map for the worker request and the plugin ABI.
+template<>
+struct Codec<SettingValues> {
+  static void Write(Writer& writer, const SettingValues& values) {
+    writer.Array(values.size());
+    for (const auto& [key, value] : values) {
+      writer.Array(3);
+      writer.Text(key);
+      writer.Byte(static_cast<std::uint8_t>(value.index()));
+      std::visit([&](const auto& item) { Codec<std::remove_cvref_t<decltype(item)>>::Write(writer, item); }, value);
+    }
+  }
+
+  static SettingValues Read(Reader& reader) {
+    SettingValues values;
+    const auto count = reader.Array();
+    for (std::size_t i = 0; i < count; ++i) {
+      reader.Record(3);
+      auto key = reader.Text();
+      auto value = ReadValue(reader);
+      if (key.empty() || !values.emplace(std::move(key), std::move(value)).second) Reader::Invalid();
+    }
+    return values;
+  }
+
+private:
+  static SettingValue ReadValue(Reader& reader) {
+    switch (reader.Byte()) {
+      case 0: return Codec<bool>::Read(reader);
+      case 1: return Codec<std::int64_t>::Read(reader);
+      case 2: return Codec<std::string>::Read(reader);
+      default: Reader::Invalid();
+    }
+  }
+};
+
 template<class T, class Interface>
 struct Codec<std::vector<T>, Interface> {
   static void Write(Writer& writer, const std::vector<T>& values) {

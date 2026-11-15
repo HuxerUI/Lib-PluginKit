@@ -53,6 +53,13 @@ public:
   /// @return Reference valid for the lifetime of this context.
   const File& DataDirectory() const noexcept { return data_; }
 
+  /// @brief Returns the effective setting values captured before this activation's OnActivate().
+  ///
+  /// Includes defaults and saved overrides for every declared setting. Changes saved by the host take effect
+  /// on the next activation. Every instance and hook in this activation reads the same immutable snapshot.
+  /// @return Reference valid through OnDeactivate(). An empty map means the package declares no settings.
+  const SettingValues& Settings() const noexcept { return settings_; }
+
   /// @brief Returns the HuxerUI resource package shared by this activation's hooks and instances.
   /// @return Reference valid through OnDeactivate(). Uncached raw assets need a live resource resolver.
   /// @throws Error With NotFound if the plugin package has no resources directory.
@@ -63,12 +70,15 @@ public:
 
 private:
   friend struct detail::PluginContextAccess;
-  PluginContext(PluginIdentity info, File bundle, File data, std::optional<huxerui::Resources> resources)
-      : info_(std::move(info)), bundle_(std::move(bundle)), data_(std::move(data)), resources_(std::move(resources)) {}
+  PluginContext(PluginIdentity info, File bundle, File data, SettingValues settings,
+                std::optional<huxerui::Resources> resources)
+      : info_(std::move(info)), bundle_(std::move(bundle)), data_(std::move(data)), settings_(std::move(settings)),
+        resources_(std::move(resources)) {}
 
   PluginIdentity info_;
   File bundle_;
   File data_;
+  SettingValues settings_;
   std::optional<huxerui::Resources> resources_;
 };
 
@@ -157,6 +167,7 @@ inline const void* RuntimeIdentity() noexcept {
 
 struct PluginContextAccess {
   static std::unique_ptr<PluginContext> Create(const hpk_plugin_context_v1& context) {
+    auto settings = Decode<SettingValues, void>(std::as_bytes(std::span(context.settings.data, context.settings.size)));
     File bundle(context.bundle_directory);
     const auto directory = bundle.Child("resources");
     const auto status = directory.Stat();
@@ -169,7 +180,7 @@ struct PluginContextAccess {
     }
     return std::unique_ptr<PluginContext>(new PluginContext(
         {context.id, context.version, context.digest},
-        std::move(bundle), File(context.data_directory), std::move(resources)));
+        std::move(bundle), File(context.data_directory), std::move(settings), std::move(resources)));
   }
 };
 
@@ -251,6 +262,7 @@ constexpr hpk_plugin_v1 BindPlugin(const std::array<hpk_extension_v1, Count>& ex
           return HPK_PLUGIN_FAILED;
         }
       },
+      sizeof(hpk_plugin_context_v1),
   };
 }
 

@@ -58,7 +58,7 @@ The Kit ABI and protocol, application contract version, and plugin release versi
 | `ExtensionPoint<T>` | A named application extension point for a contract. Several points can use the same interface with different metadata and selection rules. |
 | `ExtensionInfo` | A factory declaration tied to an extension point and a package digest, returned by both package inspection and discovery. |
 | `ExtensionHandle<T>` | A typed, revocable handle to an opened extension instance. |
-| `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, optional HuxerUI resources, and writable data directory. |
+| `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, optional HuxerUI resources, writable data directory, and effective settings. |
 | `Task<T>` | Lazy operation whose coroutine runs on its owning thread. |
 | `std::shared_ptr<T>` | Typed proxy for a caller-owned callback interface, scoped to one invocation. |
 | `WireCodec<T>` | Optional mapping of a C++ value to a supported IPC representation. |
@@ -72,7 +72,7 @@ The application owns one `huxerui::pluginkit::PluginManager` for each plugin pro
 | Discovery | `RefreshCatalogAsync()`, `ListPlugins()`, `ListExtensions(point)` | Refresh configured sources and read catalog snapshots. Listing contributions uses manifest metadata. |
 | Invocation | `CreateExtension(point, candidate)`, `CreateExtension(point, plugin_id)`, `CreateExtensions(point, [plugin_id])` | Synchronously return typed handles. The first managed method creates its instance. |
 | Local package changes | `InstallPackage()`, `SetEnabled()`, `UpgradePackage()`, `UninstallPackage()` | Install an approved snapshot, persist enablement, upgrade to another local release, and uninstall with a data retention policy. |
-| Settings | `GetSettings(plugin_id)`, `SetSettingsAsync(plugin_id, values)` | Read a snapshot and validate or persist changes against the plugin settings schema. |
+| Settings | `GetSettings(plugin_id, locale)`, `SetSettingsAsync(plugin_id, revision, overrides)` | Read the localized schema and committed values. Validate and atomically replace explicit overrides for the revision being edited. |
 | Observability | `SubscribeEvents()`, `Diagnostics()` | Report catalog revisions, state transitions, operation progress, and structured failures. Subscription handles release their callbacks. |
 
 `ListExtensions` returns candidates with their plugin ID and optional JSON object text in `metadata_json`. The host can parse the text using its own metadata conventions to pick a candidate and pass it to `CreateExtension`. A plugin ID selects a factory when it is the only one at that point and yields `Ambiguous` when several match. `CreateExtensions` returns one handle per available factory, ordered by plugin ID and then by declaration order within each package. Disabled packages disappear from extension discovery while their package records remain visible. After an upgrade, a candidate for the old digest yields `PackageChanged`.
@@ -85,11 +85,11 @@ The activation opens the installed `resources/` directory once with `huxerui::Re
 
 The host records service grants and execution mode with the approved package digest. During a call, `GetService<T>()` synchronously returns a typed handle. The service implementation resolves the grant from the invocation. The caller supplies a `std::shared_ptr<T>` as a shared C++ callback argument, with access scoped to that invocation. See the [CSV example](../README.md#sdk-and-runtime).
 
-The broader lifecycle design includes settings, logging, and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
+The broader lifecycle design includes logging and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
 
 ## Packages, discovery, and resolution
 
-A local directory package contains `plugin.json`, one library for the selected target, and optionally the HuxerUI resource compiler's output under `resources/`. The manifest identifies the plugin and release, available execution modes, C++ ABI identity, and extension factories. The manager enumerates the resource files and hashes their relative paths and exact contents alongside the manifest and library. Installation verifies those files in a staging directory before publishing the approved snapshot. Archive extraction belongs to the caller. The broader package design includes publisher signatures, target variants, dependencies, requested capabilities, and settings schemas.
+A local directory package contains `plugin.json`, one library for the selected target, and optionally the HuxerUI resource compiler's output under `resources/`. The manifest identifies the plugin and release, available execution modes, C++ ABI identity, extension factories, and optional settings declarations. The manager enumerates the resource files and hashes their relative paths and exact contents alongside the manifest and library. Installation verifies those files in a staging directory before publishing the approved snapshot. Archive extraction belongs to the caller. The broader package design includes publisher signatures, target variants, dependencies, and requested capabilities.
 
 The CSV example publishes two importers and one exporter in the same package.
 
@@ -164,15 +164,27 @@ Startup and initial activation share the invocation's deadline. An expired attem
 
 ## Management transactions and persisted state
 
-A profile records the selected local package, enabled flag, granted services, and data directory per installed plugin. A new host process reopens the profile and uses the managed snapshot without reinstalling. Register its current extension points and service objects before using the installed plugins. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.
+A profile records the selected local package, enabled flag, granted services, data directory, and saved setting overrides per installed plugin. A new host process reopens the profile and uses the managed snapshot without reinstalling. Register its current extension points and service objects before using the installed plugins. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.
 
-`UpgradePackage` checks the installed and candidate digests and the complete approved grant list. The package keeps the plugin identifier, declares a different release version, and matches the registered points and installed execution mode. `UninstallPackage` checks the installed digest and removes its catalog entry, factories, grants, and pending upgrade. Current plugin data is retained by default and reused on reinstall. `PluginDataPolicy::Delete` records that the data can be removed after uninstall commits.
+`UpgradePackage` checks the installed and candidate digests and the complete approved grant list. The package keeps the plugin identifier, declares a different release version, and matches the registered points and installed execution mode. `UninstallPackage` checks the installed digest and removes its catalog entry, factories, grants, and pending upgrade. Plugin data and saved settings are retained by default for reinstall. `PluginDataPolicy::Delete` drops the overrides at commit and schedules removal of the data directory.
 
-The manager stages the verified package and records when validation begins. It stops the old generation before copying the current data. The plugin owns data format migration in `OnActivate` and can write to the candidate copy. One atomic profile replacement selects the package, the grants, and the migrated data. Opening the profile discards interrupted candidates and retries cleanup of files discarded by a committed change. Host side effects and files outside the plugin data directory follow the application's contracts.
+The manager stages the verified package and records when validation begins. It stops the old generation before copying the current data. The plugin owns data format migration in `OnActivate` and can write to the candidate copy. One atomic profile replacement selects the package, grants, migrated data, and settings. Opening the profile discards interrupted candidates and retries cleanup of files discarded by a committed change. Host side effects and files outside the plugin data directory follow the application's contracts.
 
 An enabled worker upgrade waits for the old worker to exit and validates the candidate in a new worker before committing. Validation runs `OnActivate` and creates and destroys a probe instance from every factory on the shared activation. The host obtains new handles after commit. In-process upgrades run the same factory checks when `ApplyPendingChanges` runs in a new host process after registration. If a failed candidate was mapped, the selected old version can be loaded in a subsequent process. Disabled packages keep their enablement state and activate on first use. The old package and data can be cleaned up once their references are released.
 
-The broader management design can use `PlanChangesAsync` and `ApplyPlanAsync` for coordinated package and dependency changes against a profile revision. It includes versioned settings validated against a schema, provider preferences, and scoped grant revocation. Local upgrades commit explicit grants for the approved target digest.
+The broader management design can use `PlanChangesAsync` and `ApplyPlanAsync` for coordinated package and dependency changes against a profile revision. It includes provider preferences and scoped grant revocation. Local upgrades commit explicit grants for the approved target digest.
+
+### Plugin settings
+
+The optional manifest `settings` array declares ordered controls with stable keys, types, titles, and defaults. Integers accept optional inclusive `minimum` and `maximum` bounds. Enumerations contain ordered options with stable string values and display titles. Booleans and free-form UTF-8 strings use their corresponding `SettingValue` alternatives. The manager checks defaults and constraints during inspection.
+
+Titles, optional descriptions, and option titles accept literal text or `{"resource":"namespace:strings/key"}`. Inspection preserves the reference in `PackageInfo::settings_schema`. The approved resource package must resolve each reference with the SDK's default configuration. `GetSettings` uses the caller's locale and the SDK's catalog fallback. It opens the committed package directly and returns owned labels even while the plugin is disabled. Changing the UI locale calls `GetSettings` again for the new labels.
+
+The profile persists explicit overrides and an opaque revision. `SetSettingsAsync` compares the expected revision, reports invalid fields together, and validates the complete replacement map before committing. Removing an override selects the manifest default. An actual change publishes `PluginCatalogChange::SettingsChanged` after commit. The snapshot exposes the saved revision and, when active, the revision read by the plugin.
+
+`PluginContext::Settings()` holds effective values for the lifetime of the activation. An in-process package captures the settings when its first managed call begins activation. The worker receives the same typed values in its startup request. All factories and lifecycle hooks share that snapshot. Saved edits take effect when the plugin next activates.
+
+An upgrade takes the latest saved overrides when it applies, including edits made while an in-process replacement was staged. The candidate retains only keys with the same declared type whose values pass its constraints. The new schema supplies defaults for the other keys. Validation failure or interruption leaves the previous settings revision selected. Reinstall with retained data applies the same compatibility check to the saved overrides.
 
 ## Toolchain and HuxerUI integration
 

@@ -2,6 +2,7 @@
 
 #include "csv_contract.h"
 
+#include <limits>
 #include <span>
 #include <utility>
 
@@ -28,7 +29,9 @@ inline void AppendCsvRecord(std::string& output, const Row& row) {
 
 class CsvRecords {
 public:
-  CsvRecords(char separator, std::uint32_t limit) : separator_(separator), limit_(limit) {}
+  CsvRecords(char separator, std::uint32_t limit,
+             std::int64_t row_limit = (std::numeric_limits<std::int64_t>::max)())
+      : separator_(separator), limit_(limit), row_limit_(row_limit) {}
 
   template<class Emit>
   bool Feed(std::span<const std::byte> data, Emit emit) {
@@ -112,6 +115,7 @@ private:
   template<class Emit>
   bool EndRecord(Emit& emit) {
     if (!EndField()) return false;
+    if (width_ && Rows() >= row_limit_) return Fail("csv.row_limit", "Too many data rows", 1);
     if (!width_) width_ = row_.size();
     if (row_.size() != width_) return Fail("csv.column_count", "The row width differs from the header", 1);
     emit(std::exchange(row_, {}), record_ == 1);
@@ -128,6 +132,7 @@ private:
 
   const char separator_;
   const std::uint32_t limit_;
+  const std::int64_t row_limit_;
   Field field_ = Field::Start;
   std::uint32_t record_ = 1;
   std::uint32_t cells_ = 0;

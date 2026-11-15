@@ -2,6 +2,7 @@
 #include "extension.h"
 #include "plugin_events.h"
 #include "plugin_module.h"
+#include "plugin_settings.h"
 #include "run_transport.h"
 #include "worker_process.h"
 
@@ -72,7 +73,7 @@ PackageInfo ManifestParser::Parse(const Json& manifest, std::string digest) {
     }
     PackageInfo info{
         manifest.at("id").get<std::string>(), manifest.at("version").get<std::string>(), std::move(digest),
-        {}, {}, manifest.at("cpp_abi").get<std::string>()};
+        {}, {}, manifest.at("cpp_abi").get<std::string>(), {}};
     if (!IsId(info.id) || !IsId(info.version)) throw Error(ErrorCode::InvalidPackage, "Invalid plugin identity");
     if (manifest.contains("provides")) {
       throw Error(ErrorCode::InvalidPackage, "Extension contracts come from the host SDK");
@@ -112,6 +113,7 @@ PackageInfo ManifestParser::Parse(const Json& manifest, std::string digest) {
         (info.cpp_abi.empty() || info.cpp_abi.size() > 256 || info.cpp_abi.find('\0') != std::string::npos)) {
       throw Error(ErrorCode::InvalidPackage, "Missing or invalid in-process ABI identity");
     }
+    info.settings_schema = ParseSettingsSchema(manifest);
     return info;
   } catch (const Json::exception& error) {
     throw Error(ErrorCode::InvalidPackage, "Invalid plugin manifest: " + std::string(error.what()));
@@ -206,13 +208,25 @@ Package ReadPackage(const fs::path& directory) try {
   throw Error(ErrorCode::Io, "Cannot read plugin package: " + std::string(error.what()));
 }
 
+Package ReadPackageForApproval(const fs::path& directory) {
+  auto package = ReadPackage(directory);
+  ValidateSettingsResources(package.info.settings_schema, File(PathText(directory / "resources")));
+  return package;
+}
+
 struct Installed {
   PackageInfo info;
   Json manifest;
   bool enabled;
   InstallOptions approval;
   std::string data;
+  std::string settings_revision;
+  SavedSettings overrides;
 };
+
+Bytes EncodeEffectiveSettings(const Installed& installed) {
+  return Encode<void>(EffectiveSettings(installed.info.settings_schema, installed.overrides));
+}
 
 struct PendingUpgrade {
   Installed target;
@@ -223,10 +237,15 @@ struct PendingUpgrade {
 
 using Catalog = std::map<std::string, Installed, std::less<>>;
 
+struct RetainedData {
+  std::string directory;
+  SavedSettings overrides;
+};
+
 struct Profile {
   Catalog plugins;
   std::map<std::string, PendingUpgrade, std::less<>> upgrades;
-  std::map<std::string, std::string, std::less<>> retained_data;
+  std::map<std::string, RetainedData, std::less<>> retained_data;
   std::set<std::string, std::less<>> discarded_data;
 };
 
@@ -259,12 +278,20 @@ Installed ReadInstalled(const Json& entry) {
       !std::ranges::all_of(approval.services, [](const auto& service) { return IsId(service); })) {
     throw Error(ErrorCode::Io, "Invalid plugin data or approval in the profile");
   }
-  return {std::move(info), std::move(manifest), entry.at("enabled").get<bool>(), std::move(approval), std::move(data)};
+  const auto& settings = entry.at("settings");
+  auto revision = settings.at("revision").get<std::string>();
+  auto overrides = ReadSavedSettings(settings.at("overrides"));
+  if (!IsDigest(revision) || RetainOverrides(info.settings_schema, overrides).size() != overrides.size()) {
+    throw Error(ErrorCode::Io, "Invalid saved settings in the profile");
+  }
+  return {std::move(info), std::move(manifest), entry.at("enabled").get<bool>(), std::move(approval), std::move(data),
+          std::move(revision), std::move(overrides)};
 }
 
 Json DescribeInstalled(const Installed& plugin) {
   return {{"digest", plugin.info.digest}, {"manifest", plugin.manifest}, {"enabled", plugin.enabled},
-          {"mode", ModeName(plugin.approval.mode)}, {"services", plugin.approval.services}, {"data", plugin.data}};
+          {"mode", ModeName(plugin.approval.mode)}, {"services", plugin.approval.services}, {"data", plugin.data},
+          {"settings", {{"revision", plugin.settings_revision}, {"overrides", DescribeSavedSettings(plugin.overrides)}}}};
 }
 
 Profile ReadProfile(const fs::path& file) {
@@ -307,11 +334,11 @@ Profile ReadProfile(const fs::path& file) {
       }
     }
     for (const auto& [id, value] : retained.items()) {
-      auto data = value.get<std::string>();
+      auto data = value.at("directory").get<std::string>();
       if (!IsId(id) || !IsDataName(id, data) || result.plugins.contains(id)) {
         throw Error(ErrorCode::Io, "Invalid retained data in the profile");
       }
-      result.retained_data.emplace(id, std::move(data));
+      result.retained_data.emplace(id, RetainedData{std::move(data), ReadSavedSettings(value.at("overrides"))});
     }
     for (const auto& entry : discarded) {
       auto name = entry.get<std::string>();
@@ -332,8 +359,12 @@ void SaveProfile(const fs::path& file, const Profile& profile) {
     upgrades.push_back({{"target", DescribeInstalled(upgrade.target)}, {"expected_digest", upgrade.expected_digest},
                         {"process", upgrade.process}, {"applying", upgrade.applying}});
   }
+  auto retained = Json::object();
+  for (const auto& [id, data] : profile.retained_data) {
+    retained[id] = {{"directory", data.directory}, {"overrides", DescribeSavedSettings(data.overrides)}};
+  }
   const auto text = Json{{"schema_version", 1}, {"plugins", std::move(plugins)}, {"upgrades", std::move(upgrades)},
-                         {"retained_data", profile.retained_data}, {"discarded_data", profile.discarded_data}}.dump(2);
+                         {"retained_data", std::move(retained)}, {"discarded_data", profile.discarded_data}}.dump(2);
   if (text.size() > MaxProfile) throw Error(ErrorCode::PayloadTooLarge, "The plugin profile exceeds the byte limit");
   WriteAtomicFile(file, AsBytes(text));
 }
@@ -467,7 +498,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
 
   void ValidatePackage(const PackageInfo& info, InstallOptions& approval) const;
   void StorePackage(const Package& package);
-  Package VerifyPackage(const Installed& installed) const;
+  Package VerifyPackage(std::string_view digest) const;
   PluginStartup Startup(const Installed& installed) const;
   std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed, PluginStartup startup,
                                         std::shared_ptr<PluginRun> run = {});
@@ -479,6 +510,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   Task<void> ChangeLocalEnabled(const std::string& id, bool enabled);
   void ChangeWorkerEnabled(const std::string& id, bool enabled, std::stop_token stop);
   Task<void> SetEnabled(std::string id, bool enabled);
+  Task<void> SetSettings(std::string id, std::string expected_revision, SettingValues overrides);
   Task<UpgradeStatus> Upgrade(File directory, UpgradeApproval approval);
   Task<UpgradeStatus> ApplyUpgrade(std::string id, std::optional<Package> source, UpgradeApproval approval = {});
   Task<UninstallStatus> Uninstall(std::string id, std::string expected_digest, PluginDataPolicy data);
@@ -486,6 +518,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   Task<void> RetirePlugin(const std::string& id, PluginStopReason reason);
   PluginInfo DescribePlugin(const Installed& installed) const;
   void CleanupFiles();
+  bool IsChangingPackage(std::string_view id) const;
   bool IsPluginBusy(std::string_view id, const Installed& installed) const;
   void CleanupFilesAfterCommit() noexcept;
   void PruneExitedWorkers();
@@ -603,7 +636,7 @@ void PluginManager::Impl::CleanupFiles() {
     packages.insert(upgrade.target.info.digest);
     data.insert(upgrade.target.data);
   }
-  for (const auto& [id, directory] : profile_state.retained_data) data.insert(directory);
+  for (const auto& [id, retained] : profile_state.retained_data) data.insert(retained.directory);
 
   // A mapped library may still be referenced by C++ code. Its directory can be cleaned in a later process.
   RemoveUnusedDirectories(profile / "packages", packages,
@@ -646,12 +679,17 @@ void PluginManager::Impl::PruneExitedWorkers() {
   });
 }
 
-bool PluginManager::Impl::IsPluginBusy(std::string_view id, const Installed& installed) const {
+bool PluginManager::Impl::IsChangingPackage(std::string_view id) const {
   if (const auto change = changes.find(id); change != changes.end() && change->second == 0) return true;
   const auto pending = profile_state.upgrades.find(id);
-  if (pending != profile_state.upgrades.end() && pending->second.applying) return true;
+  return pending != profile_state.upgrades.end() && pending->second.applying;
+}
+
+bool PluginManager::Impl::IsPluginBusy(std::string_view id, const Installed& installed) const {
+  if (IsChangingPackage(id)) return true;
   if (installed.approval.mode != ExecutionMode::InProcess) return false;
   if (InProcessVersionRequiresRestart(profile, id, installed.info.digest)) return true;
+  const auto pending = profile_state.upgrades.find(id);
   return pending != profile_state.upgrades.end() && pending->second.process != HostProcessToken();
 }
 
@@ -682,6 +720,7 @@ std::string_view ErrorName(ErrorCode code) noexcept {
     case ErrorCode::CallbackUnavailable: return "callback_unavailable";
     case ErrorCode::Busy: return "busy";
     case ErrorCode::Ambiguous: return "ambiguous";
+    case ErrorCode::SettingsChanged: return "settings_changed";
   }
   return "unknown";
 }
@@ -755,12 +794,12 @@ void PluginManager::Provide(ContractInfo contract, std::shared_ptr<void> impleme
 
 PackageInfo PluginManager::InspectPackage(const File& directory) {
   RejectServiceReentry();
-  return ReadPackage(NativePath(directory)).info;
+  return ReadPackageForApproval(NativePath(directory)).info;
 }
 
 void PluginManager::InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options) {
   RejectServiceReentry();
-  auto package = ReadPackage(NativePath(directory));
+  auto package = ReadPackageForApproval(NativePath(directory));
   if (package.info.digest != approved_digest) {
     throw Error(ErrorCode::ApprovalMismatch, "The package contents differ from the approved digest");
   }
@@ -798,13 +837,15 @@ void PluginManager::InstallPackage(const File& directory, std::string_view appro
     auto candidate = impl_->profile_state;
     const auto id = package.info.id;
     auto retained = candidate.retained_data.extract(id);
-    auto data = retained.empty() ? DefaultDataName(id) : std::move(retained.mapped());
+    auto data = retained.empty() ? DefaultDataName(id) : std::move(retained.mapped().directory);
+    auto overrides = retained.empty() ? SavedSettings{} :
+        RetainOverrides(package.info.settings_schema, retained.mapped().overrides);
     if (retained.empty() && candidate.discarded_data.contains(data)) {
       // A previous delete can still be awaiting cleanup. A new installation gets fresh data.
       data += "." + NewToken();
     }
     candidate.plugins.emplace(id, Installed{std::move(package.info), std::move(package.manifest), true,
-                                           std::move(options), std::move(data)});
+                                           std::move(options), std::move(data), NewToken(), std::move(overrides)});
     impl_->Commit(std::move(candidate));
     impl_->events->CatalogChanged(identity, PluginCatalogChange::Installed);
     impl_->CleanupFilesAfterCommit();
@@ -840,7 +881,7 @@ void PluginManager::Impl::StorePackage(const Package& package) try {
   RequireManagedDirectory(destination.parent_path());
   RequireManagedDirectory(destination);
   try {
-    if (ReadPackage(destination).info.digest == package.info.digest) return;
+    if (ReadPackageForApproval(destination).info.digest == package.info.digest) return;
   } catch (const Error&) {
     // Restore the approved bytes if a previous write left an incomplete snapshot.
   }
@@ -859,7 +900,7 @@ void PluginManager::Impl::StorePackage(const Package& package) try {
       CopyRegularFile(package.directory / relative, output);
     }
     // Approve the staged bytes that will be installed, including resources copied after inspection.
-    if (ReadPackage(staged).info.digest != package.info.digest) {
+    if (ReadPackageForApproval(staged).info.digest != package.info.digest) {
       throw Error(ErrorCode::ApprovalMismatch, "The package contents changed while staging the approved snapshot");
     }
     fs::remove_all(destination);
@@ -873,13 +914,13 @@ void PluginManager::Impl::StorePackage(const Package& package) try {
   throw Error(ErrorCode::Io, "Cannot store plugin package: " + std::string(error.what()));
 }
 
-Package PluginManager::Impl::VerifyPackage(const Installed& installed) const {
+Package PluginManager::Impl::VerifyPackage(std::string_view digest) const {
   try {
-    const auto directory = PackageDirectory(installed.info.digest);
+    const auto directory = PackageDirectory(digest);
     RequireManagedDirectory(directory.parent_path());
     RequireManagedDirectory(directory);
     auto package = ReadPackage(directory);
-    if (package.info.digest == installed.info.digest) return package;
+    if (package.info.digest == digest) return package;
   } catch (const Error& error) {
     throw Error(ErrorCode::PackageChanged, "Cannot verify the installed package: " + std::string(error.what()));
   } catch (const fs::filesystem_error& error) {
@@ -936,7 +977,7 @@ Task<UpgradeStatus> PluginManager::UpgradePackage(File directory, UpgradeApprova
 
 Task<UpgradeStatus> PluginManager::Impl::Upgrade(File directory, UpgradeApproval approval) {
   auto source = co_await RunTransport([directory = std::move(directory)](std::stop_token) {
-    return ReadPackage(NativePath(directory));
+    return ReadPackageForApproval(NativePath(directory));
   });
   auto id = source.info.id;
   co_return co_await ApplyUpgrade(std::move(id), std::move(source), std::move(approval));
@@ -977,7 +1018,7 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
       source->module_file.reset();
       StorePackage(*source);
       replacement.emplace(Installed{std::move(source->info), std::move(source->manifest), current.enabled,
-                                     std::move(options), current.data});
+                                     std::move(options), current.data, {}, {}});
     } else {
       const auto found = profile_state.upgrades.find(id);
       if (found == profile_state.upgrades.end() || found->second.process == HostProcessToken() || found->second.applying) {
@@ -991,6 +1032,9 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     if (source) replacement->data = DefaultDataName(id) + "." + NewToken();
     candidate_data = replacement->data;
     replacement->enabled = current.enabled;
+    // Apply the candidate schema to the latest committed edit, including saves made after staging a restart upgrade.
+    replacement->overrides = RetainOverrides(replacement->info.settings_schema, current.overrides);
+    replacement->settings_revision = NewToken();
     auto next = profile_state;
     stage = PluginFailureStage::Commit;
     if (source && current.approval.mode == ExecutionMode::InProcess) {
@@ -1024,15 +1068,18 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     {
       std::lock_guard lock(mutex);
       ValidatePackage(replacement->info, replacement->approval);
-      if (replacement->enabled) startup = Startup(*replacement);
+      if (replacement->enabled) {
+        startup = Startup(*replacement);
+        startup.settings = EncodeEffectiveSettings(*replacement);
+      }
       if (replacement->approval.mode == ExecutionMode::WorkerProcess) granted = ApprovedServices(*replacement);
     }
     stage = PluginFailureStage::RetirePrevious;
     co_await RetirePlugin(id, PluginStopReason::Upgrading);
     stage = PluginFailureStage::PrepareData;
-    const auto prepare = [self = shared_from_this(), target = *replacement, source_data = DataDirectory(current_data),
+    const auto prepare = [self = shared_from_this(), digest = replacement->info.digest, source_data = DataDirectory(current_data),
                           target_data = DataDirectory(candidate_data)](std::stop_token) {
-      auto package = self->VerifyPackage(target);
+      auto package = self->VerifyPackage(digest);
       RequireManagedDirectory(target_data.parent_path());
       fs::create_directories(target_data.parent_path());
       CopyPluginData(source_data, target_data);
@@ -1041,14 +1088,14 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     auto package = co_await RunTransport(prepare);
     if (replacement->enabled && replacement->approval.mode == ExecutionMode::WorkerProcess) {
       stage = PluginFailureStage::StartWorker;
-      run = events->Start(*identity, true);
+      run = events->Start(*identity, replacement->settings_revision, true);
       worker = MakeWorker(package, std::move(granted), std::move(startup), run);
       stage = PluginFailureStage::ValidateFactories;
       co_await RunTransport([worker](std::stop_token stop) { worker->ValidateFactories(stop); });
       if (!worker->Pid()) throw Error(ErrorCode::WorkerExited, "The candidate worker exited during validation");
     } else if (replacement->enabled) {
       stage = PluginFailureStage::ValidateFactories;
-      run = events->Start(*identity, true);
+      run = events->Start(*identity, replacement->settings_revision, true);
       local = MakeLocal(*replacement, std::move(startup), run);
       ValidateLocalPlugin(local);
     }
@@ -1140,7 +1187,7 @@ Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string
   std::lock_guard lock(mutex);
   (void)RequireInstalled(id);
   auto next = profile_state;
-  const auto current = next.plugins.extract(id);
+  auto current = next.plugins.extract(id);
   const auto identity = Identity(current.mapped().info);
   const auto pending = next.upgrades.extract(id);
   const auto package_path = PackageDirectory(current.mapped().info.digest);
@@ -1152,8 +1199,11 @@ Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string
     next.discarded_data.insert(pending.mapped().target.data);
     pending_data = DataDirectory(pending.mapped().target.data);
   }
-  if (data == PluginDataPolicy::Keep) next.retained_data.emplace(id, current.mapped().data);
-  else next.discarded_data.insert(current.mapped().data);
+  if (data == PluginDataPolicy::Keep) {
+    next.retained_data.emplace(id, RetainedData{std::move(current.mapped().data), std::move(current.mapped().overrides)});
+  } else {
+    next.discarded_data.insert(current.mapped().data);
+  }
   Commit(std::move(next));
   change->ReleaseLocked();
   events->CatalogChanged(identity, PluginCatalogChange::Uninstalled);
@@ -1293,6 +1343,46 @@ std::vector<PluginInfo> PluginManager::ListPlugins() const {
   return result;
 }
 
+SettingsSnapshot PluginManager::GetSettings(std::string_view plugin_id, const Locale& locale) const {
+  std::lock_guard lock(impl_->mutex);
+  const auto& installed = impl_->RequireInstalled(plugin_id);
+  const auto& schema = installed.info.settings_schema;
+  const File resources(PathText(impl_->PackageDirectory(installed.info.digest) / "resources"));
+  return {ResolveSettingsSchema(schema, resources, locale), EffectiveSettings(schema, installed.overrides),
+          ExplicitOverrides(installed.overrides), installed.settings_revision,
+          impl_->events->ActiveSettingsRevision(plugin_id, installed.info.digest)};
+}
+
+Task<void> PluginManager::SetSettingsAsync(std::string_view plugin_id, std::string_view expected_revision,
+                                           SettingValues overrides) {
+  return RunManagement<void>(impl_, [id = std::string(plugin_id), revision = std::string(expected_revision),
+                                     overrides = std::move(overrides)](Impl& impl) mutable {
+    return impl.SetSettings(std::move(id), std::move(revision), std::move(overrides));
+  });
+}
+
+Task<void> PluginManager::Impl::SetSettings(std::string id, std::string expected_revision, SettingValues overrides) {
+  auto save = [self = shared_from_this(), id = std::move(id), expected_revision = std::move(expected_revision),
+               overrides = std::move(overrides)](std::stop_token) mutable {
+    std::lock_guard lock(self->mutex);
+    const auto& current = self->RequireInstalled(id);
+    if (self->IsChangingPackage(id)) throw Error(ErrorCode::Busy, "The plugin is applying a package change");
+    if (current.settings_revision != expected_revision) {
+      throw Error(ErrorCode::SettingsChanged, "The plugin settings have changed since they were read");
+    }
+    auto validated = ValidateOverrides(current.info.settings_schema, std::move(overrides));
+    if (validated == current.overrides) return;
+    const auto identity = Identity(current.info);
+    auto next = self->profile_state;
+    auto& target = next.plugins.at(id);
+    target.overrides = std::move(validated);
+    target.settings_revision = NewToken();
+    self->Commit(std::move(next));
+    self->events->CatalogChanged(identity, PluginCatalogChange::SettingsChanged);
+  };
+  co_await RunTransport(std::move(save));
+}
+
 PluginEventSubscription PluginManager::SubscribeEvents(std::function<void(const PluginEvent&)> callback) {
   return PluginEventSubscription(impl_->events->Subscribe(std::move(callback)));
 }
@@ -1382,30 +1472,47 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
 
 std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& installed, PluginStartup startup,
                                                            std::shared_ptr<PluginRun> run) {
-  return CreateLocalPlugin(callbacks, [manager = weak_from_this(), installed]() -> const hpk_plugin_v1& {
+  LocalStarter start;
+  if (!run) {
+    start = [manager = weak_from_this()](PluginStartup& current_startup) {
+      const auto impl = manager.lock();
+      if (!impl) throw Error(ErrorCode::Closed, "The plugin manager is closed");
+      std::lock_guard lock(impl->mutex);
+      const auto& current = impl->RequireInstalled(current_startup.identity.id);
+      if (!current.enabled || current.info.digest != current_startup.identity.digest) {
+        throw Error(ErrorCode::Closed, "The plugin generation is closed");
+      }
+      // Creating a handle is lazy. Read the committed settings when the handle first activates the package.
+      current_startup.settings = EncodeEffectiveSettings(current);
+      return impl->events->Start(current_startup.identity, current.settings_revision);
+    };
+  }
+  auto load = [manager = weak_from_this(), id = installed.info.id, digest = installed.info.digest,
+               cpp_abi = installed.info.cpp_abi]() -> const hpk_plugin_v1& {
     const auto impl = manager.lock();
     if (!impl) throw Error(ErrorCode::Closed, "The plugin manager is closed");
-    if (installed.info.cpp_abi != CppAbi) {
+    if (cpp_abi != CppAbi) {
       throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
     }
-    auto package = impl->VerifyPackage(installed);
-    const auto module = impl->PackageDirectory(package.info.digest) / ModuleName;
-    const auto* binding = &LoadInProcessModule(module, std::move(package.module_file), impl->profile,
-                                               installed.info.id, installed.info.digest);
+    auto package = impl->VerifyPackage(digest);
+    const auto module = impl->PackageDirectory(digest) / ModuleName;
+    const auto* binding = &LoadInProcessModule(module, std::move(package.module_file), impl->profile, id, digest);
     const auto* runtime = RuntimeIdentity();
-    if (!runtime || !binding->cpp_abi || installed.info.cpp_abi != binding->cpp_abi || !binding->runtime_identity ||
+    if (!runtime || !binding->cpp_abi || cpp_abi != binding->cpp_abi || !binding->runtime_identity ||
         binding->runtime_identity() != runtime) {
       throw Error(ErrorCode::ContractMismatch, "The plugin does not share the host's C++ ABI and HuxerUI Runtime");
     }
     return *binding;
-  }, std::move(startup), ApprovedServices(installed), events, std::move(run));
+  };
+  return CreateLocalPlugin(callbacks, std::move(load), std::move(startup), ApprovedServices(installed),
+                           std::move(start), std::move(run));
 }
 
 PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
   const auto& info = installed.info;
   const auto directory = PackageDirectory(info.digest);
   const auto data = DataDirectory(installed.data);
-  PluginStartup startup{{info.id, info.version, info.digest}, PathText(directory), PathText(data), {}};
+  PluginStartup startup{{info.id, info.version, info.digest}, PathText(directory), PathText(data), {}, {}};
   startup.extensions.reserve(info.extensions.size());
   for (const auto& extension : info.extensions) {
     // The manifest selects the factory slot. The host supplies the contract the library must implement.
@@ -1439,7 +1546,7 @@ WorkerStart PluginManager::Impl::StartWorker(const std::string& id, const std::s
     workers.erase(running);
   }
 
-  auto run = events->Start(Identity(installed->second.info));
+  auto run = events->Start(Identity(installed->second.info), installed->second.settings_revision);
   auto stage = PluginFailureStage::VerifyPackage;
   std::shared_ptr<Worker> worker;
   const auto check_start = [&] {
@@ -1453,10 +1560,12 @@ WorkerStart PluginManager::Impl::StartWorker(const std::string& id, const std::s
     }
   };
   try {
-    const auto package = VerifyPackage(installed->second);
+    const auto package = VerifyPackage(installed->second.info.digest);
     check_start();
     stage = PluginFailureStage::StartWorker;
-    worker = MakeWorker(package, ApprovedServices(installed->second), Startup(installed->second), run);
+    auto startup = Startup(installed->second);
+    startup.settings = EncodeEffectiveSettings(installed->second);
+    worker = MakeWorker(package, ApprovedServices(installed->second), std::move(startup), run);
     // The new process belongs to this call until it is published for other handles.
     check_start();
     workers.emplace(id, worker);

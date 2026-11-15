@@ -91,6 +91,7 @@ inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path) 
   if (!address) throw Error(ErrorCode::ContractMismatch, "Missing pluginkit_query_v1 export");
   const auto* binding = reinterpret_cast<hpk_query_v1>(address)();
   if (!binding || binding->struct_size != sizeof(hpk_plugin_v1) || binding->abi_version != HPK_ABI_VERSION ||
+      binding->activation_context_size != sizeof(hpk_plugin_context_v1) ||
       !binding->extensions || !binding->extension_count || binding->extension_count > HPK_MAX_EXTENSIONS ||
       !binding->activate || !binding->deactivate) {
     throw Error(ErrorCode::ContractMismatch, "The module has an invalid plugin descriptor");
@@ -182,7 +183,9 @@ inline void* ActivatePlugin(const hpk_plugin_v1& binding, const PluginStartup& s
 
   const auto& identity = startup.identity;
   const hpk_plugin_context_v1 context{identity.id.c_str(), identity.version.c_str(), identity.digest.c_str(),
-                                     startup.bundle_directory.c_str(), startup.data_directory.c_str()};
+                                     startup.bundle_directory.c_str(), startup.data_directory.c_str(),
+                                     {reinterpret_cast<const std::uint8_t*>(startup.settings.data()),
+                                      static_cast<std::uint32_t>(startup.settings.size())}};
   void* activation = nullptr;
   CheckPluginStatus(binding.activate(&context, &activation));
   if (!activation) throw Error(ErrorCode::Protocol, "The plugin returned an empty activation");

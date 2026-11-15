@@ -226,10 +226,10 @@ struct LocalCall : LocalInvocation {
 class LocalPlugin : public std::enable_shared_from_this<LocalPlugin> {
 public:
   LocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load, PluginStartup startup,
-              std::vector<RegisteredService> services, std::weak_ptr<PluginEvents> events,
+              std::vector<RegisteredService> services, LocalStarter start,
               std::shared_ptr<PluginRun> run)
       : tasks(std::move(tasks)), load_(std::move(load)), startup_(std::move(startup)), services_(std::move(services)),
-        events_(std::move(events)), run_(std::move(run)) {}
+        start_(std::move(start)), run_(std::move(run)) {}
 
   ~LocalPlugin() {
     if (!activation_) return;
@@ -490,10 +490,8 @@ private:
   }
 
   void Activate() {
-    if (!run_) {
-      if (const auto events = events_.lock()) run_ = events->Start(startup_.identity);
-    }
     try {
+      if (start_) run_ = start_(startup_);
       const auto& binding = load_();
       activation_ = ActivatePlugin(binding, startup_, HPK_IN_PROCESS);
       binding_ = &binding;
@@ -511,7 +509,7 @@ private:
   std::function<const hpk_plugin_v1&()> load_;
   PluginStartup startup_;
   std::vector<RegisteredService> services_;
-  std::weak_ptr<PluginEvents> events_;
+  LocalStarter start_;
   std::shared_ptr<PluginRun> run_;
   std::deque<std::shared_ptr<LocalCall>> queued_;
   std::shared_ptr<LocalCall> active_;
@@ -566,9 +564,9 @@ private:
 
 std::shared_ptr<LocalPlugin> CreateLocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load,
                                                PluginStartup startup, std::vector<RegisteredService> services,
-                                               std::weak_ptr<PluginEvents> events, std::shared_ptr<PluginRun> run) {
+                                               LocalStarter start, std::shared_ptr<PluginRun> run) {
   return std::make_shared<LocalPlugin>(std::move(tasks), std::move(load), std::move(startup), std::move(services),
-                                       std::move(events), std::move(run));
+                                       std::move(start), std::move(run));
 }
 
 void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin, PluginStopReason reason) {

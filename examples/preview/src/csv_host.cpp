@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <charconv>
 #include <condition_variable>
@@ -19,6 +20,7 @@
 #include <random>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -56,6 +58,7 @@ using csv_import::Importers;
 constexpr char CommandHelp[] =
     "inspect <package>, install <package> <digest> <in_process|worker_process> [status], list, "
     "upgrade <package> <installed-digest> <approved-digest> [status], uninstall <id> <digest> [delete-data], "
+    "settings <id> [locale], set-settings <id> <revision> <overrides-file>, "
     "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], "
     "round-trip <csv-file> <ssv-file> <plugin-id>, convert <sync|async> <ssv-file> <csv-file> <plugin-id> [chunk-kib], "
     "convert-pair <sync|async> <first-input> <first-output> <second-input> <second-output> <plugin-id>, quit";
@@ -290,6 +293,66 @@ AsyncOutputStream OpenStagedAsync(const std::shared_ptr<StagedOutput>& stage, st
       });
 }
 
+Json DescribeSettingText(const SettingText& text) {
+  if (const auto resource = std::get_if<huxerui::StringResource>(&text)) return {{"resource", resource->ToString()}};
+  return std::get<std::string>(text);
+}
+
+Json DescribeSettingValue(const SettingValue& value) {
+  return std::visit([](const auto& item) -> Json { return item; }, value);
+}
+
+Json DescribeSettingsSchema(const std::vector<SettingDefinition>& schema) {
+  constexpr std::array<std::string_view, 4> types{"boolean", "integer", "string", "enum"};
+  auto described = Json::array();
+  for (const auto& setting : schema) {
+    Json entry{{"key", setting.key}, {"type", types.at(static_cast<std::size_t>(setting.type))},
+               {"title", DescribeSettingText(setting.title)}, {"default", DescribeSettingValue(setting.default_value)}};
+    if (setting.description) entry["description"] = DescribeSettingText(*setting.description);
+    if (setting.minimum) entry["minimum"] = *setting.minimum;
+    if (setting.maximum) entry["maximum"] = *setting.maximum;
+    if (!setting.options.empty()) {
+      auto options = Json::array();
+      for (const auto& choice : setting.options) {
+        options.push_back({{"value", choice.value}, {"title", DescribeSettingText(choice.title)}});
+      }
+      entry["options"] = std::move(options);
+    }
+    described.push_back(std::move(entry));
+  }
+  return described;
+}
+
+Json DescribeSettings(const SettingsSnapshot& settings) {
+  const auto values = [](const SettingValues& source) {
+    auto result = Json::object();
+    for (const auto& [key, value] : source) result[key] = DescribeSettingValue(value);
+    return result;
+  };
+  return {{"schema", DescribeSettingsSchema(settings.schema)}, {"effective", values(settings.effective)},
+          {"overrides", values(settings.overrides)}, {"revision", settings.revision},
+          {"active_revision", settings.active_revision ? Json(*settings.active_revision) : Json(nullptr)}};
+}
+
+SettingValues ReadSettingEdits(const File& file) try {
+  const auto overrides = Json::parse(RequireIo(file.ReadString()));
+  if (!overrides.is_object()) throw Error(ErrorCode::InvalidArgument, "Setting overrides must be a JSON object");
+  SettingValues result;
+  for (const auto& [key, value] : overrides.items()) {
+    if (value.is_boolean()) result.emplace(key, value.get<bool>());
+    else if (value.is_string()) result.emplace(key, value.get<std::string>());
+    else if (value.is_number_integer() && (!value.is_number_unsigned() ||
+             value.get<std::uint64_t>() <= static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)()))) {
+      result.emplace(key, value.get<std::int64_t>());
+    } else {
+      throw Error(ErrorCode::InvalidArgument, "Expected a boolean, signed 64-bit integer, or string at " + key);
+    }
+  }
+  return result;
+} catch (const Json::exception& error) {
+  throw Error(ErrorCode::InvalidArgument, "Cannot parse setting overrides: " + std::string(error.what()));
+}
+
 Json Describe(const PackageInfo& package) {
   auto extensions = Json::array();
   for (const auto& extension : package.extensions) {
@@ -298,7 +361,7 @@ Json Describe(const PackageInfo& package) {
     extensions.push_back(std::move(entry));
   }
   return {{"id", package.id}, {"version", package.version}, {"digest", package.digest},
-          {"extensions", std::move(extensions)}};
+          {"extensions", std::move(extensions)}, {"settings_schema", DescribeSettingsSchema(package.settings_schema)}};
 }
 
 Json List(PluginManager& manager) {
@@ -1253,6 +1316,39 @@ Task<Json> CheckInProcessUpgrade(const File& profile, const std::vector<std::str
   co_return Json{{"result", "restart_required"}, {"current_digest", args[2]}, {"pending_digest", package.digest}};
 }
 
+Task<Json> CheckSettingsActivation(PluginManager& manager, const std::string& plugin) {
+  const auto original = manager.GetSettings(plugin);
+  auto importers = manager.CreateExtensions(Importers, plugin);
+  if (original.active_revision || importers.size() != 2) {
+    throw Error(ErrorCode::PluginFailed, "Expected a fresh activation and two CSV importers");
+  }
+  std::optional<std::string> notified;
+  const auto subscription = manager.SubscribeEvents([&](const PluginEvent& event) {
+    if (event.package.id == plugin && event.change == PluginCatalogChange::SettingsChanged) {
+      notified = manager.GetSettings(plugin).revision;
+    }
+  });
+  auto overrides = original.overrides;
+  overrides.insert_or_assign("max_rows", std::int64_t{1});
+  co_await manager.SetSettingsAsync(plugin, original.revision, std::move(overrides));
+  const auto saved = manager.GetSettings(plugin);
+  if (saved.active_revision || saved.revision == original.revision) {
+    throw Error(ErrorCode::PluginFailed, "Saving an override must commit without activating the plugin");
+  }
+  for (auto& importer : importers) {
+    const auto result = co_await importer->Import(StringInput("heading\nfirst\nsecond\n"), nullptr);
+    if (result.table || result.issues.size() != 1 || result.issues[0].code != "csv.row_limit") {
+      throw Error(ErrorCode::PluginFailed, "The CSV importer did not use the saved row limit");
+    }
+  }
+  const auto activated = manager.GetSettings(plugin);
+  co_await WaitFor([&] { return notified.has_value(); });
+  if (activated.active_revision != saved.revision || notified != saved.revision) {
+    throw Error(ErrorCode::PluginFailed, "The activation and settings event must observe the committed revision");
+  }
+  co_return DescribeSettings(activated);
+}
+
 Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportStatus>& status,
              const std::vector<std::string>& args) {
   const auto& name = args.front();
@@ -1292,6 +1388,17 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
   if ((name == "enable" || name == "disable") && args.size() == 2) {
     co_await manager.SetEnabled(args[1], name == "enable");
     co_return Json::object();
+  }
+  if (name == "settings" && (args.size() == 2 || args.size() == 3)) {
+    const auto locale = args.size() == 3 ? huxerui::Locale::FromLanguageTag(args[2]) : huxerui::Locale::Default();
+    co_return DescribeSettings(manager.GetSettings(args[1], locale));
+  }
+  if (name == "set-settings" && args.size() == 4) {
+    co_await manager.SetSettingsAsync(args[1], args[2], ReadSettingEdits(File(args[3])));
+    co_return DescribeSettings(manager.GetSettings(args[1]));
+  }
+  if (name == "check-settings-activation" && args.size() == 2) {
+    co_return co_await CheckSettingsActivation(manager, args[1]);
   }
   if (name == "check-contract-codecs" && args.size() == 1) {
     CheckContractCodecs();
@@ -1337,7 +1444,17 @@ void Print(const Json& response) {
 
 void PrintError(const std::exception& error) {
   const auto* kit_error = dynamic_cast<const Error*>(&error);
-  Print({{"ok", false}, {"error", kit_error ? ErrorName(kit_error->Code()) : "io"}, {"message", error.what()}});
+  Json response{{"ok", false}, {"error", kit_error ? ErrorName(kit_error->Code()) : "io"}, {"message", error.what()}};
+  if (const auto* validation = dynamic_cast<const SettingsValidationError*>(&error)) {
+    constexpr std::array<std::string_view, 5> reasons{
+        "unknown_key", "type_mismatch", "out_of_range", "unknown_option", "invalid_text"};
+    auto fields = Json::array();
+    for (const auto& issue : validation->Issues()) {
+      fields.push_back({{"key", issue.key}, {"reason", reasons.at(static_cast<std::size_t>(issue.kind))}});
+    }
+    response["fields"] = std::move(fields);
+  }
+  Print(response);
 }
 
 Task<void> Report(PluginManager& manager, const std::shared_ptr<PreviewImportStatus>& status,

@@ -69,6 +69,15 @@ PluginDiagnostics PluginEvents::Snapshot(PluginInfo plugin, bool restart_require
   return result;
 }
 
+std::optional<std::string> PluginEvents::ActiveSettingsRevision(std::string_view id, std::string_view digest) const {
+  std::lock_guard lock(mutex_);
+  const auto found = records_.find(id);
+  if (found == records_.end()) return std::nullopt;
+  const auto& run = found->second.run;
+  if (!run || run->state_ != PluginRuntimeState::Active || run->package_.digest != digest) return std::nullopt;
+  return run->settings_revision_;
+}
+
 void PluginEvents::Close() noexcept {
   std::vector<std::shared_ptr<PluginEventSubscriber>> subscribers;
   {
@@ -81,9 +90,10 @@ void PluginEvents::Close() noexcept {
   for (const auto& subscriber : subscribers) subscriber->callback.reset();
 }
 
-std::shared_ptr<PluginRun> PluginEvents::Start(PluginIdentity package, bool provisional) {
+std::shared_ptr<PluginRun> PluginEvents::Start(PluginIdentity package, std::string settings_revision, bool provisional) {
   std::lock_guard lock(mutex_);
-  auto run = std::shared_ptr<PluginRun>(new PluginRun(weak_from_this(), std::move(package), ++generation_, !provisional));
+  auto run = std::shared_ptr<PluginRun>(new PluginRun(weak_from_this(), std::move(package), std::move(settings_revision),
+                                                     ++generation_, !provisional));
   if (!closed_ && !provisional) records_[run->package_.id].run = run;
   return run;
 }
@@ -190,8 +200,10 @@ void PluginEvents::Deliver() {
   }
 }
 
-PluginRun::PluginRun(std::weak_ptr<PluginEvents> events, PluginIdentity package, std::uint64_t generation, bool published)
-    : events_(std::move(events)), package_(std::move(package)), generation_(generation), published_(published) {}
+PluginRun::PluginRun(std::weak_ptr<PluginEvents> events, PluginIdentity package, std::string settings_revision,
+                     std::uint64_t generation, bool published)
+    : events_(std::move(events)), package_(std::move(package)), settings_revision_(std::move(settings_revision)),
+      generation_(generation), published_(published) {}
 
 PluginEvent PluginRun::Event(PluginEventKind kind) const {
   auto event = MakeEvent(package_, kind);

@@ -544,6 +544,140 @@ def verify_package_resources(host, package, scratch, sample, module_name):
         assert run(host, profile, "import", sample, info["id"])["table"] is not None
 
 
+def verify_settings(host, package, scratch, sample):
+    info = run(host, scratch / "settings inspection", "inspect", package)
+    plugin_id = info["id"]
+    assert info["settings_schema"][0]["title"] == {"resource": "csv_resources:strings/settings_max_rows"}, info
+    reset = scratch / "reset settings.json"
+    reset.write_text("{}", encoding="utf-8")
+    invalid = scratch / "invalid settings.json"
+    invalid.write_text('{"max_rows": 0, "unknown": true}', encoding="utf-8")
+    for mode in ("in_process", "worker_process"):
+        profile = scratch / f"settings {mode}"
+        assert run(host, profile, "install", package, info["digest"], mode, "status")["ok"]
+        assert run(host, profile, "disable", plugin_id)["ok"]
+        english, chinese, fallback, listed = run(host, profile, commands=[
+            ("settings", plugin_id, "en-US"), ("settings", plugin_id, "zh-Hans-CN"),
+            ("settings", plugin_id, "fr-CA"), ("list",),
+        ])
+        assert not plugin(listed, plugin_id)["enabled"] and plugin(listed, plugin_id)["worker_pid"] is None, listed
+        assert not installed_data(profile, plugin_id).exists(), listed
+        assert [view["schema"][0]["title"] for view in (english, chinese, fallback)] == [
+            "Maximum rows", "最大行数", "Maximum rows",
+        ], (english, chinese, fallback)
+        for view in (english, chinese, fallback):
+            assert view["schema"][0]["description"] == "Count data rows after the header.", view
+            assert view["effective"] == {"max_rows": 10000} and view["overrides"] == {}, view
+            assert view["revision"] == english["revision"] and view["active_revision"] is None, view
+
+        rejected = run(host, profile, "set-settings", plugin_id, english["revision"], invalid)
+        check_error(rejected, "invalid_argument")
+        assert rejected["fields"] == [{"key": "max_rows", "reason": "out_of_range"},
+                                      {"key": "unknown", "reason": "unknown_key"}], rejected
+        assert run(host, profile, "settings", plugin_id, "en-US") == english
+        assert run(host, profile, "enable", plugin_id)["ok"]
+        activated = run(host, profile, "check-settings-activation", plugin_id)
+        assert activated["effective"] == activated["overrides"] == {"max_rows": 1}, activated
+        first_revision = activated["revision"]
+        before, saved, still_old, stale, _, disabled, _, after, current = run(host, profile, commands=[
+            ("import", sample, plugin_id), ("set-settings", plugin_id, first_revision, reset),
+            ("import", sample, plugin_id), ("set-settings", plugin_id, first_revision, reset),
+            ("disable", plugin_id), ("settings", plugin_id, "zh-Hans-CN"),
+            ("enable", plugin_id), ("import", sample, plugin_id), ("settings", plugin_id),
+        ])
+        for limited in (before, still_old):
+            assert limited["table"] is None and limited["issues"][0]["code"] == "csv.row_limit", limited
+        assert saved["active_revision"] == first_revision and saved["revision"] != first_revision, saved
+        assert saved["effective"] == {"max_rows": 10000} and saved["overrides"] == {}, saved
+        check_error(stale, "settings_changed")
+        assert disabled["active_revision"] is None and disabled["schema"][0]["title"] == "最大行数", disabled
+        assert after["table"] and after["progress_rows"] == 2, after
+        assert current["active_revision"] == current["revision"] == saved["revision"], current
+
+    missing = scratch / "missing setting resource"
+    shutil.copytree(package, missing)
+    manifest_path = missing / "plugin.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["settings"][0]["title"]["resource"] = "csv_resources:strings/missing"
+    manifest["version"] = "0.2.0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    for command in (("inspect", missing), ("install", missing, info["digest"], "worker_process"),
+                    ("upgrade", missing, info["digest"], info["digest"])):
+        bad = run(host, profile, *command)
+        check_error(bad, "invalid_package")
+        assert "settings.max_rows.title" in bad["message"] and "csv_resources:strings/missing" in bad["message"], bad
+
+
+def verify_settings_upgrade(host, faults, replacement, scratch):
+    def customize(source, name, upgrading):
+        package = scratch / name
+        shutil.copytree(source, package)
+        path = package / "plugin.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        settings = manifest["settings"]
+        settings.extend([
+            {"key": "flag", "type": "boolean", "title": "$5", "default": False},
+            {"key": "label", "type": "string", "title": "Label", "default": ""},
+        ])
+        if upgrading:
+            settings[0].update(maximum=50, default=20)
+            settings.append({"key": "style", "type": "string", "title": "Style", "default": "new"})
+        else:
+            settings.append({"key": "style", "type": "enum", "title": "Style", "default": "original", "options": [
+                {"value": "original", "title": "Original"},
+                {"value": "alternate", "title": {"resource": "csv_resources:strings/settings_max_rows"}},
+            ]})
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        return package
+
+    old_package = customize(faults, "settings upgrade source", False)
+    new_package = customize(replacement, "settings upgrade candidate", True)
+    inspect = scratch / "settings upgrade inspection"
+    old_info = run(host, inspect, "inspect", old_package)
+    new_info = run(host, inspect, "inspect", new_package)
+    plugin_id = old_info["id"]
+    old = old_info["digest"]
+    new = new_info["digest"]
+    edits = scratch / "settings upgrade edits.json"
+    values = {"max_rows": 75, "flag": True, "label": "自定义文案", "style": "alternate"}
+    edits.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+    updated = scratch / "settings after staging.json"
+    updated.write_text(json.dumps({**values, "label": "重启前修改"}, ensure_ascii=False), encoding="utf-8")
+    request = scratch / "settings values.csv"
+    request.write_bytes(b"settings")
+    for mode in ("worker_process", "in_process"):
+        profile = scratch / f"settings upgrade {mode}"
+        assert run(host, profile, "install", old_package, old, mode)["ok"]
+        initial = run(host, profile, "settings", plugin_id, "zh-Hans-CN")
+        assert initial["schema"][1]["title"] == "$5", initial
+        assert initial["schema"][-1]["options"][-1] == {"value": "alternate", "title": "最大行数"}, initial
+        saved = run(host, profile, "set-settings", plugin_id, initial["revision"], edits)
+        declared = run(host, profile, "import", request, plugin_id)
+        assert dict(declared["table"]["rows"]) == {"max_rows": "75", "flag": "true", "label": "自定义文案",
+                                                  "style": "alternate"}, declared
+        if mode == "in_process":
+            staged, saved = run(host, profile, commands=[
+                ("upgrade", new_package, old, new), ("set-settings", plugin_id, saved["revision"], updated),
+            ])
+            assert staged["result"] == "restart_required" and saved["overrides"]["label"] == "重启前修改", staged
+        else:
+            failed = installed_data(profile, plugin_id) / "fail-upgrade"
+            failed.touch()
+            check_error(run(host, profile, "upgrade", new_package, old, new), "plugin_failed")
+            persisted = run(host, profile, "settings", plugin_id)
+            assert persisted["overrides"] == values and persisted["revision"] == saved["revision"], persisted
+            failed.unlink()
+            assert run(host, profile, "upgrade", new_package, old, new)["result"] == "applied"
+        imported, migrated = run(host, profile, commands=[("import", request, plugin_id), ("settings", plugin_id)])
+        label = saved["overrides"]["label"]
+        assert migrated["overrides"] == {"flag": True, "label": label}, migrated
+        assert migrated["effective"] == {"max_rows": 20, "flag": True, "label": label, "style": "new"}, migrated
+        assert migrated["schema"][0]["title"] == "Maximum rows per import", migrated
+        assert migrated["active_revision"] == migrated["revision"] != saved["revision"], migrated
+        assert dict(imported["table"]["rows"]) == {"max_rows": "20", "flag": "true", "label": label,
+                                                  "style": "new"}, imported
+
+
 def verify_suffix_metadata(host, package, scratch, sample):
     source = scratch / "CSV suffix metadata"
     shutil.copytree(package, source)
@@ -713,6 +847,10 @@ def verify_uninstall(host, faults, replacement, scratch, valid):
     old = run(host, profile, "inspect", faults)["digest"]
     new = run(host, profile, "inspect", replacement)["digest"]
     assert run(host, profile, "install", faults, old, "worker_process", "status")["ok"]
+    settings = run(host, profile, "settings", plugin_id)
+    overrides = scratch / "uninstall settings.json"
+    overrides.write_text('{"max_rows": 2}', encoding="utf-8")
+    assert run(host, profile, "set-settings", plugin_id, settings["revision"], overrides)["ok"]
     data = installed_data(profile, plugin_id)
     data.mkdir(parents=True)
     (data.parent / "unrelated.txt").write_text("outside plugin data", encoding="utf-8")
@@ -726,6 +864,7 @@ def verify_uninstall(host, faults, replacement, scratch, valid):
     assert not (profile / "packages" / old).exists() and (data / "retained.txt").exists()
     assert run(host, profile, "install", faults, old, "worker_process")["ok"]
     assert installed_data(profile, plugin_id) == data
+    assert run(host, profile, "settings", plugin_id)["overrides"] == {"max_rows": 2}
     status_request = scratch / "reinstall status.csv"
     status_request.write_bytes(b"status")
     check_error(run(host, profile, "import", status_request, plugin_id), "service_denied")
@@ -733,6 +872,7 @@ def verify_uninstall(host, faults, replacement, scratch, valid):
     assert not data.exists()
     assert (data.parent / "unrelated.txt").read_text() == "outside plugin data"
     assert run(host, profile, "install", faults, old, "worker_process")["ok"]
+    assert run(host, profile, "settings", plugin_id)["overrides"] == {}
     assert run(host, profile, "import", valid, plugin_id)["ok"]
     assert not (installed_data(profile, plugin_id) / "retained.txt").exists()
 
@@ -760,6 +900,11 @@ def verify_interrupted_upgrade(host, faults, replacement, scratch):
     for mode in ("worker_process", "in_process"):
         profile = scratch / f"interrupted {mode} upgrade"
         assert run(host, profile, "install", faults, old, mode, "status")["ok"]
+        settings = run(host, profile, "settings", plugin_id)
+        overrides = scratch / "interrupted upgrade settings.json"
+        overrides.write_text('{"max_rows": 12}', encoding="utf-8")
+        saved = run(host, profile, "set-settings", plugin_id, settings["revision"], overrides)
+        assert saved["ok"], saved
         data = installed_data(profile, plugin_id)
         data.mkdir(parents=True)
         (data / "data-format").write_text("1", encoding="utf-8")
@@ -786,6 +931,7 @@ def verify_interrupted_upgrade(host, faults, replacement, scratch):
         recovered = run(host, profile, "list")
         entry = plugin(recovered, plugin_id)
         assert entry["digest"] == old and entry["pending_upgrade"] is None, recovered
+        assert run(host, profile, "settings", plugin_id) == saved
         assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
         assert not (profile / "packages" / new).exists()
         imported, status, context = run(host, profile, commands=[
@@ -863,6 +1009,9 @@ def verify(host, package, faults, worker_csv, replacement, scratch):
     service_wait = scratch / "status-wait.csv"
     service_wait.write_bytes(b"status-wait")
     sample = Path(__file__).with_name("sample.csv").resolve()
+
+    verify_settings(host, package, scratch, sample)
+    verify_settings_upgrade(host, faults, replacement, scratch)
 
     csv_id = "example.csv"
     fault_id = "example.csv-faults"

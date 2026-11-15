@@ -25,7 +25,8 @@ public:
 
 private:
   friend class PluginEvents;
-  PluginRun(std::weak_ptr<PluginEvents> events, PluginIdentity package, std::uint64_t generation, bool published);
+  PluginRun(std::weak_ptr<PluginEvents> events, PluginIdentity package, std::string settings_revision,
+            std::uint64_t generation, bool published);
   PluginEvent Event(PluginEventKind kind) const;
   bool Finished() const noexcept;
   bool BeginStopLocked(PluginStopReason reason) noexcept;
@@ -33,6 +34,7 @@ private:
 
   const std::weak_ptr<PluginEvents> events_;
   const PluginIdentity package_;
+  const std::string settings_revision_;
   const std::uint64_t generation_;
   bool published_;
   PluginRuntimeState state_ = PluginRuntimeState::Activating;
@@ -51,9 +53,10 @@ public:
   explicit PluginEvents(TaskScope tasks) : tasks_(std::move(tasks)) {}
   std::weak_ptr<PluginEventSubscriber> Subscribe(Callback callback);
   PluginDiagnostics Snapshot(PluginInfo plugin, bool restart_required) const;
+  std::optional<std::string> ActiveSettingsRevision(std::string_view id, std::string_view digest) const;
   void Close() noexcept;
 
-  std::shared_ptr<PluginRun> Start(PluginIdentity package, bool provisional = false);
+  std::shared_ptr<PluginRun> Start(PluginIdentity package, std::string settings_revision, bool provisional = false);
   void CatalogChanged(const PluginIdentity& package, PluginCatalogChange change,
                       const std::shared_ptr<PluginRun>& promoted = {}) noexcept;
   void UpgradeFailed(const PluginIdentity& package, PluginFailureStage stage, std::exception_ptr error,

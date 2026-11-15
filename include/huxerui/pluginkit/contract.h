@@ -4,10 +4,12 @@
 /// @brief Contract declarations and errors shared by the host and independently built plugins.
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <variant>
 
 /// @brief Marks an interface for hpk gen to publish in both execution modes.
 ///
@@ -40,6 +42,12 @@ struct PluginIdentity {
   /// SHA-256 digest of the package snapshot.
   std::string digest;
 };
+
+/// @brief A plugin setting value. An enumeration uses its declared UTF-8 string value.
+using SettingValue = std::variant<bool, std::int64_t, std::string>;
+
+/// @brief Setting values indexed by their stable manifest keys.
+using SettingValues = std::map<std::string, SettingValue, std::less<>>;
 
 /// @brief Exact identity of a generated contract.
 ///
@@ -148,6 +156,8 @@ enum class ErrorCode : std::uint32_t {
   Busy,
   /// The plugin provides several factories at the requested extension point.
   Ambiguous,
+  /// The settings revision supplied by the host is no longer current.
+  SettingsChanged,
 };
 
 /// @brief A PluginKit failure with an error code and a human-readable diagnostic.

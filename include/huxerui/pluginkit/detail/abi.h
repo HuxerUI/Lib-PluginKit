@@ -126,7 +126,7 @@ typedef struct hpk_host_v1 {
                              hpk_buffer_v1 payload, hpk_complete_v1 complete, void* user);
 } hpk_host_v1;
 
-/// @brief Host-verified plugin identity and directories borrowed for the activation callback.
+/// @brief Host-verified identity, directories, and settings borrowed for the activation callback.
 typedef struct hpk_plugin_context_v1 {
   /// Null-terminated plugin ID from the approved manifest.
   const char* id;
@@ -138,6 +138,8 @@ typedef struct hpk_plugin_context_v1 {
   const char* bundle_directory;
   /// Null-terminated UTF-8 path of the writable plugin data directory.
   const char* data_directory;
+  /// Encoded effective settings. The plugin copies them into its context before the callback returns.
+  hpk_buffer_v1 settings;
 } hpk_plugin_context_v1;
 
 /// @brief Factory and call bindings for one implementation of an extension point.
@@ -230,6 +232,9 @@ typedef struct hpk_plugin_v1 {
   /// @param activation Token returned by activate. Release it even if cleanup reports failure.
   /// @return HPK_OK or an error from hpk_status_v1.
   int32_t (HPK_CALL *deactivate)(void* activation);
+
+  /// Size of the activation context required by this descriptor.
+  uint32_t activation_context_size;
 } hpk_plugin_v1;
 
 /// @brief Signature of the pluginkit_query_v1 symbol exported by the plugin library.

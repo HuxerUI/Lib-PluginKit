@@ -10,6 +10,7 @@
 #include <huxerui/pluginkit/detail/extension.h>
 
 #include <huxerui/file.h>
+#include <huxerui/resource.h>
 
 #include <chrono>
 #include <functional>
@@ -64,11 +65,11 @@ struct PendingChangeResult {
   bool restart_required = false;
 };
 
-/// @brief What to do with the current plugin data when uninstalling a package.
+/// @brief What to do with the plugin's data and saved settings when uninstalling a package.
 enum class PluginDataPolicy {
-  /// Reuse the current data on a later installation with the same plugin identifier.
+  /// Retain data and reuse compatible settings on a later installation with the same plugin identifier.
   Keep,
-  /// Delete the current data after the plugin has been uninstalled.
+  /// Discard saved settings and delete the data directory after uninstall commits.
   Delete,
 };
 
@@ -117,7 +118,93 @@ private:
   std::uint32_t ordinal_;
 };
 
-/// @brief Metadata and SHA-256 digest of the installable files in a directory package.
+/// @brief Setting editor and value type declared in the package manifest.
+enum class SettingType {
+  Boolean,     ///< Toggle backed by bool.
+  Integer,     ///< Signed 64-bit integer with optional inclusive bounds.
+  String,      ///< Free-form UTF-8 text.
+  Enumeration, ///< Choice from a declared list of UTF-8 values.
+};
+
+/// @brief A literal label or a string resource in the declaring package.
+using SettingText = std::variant<std::string, StringResource>;
+
+/// @brief One choice in an enumeration setting.
+struct SettingOption {
+  /// Stable value used in the profile and in plugin code.
+  std::string value;
+  /// Label shown in the host editor.
+  SettingText title;
+};
+
+/// @brief A validated manifest declaration used to build a setting editor.
+struct SettingDefinition {
+  /// Stable key used to address the setting. It follows the manifest identifier syntax.
+  std::string key;
+  /// Determines the editor, value type, and applicable constraints.
+  SettingType type;
+  /// Label shown in the host editor.
+  SettingText title;
+  /// Additional text supplied by the plugin author, if any.
+  std::optional<SettingText> description;
+  /// Effective value when the host has saved no override for this key.
+  SettingValue default_value;
+  /// Inclusive lower bound for an integer, if declared.
+  std::optional<std::int64_t> minimum;
+  /// Inclusive upper bound for an integer, if declared.
+  std::optional<std::int64_t> maximum;
+  /// Choices in manifest order for an enumeration. Empty for other types.
+  std::vector<SettingOption> options;
+};
+
+/// @brief An owned view of the committed settings and the current activation's revision.
+struct SettingsSnapshot {
+  /// Declarations in manifest order. All display text holds resolved strings for the requested locale.
+  std::vector<SettingDefinition> schema;
+  /// One effective value per declared key, with saved overrides applied to the defaults.
+  SettingValues effective;
+  /// Explicitly saved values. Remove a key from this map to use its default on the next save.
+  SettingValues overrides;
+  /// Opaque revision to pass to SetSettingsAsync() when saving an edit to this snapshot.
+  std::string revision;
+  /// Revision of the running activation, or std::nullopt while the plugin is inactive or transitioning.
+  std::optional<std::string> active_revision;
+};
+
+/// @brief Reason a proposed override failed validation.
+enum class SettingIssueKind {
+  UnknownKey,    ///< No setting with this key is declared.
+  TypeMismatch,  ///< The value does not have the declared type.
+  OutOfRange,    ///< An integer exceeds one of the declared bounds.
+  UnknownOption, ///< The string does not match a declared choice value.
+  InvalidText,   ///< The string is not valid UTF-8.
+};
+
+/// @brief Validation failure associated with a single setting key.
+struct SettingIssue {
+  /// Key of the rejected override.
+  std::string key;
+  /// Constraint the override violated.
+  SettingIssueKind kind;
+};
+
+/// @brief InvalidArgument error containing the rejected settings from a single save attempt.
+class SettingsValidationError : public Error {
+public:
+  /// @brief Creates a validation error with the collected field issues.
+  /// @param issues Failures identified before committing the proposed overrides.
+  explicit SettingsValidationError(std::vector<SettingIssue> issues)
+      : Error(ErrorCode::InvalidArgument, "Plugin settings failed validation"), issues_(std::move(issues)) {}
+
+  /// @brief Returns the rejected fields and their reasons in key order.
+  /// @return Reference valid for the lifetime of this error.
+  const std::vector<SettingIssue>& Issues() const noexcept { return issues_; }
+
+private:
+  std::vector<SettingIssue> issues_;
+};
+
+/// @brief Metadata, settings schema, and SHA-256 digest of the installable files in a directory package.
 ///
 /// The digest covers plugin.json, the platform's plugin library, and every file under resources, if present.
 /// It hashes records sorted by relative UTF-8 path. Each record contains the path with forward slashes,
@@ -135,6 +222,8 @@ struct PackageInfo {
   std::vector<ExecutionMode> execution_modes;
   /// Shared SDK and C++ build identity checked for in-process execution. Ignored for worker execution.
   std::string cpp_abi;
+  /// Setting declarations in manifest order, retaining their literal labels or package string resource identities.
+  std::vector<SettingDefinition> settings_schema;
 };
 
 /// @brief Snapshot of an installed plugin and its activation status.
@@ -169,6 +258,7 @@ enum class PluginCatalogChange {
   UpgradePending, ///< A replacement was approved for application after host restart.
   Upgraded,       ///< The replacement became the installed package.
   Uninstalled,    ///< The package was removed from the catalog.
+  SettingsChanged, ///< A new settings revision committed. It takes effect on the next activation.
 };
 
 /// @brief Runtime state of an installed package, independent of its enablement.
@@ -380,7 +470,7 @@ private:
 class PluginManager {
 public:
   /// @brief Creates or opens the profile and takes its exclusive lock.
-  /// Reopening the profile restores installed packages, approvals, and enablement.
+  /// Reopening the profile restores installed packages, approvals, enablement, and saved settings.
   /// @param profile_directory Directory for the catalog and approved package snapshots.
   /// @param worker_executable Path to the platform's hpk-worker executable, started on demand. Pass
   /// std::nullopt to allow only in-process packages.
@@ -446,8 +536,9 @@ public:
   /// @param directory Directory containing plugin.json, the platform's plugin library, and an optional resources
   /// directory generated by HuxerUI.
   /// @return Package metadata and the digest of the exact bytes to approve.
-  /// @throws Error With InvalidPackage for invalid manifest metadata, an empty library, or an invalid resource tree,
-  /// Io for unreadable files, or PayloadTooLarge if the manifest exceeds 64 KiB or the library exceeds 64 MiB.
+  /// @throws Error With InvalidPackage for invalid manifest metadata, an empty library, an invalid resource tree,
+  /// or an unresolved setting label. Io reports unreadable files. PayloadTooLarge reports a manifest larger than
+  /// 64 KiB or a library larger than 64 MiB.
   static PackageInfo InspectPackage(const File& directory);
 
   /// @brief Installs the approved package snapshot with its extension factories and optional HuxerUI resources.
@@ -473,7 +564,7 @@ public:
   /// Use the same plugin identifier, a different release version, and the installed execution mode.
   /// The current generation is retired before validating an enabled candidate on a copy of the plugin data.
   /// Validation runs OnActivate once and constructs an instance from each factory. The package, grants,
-  /// and data are selected together at commit. Disabled plugins stay disabled and
+  /// data, and compatible setting overrides are selected together at commit. Disabled plugins stay disabled and
   /// activate when next used. The data copy accepts regular files and directories. An in-process upgrade
   /// is applied after a host process restart.
   /// @param directory Local package directory. The Task reads it when it runs.
@@ -487,10 +578,10 @@ public:
   /// @brief Removes an installed plugin, its service grants, and any pending upgrade.
   ///
   /// Release handles that borrow native interfaces before awaiting uninstall. Loaded in-process libraries
-  /// can remain mapped until host exit. The default policy preserves the current data for a later install.
+  /// can remain mapped until host exit. The default policy preserves data and saved settings for a later install.
   /// @param plugin_id Installed plugin identifier.
   /// @param expected_digest Digest of the installed snapshot being removed.
-  /// @param data Policy for the plugin's current data directory.
+  /// @param data Policy for the plugin's current data directory and saved settings.
   /// @return Lazy Task that completes after uninstall and the first attempt to clean up files.
   /// @throws Error With ApprovalMismatch for a changed digest, NotFound for an uninstalled plugin,
   /// Busy for a concurrent change, or Io if the profile cannot be committed.
@@ -521,6 +612,35 @@ public:
   /// @return A snapshot of installed packages, enablement flags, and available worker process IDs.
   /// @see ListExtensions()
   std::vector<PluginInfo> ListPlugins() const;
+
+  /// @brief Reads the installed settings and resolves their display text from the plugin package.
+  ///
+  /// Use the current UI locale when building an editor. The plugin can be disabled or inactive. This query
+  /// uses the committed profile, can read local resource files, and does not start or call the plugin.
+  /// @param plugin_id Installed plugin identifier.
+  /// @param locale Locale for titles, descriptions, and choice labels. Defaults to Locale::Default(). Missing
+  /// translations use SDK fallback.
+  /// @return The schema, committed values, and revision of the current activation, if active.
+  /// @throws Error With NotFound if the plugin is absent, Closed after shutdown, or InvalidPackage if
+  /// a resource reference cannot be resolved from the installed package.
+  /// @see SetSettingsAsync(), PluginContext::Settings()
+  SettingsSnapshot GetSettings(std::string_view plugin_id, const Locale& locale = Locale::Default()) const;
+
+  /// @brief Validates and atomically replaces a plugin's saved setting overrides.
+  ///
+  /// Pass the full override map, with any reset keys omitted. A successful change publishes SettingsChanged.
+  /// Saving is available while the plugin is disabled or a restart upgrade is staged. Active plugin instances
+  /// continue using the snapshot captured at activation. To apply saved values, disable and re-enable the plugin
+  /// or reopen the profile in a new host session.
+  /// @param plugin_id Installed plugin identifier.
+  /// @param expected_revision Revision returned by GetSettings() for the snapshot being edited.
+  /// @param overrides Complete set of explicit values to persist.
+  /// @return Lazy Task that completes after the profile commits. Once admitted, the save finishes if the wait is cancelled.
+  /// @throws SettingsValidationError If any override violates the committed schema. The entire edit is rejected.
+  /// @throws Error With SettingsChanged for a stale revision, Busy while applying an upgrade or uninstalling,
+  /// NotFound for an absent plugin, Closed after shutdown, ReentrantCall from a host callback, Io on a failed
+  /// profile write, or PayloadTooLarge if the edit would exceed the profile byte limit.
+  Task<void> SetSettingsAsync(std::string_view plugin_id, std::string_view expected_revision, SettingValues overrides);
 
   /// @brief Queues future catalog and runtime notifications on the manager's application thread.
   ///

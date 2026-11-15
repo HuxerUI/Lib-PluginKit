@@ -90,6 +90,19 @@ public:
             std::to_string(created_instances), std::to_string(live_instances),
             std::to_string(csv_import::fixture::ReadCellLimit(*cell_limit))}}}, {}};
     }
+    if (source == "settings") {
+      csv_import::Table table{{"key", "value"}, {}};
+      for (const auto& [key, value] : context_.Settings()) {
+        auto text = std::visit([](const auto& item) -> std::string {
+          using Value = std::remove_cvref_t<decltype(item)>;
+          if constexpr (std::same_as<Value, std::string>) return item;
+          else if constexpr (std::same_as<Value, bool>) return item ? "true" : "false";
+          else return std::to_string(item);
+        }, value);
+        table.rows.push_back({key, std::move(text)});
+      }
+      co_return csv_import::ImportResult{std::move(table), {}};
+    }
     if (source == "status") {
       co_await SetRows(40);
       co_await SetRows(41);

@@ -31,7 +31,7 @@ using Deadline = std::chrono::steady_clock::time_point;
 
 inline bool IsErrorCode(std::uint32_t code) {
   return code >= static_cast<std::uint32_t>(ErrorCode::InvalidArgument) &&
-         code <= static_cast<std::uint32_t>(ErrorCode::Ambiguous);
+         code <= static_cast<std::uint32_t>(ErrorCode::SettingsChanged);
 }
 
 struct ExpectedExtension {
@@ -49,10 +49,11 @@ struct PluginStartup {
   std::string bundle_directory;
   std::string data_directory;
   std::vector<ExpectedExtension> extensions;
+  Bytes settings;
 
   Bytes Encode() const {
     Writer writer;
-    writer.Array(6);
+    writer.Array(7);
     writer.Text(identity.id);
     writer.Text(identity.version);
     writer.Text(identity.digest);
@@ -67,13 +68,19 @@ struct PluginStartup {
       Codec<std::uint32_t>::Write(writer, extension.contract_version);
       writer.Text(extension.contract_fingerprint);
     }
-    return std::move(writer).Finish();
+    auto bytes = std::move(writer).Finish();
+    if (settings.size() > MaxPayload - bytes.size()) {
+      throw Error(ErrorCode::PayloadTooLarge, "Plugin startup exceeds the byte limit");
+    }
+    // The settings map is already encoded as the final CBOR item. Pass the same bytes to the plugin library.
+    bytes.insert(bytes.end(), settings.begin(), settings.end());
+    return bytes;
   }
 
   static PluginStartup Decode(std::span<const std::byte> payload) {
     Reader reader(payload);
-    reader.Record(6);
-    PluginStartup startup{{reader.Text(), reader.Text(), reader.Text()}, reader.Text(), reader.Text(), {}};
+    reader.Record(7);
+    PluginStartup startup{{reader.Text(), reader.Text(), reader.Text()}, reader.Text(), reader.Text(), {}, {}};
     const auto count = reader.Array();
     if (!count || count > HPK_MAX_EXTENSIONS) throw Error(ErrorCode::Protocol, "Invalid startup factory count");
     startup.extensions.reserve(count);
@@ -82,7 +89,8 @@ struct PluginStartup {
       startup.extensions.push_back({reader.Text(), Codec<std::uint32_t>::Read(reader), reader.Text(),
                                     Codec<std::uint32_t>::Read(reader), reader.Text()});
     }
-    reader.Finish();
+    const auto settings = reader.Remaining();
+    startup.settings.assign(settings.begin(), settings.end());
     return startup;
   }
 };

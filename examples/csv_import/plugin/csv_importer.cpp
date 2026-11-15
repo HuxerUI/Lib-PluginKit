@@ -30,7 +30,7 @@ void OnDeactivate(const PluginContext& context) {
 template<char Separator>
 class CsvImporter final : public TableImporter {
 public:
-  explicit CsvImporter(const PluginContext& context) {
+  explicit CsvImporter(const PluginContext& context) : context_(context) {
     if (fixture::active_context != &context) throw std::runtime_error("Expected the activation's context");
     ++live_importers;
   }
@@ -44,7 +44,8 @@ public:
     using huxerui::pluginkit::Error;
     using huxerui::pluginkit::ErrorCode;
     co_await huxerui::Delay(std::chrono::milliseconds(1));
-    fixture::CsvRecords parser(Separator, fixture::ReadCellLimit(*cell_limit));
+    fixture::CsvRecords parser(Separator, fixture::ReadCellLimit(*cell_limit),
+                               std::get<std::int64_t>(context_.Settings().at("max_rows")));
     Table table;
     const auto append = [&table](fixture::Row row, bool header) {
       if (header) table.header = std::move(row);
@@ -64,6 +65,9 @@ public:
     }
     co_return ImportResult{std::move(table), {}};
   }
+
+private:
+  const PluginContext& context_;
 };
 
 } // namespace

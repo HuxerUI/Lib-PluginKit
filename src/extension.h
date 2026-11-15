@@ -18,7 +18,6 @@ struct RegisteredService {
 const RegisteredService& RequireHostService(std::span<const RegisteredService> services, ContractInfo contract);
 
 class LocalPlugin;
-class PluginEvents;
 class PluginRun;
 class Worker;
 
@@ -28,10 +27,11 @@ struct WorkerStart {
 };
 
 using WorkerStarter = std::function<WorkerStart(Deadline, std::stop_token)>;
+using LocalStarter = std::function<std::shared_ptr<PluginRun>(PluginStartup&)>;
 
 std::shared_ptr<LocalPlugin> CreateLocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load,
                                                PluginStartup startup, std::vector<RegisteredService> services,
-                                               std::weak_ptr<PluginEvents> events, std::shared_ptr<PluginRun> run);
+                                               LocalStarter start, std::shared_ptr<PluginRun> run);
 void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin,
                         PluginStopReason reason = PluginStopReason::Shutdown);
 Task<void> FinishLocalShutdown(std::shared_ptr<LocalPlugin> plugin);
