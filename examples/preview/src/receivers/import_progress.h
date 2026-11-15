@@ -10,21 +10,16 @@
 
 namespace csv_import {
 
-/// @brief Number of data rows parsed by the importer.
-struct ImportedRows {
-  /// Number of parsed records after the header row.
-  std::uint32_t rows;
-};
-
 /// @brief Receives row count updates for one invocation.
 class HPK_REMOTE ImportProgress {
 public:
   virtual ~ImportProgress() = default;
 
   /// @brief Handles a row count update before the import continues.
-  /// @param update Parsed row count for this invocation.
+  /// @param rows Parsed row count for this invocation.
+  /// @param input_bytes Bytes consumed from the source.
   /// @return Task that completes after the receiver handles the update on the host application thread.
-  virtual huxerui::Task<void> OnRows(ImportedRows update) = 0;
+  virtual huxerui::Task<void> OnRows(std::uint32_t rows, std::uint64_t input_bytes) = 0;
 };
 
 } // namespace csv_import

@@ -40,7 +40,7 @@ public:
   std::string Delimiter() const override { return std::string(1, Separator); }
   std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
 
-  huxerui::Task<ImportResult> Import(huxerui::AsyncInputStream input, ImportReceiver receiver) override {
+  huxerui::Task<ImportResult> Import(huxerui::AsyncInputStream input, std::shared_ptr<ImportProgress> receiver) override {
     using huxerui::pluginkit::Error;
     using huxerui::pluginkit::ErrorCode;
     co_await huxerui::Delay(std::chrono::milliseconds(1));
@@ -58,7 +58,7 @@ public:
     }
     if (!parser.Finish(append)) co_return ImportResult{std::nullopt, {parser.Error()}};
     const auto rows = parser.Rows();
-    if (receiver) co_await receiver->OnRows({rows});
+    if (receiver) co_await receiver->OnRows(rows, MaxImportBytes - remaining);
     if (!co_await SetImportedRows(rows)) {
       throw Error(ErrorCode::PluginFailed, "The host declined the imported row count");
     }

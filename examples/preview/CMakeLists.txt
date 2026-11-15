@@ -72,6 +72,15 @@ foreach (header IN ITEMS
     list(APPEND sdk_outputs "${sdk_dir}/${header}")
 endforeach ()
 
+set(codec_check_src "${CMAKE_CURRENT_SOURCE_DIR}/src/codec_check")
+set(codec_check_dir "${CMAKE_CURRENT_BINARY_DIR}/codec-check")
+list(APPEND sdk_inputs "${codec_check_src}/codec_record.h" "${codec_check_src}/codec_mapped.h"
+    "${codec_check_src}/codec_mappings.h")
+list(APPEND sdk_outputs
+    "${codec_check_dir}/record/codec_record.h" "${codec_check_dir}/record/codec_record.bindings.h"
+    "${codec_check_dir}/reordered/codec_record.h" "${codec_check_dir}/reordered/codec_record.bindings.h"
+    "${codec_check_dir}/mapped/codec_mapped.h" "${codec_check_dir}/mapped/codec_mapped.bindings.h")
+
 add_custom_command(OUTPUT ${sdk_outputs}
     COMMAND "$<TARGET_FILE:hpk>" gen "${progress_header}"
         csv_import::ImportProgress example.import-progress 1 "${sdk_dir}/receivers" -- "-I${kit_root}/include"
@@ -85,6 +94,15 @@ add_custom_command(OUTPUT ${sdk_outputs}
     COMMAND "$<TARGET_FILE:hpk>" gen "${status_header}"
         csv_import::ImportStatus example.import-status 1 "${sdk_dir}/services" -- "-I${kit_root}/include"
         "-I$<JOIN:${csv_framework_includes},;-I>"
+    COMMAND "$<TARGET_FILE:hpk>" gen "${codec_check_src}/codec_record.h"
+        csv_import::codec_check::RecordColumns example.codec-check 1 "${codec_check_dir}/record" --
+        "-I${kit_root}/include" "-I$<JOIN:${csv_framework_includes},;-I>"
+    COMMAND "$<TARGET_FILE:hpk>" gen "${codec_check_src}/codec_record.h"
+        csv_import::codec_check::ReorderedColumns example.codec-check 1 "${codec_check_dir}/reordered" --
+        "-I${kit_root}/include" "-I$<JOIN:${csv_framework_includes},;-I>"
+    COMMAND "$<TARGET_FILE:hpk>" gen "${codec_check_src}/codec_mapped.h"
+        csv_import::codec_check::MappedColumns example.codec-mapped-check 1 "${codec_check_dir}/mapped" --
+        "-I${kit_root}/include" "-I$<JOIN:${csv_framework_includes},;-I>" -isystem "${codec_check_src}"
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_sdk.h" "${sdk_dir}/csv_sdk.h"
     COMMAND "$<TARGET_FILE:hpk-abi-stamp>" "${sdk_dir}/cpp-abi.txt"
     COMMAND "${CMAKE_COMMAND}" -E copy_directory "${kit_root}/include/huxerui" "${sdk_dir}/huxerui"
@@ -95,7 +113,8 @@ add_custom_target(csv-import-sdk DEPENDS ${sdk_outputs})
 
 set_source_files_properties("${host_source}" PROPERTIES OBJECT_DEPENDS "${sdk_outputs}")
 add_dependencies(example_lib_plugin_kit csv-import-sdk hpk-worker)
-target_include_directories(example_lib_plugin_kit PRIVATE "${sdk_dir}" src "${kit_root}/src")
+target_include_directories(example_lib_plugin_kit PRIVATE "${sdk_dir}" src "${kit_root}/src"
+    "${codec_check_dir}" "${codec_check_src}")
 target_link_libraries(example_lib_plugin_kit PRIVATE nlohmann_json::nlohmann_json)
 if (WIN32)
     target_compile_definitions(example_lib_plugin_kit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

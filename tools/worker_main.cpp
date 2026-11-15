@@ -37,14 +37,32 @@ struct ServiceChannel {
 
   void Send(Outgoing message) {
     std::lock_guard lock(mutex);
-    if (pending) throw Error(ErrorCode::Protocol, "A worker frame is already queued");
+    if (callback_active) throw Error(ErrorCode::Busy, "The invocation already has an active callback");
     pending.emplace(std::move(message));
+    callback_active = true;
+    ready.notify_one();
+  }
+
+  void CompleteCallback() {
+    std::lock_guard lock(mutex);
+    callback_active = false;
+  }
+
+  void Reply(Frame reply) {
+    std::lock_guard lock(mutex);
+    if (callback_active) {
+      reply = ErrorReply(Error(ErrorCode::Busy, "An invocation callback is still active"));
+    }
+    reply.kind = FrameKind::Reply;
+    reply.call = request.call;
+    final.emplace(std::move(reply));
     ready.notify_one();
   }
 
   Outgoing Receive() {
     std::unique_lock lock(mutex);
-    ready.wait(lock, [&] { return pending.has_value(); });
+    ready.wait(lock, [&] { return pending || final; });
+    if (!pending) return {std::move(*final)};
     auto message = std::move(*pending);
     pending.reset();
     return message;
@@ -57,6 +75,8 @@ private:
   std::mutex mutex;
   std::condition_variable ready;
   std::optional<Outgoing> pending;
+  std::optional<Frame> final;
+  bool callback_active = false;
 };
 
 // Only the worker's application thread sets this pointer. The transport owns the channel until its final reply.
@@ -65,9 +85,7 @@ thread_local ServiceChannel* current_service_channel = nullptr;
 void Finish(ServiceChannel& channel, Frame reply) {
   // Publish the final reply after the plugin's dispatch Task releases its invocation context.
   current_service_channel = nullptr;
-  reply.kind = FrameKind::Reply;
-  reply.call = channel.request.call;
-  channel.Send({std::move(reply)});
+  channel.Reply(std::move(reply));
 }
 
 std::uint32_t HPK_CALL CallHost(std::uint64_t invocation, std::uint32_t receiver, const char* id, std::uint32_t version,
@@ -75,15 +93,12 @@ std::uint32_t HPK_CALL CallHost(std::uint64_t invocation, std::uint32_t receiver
                               std::uint32_t size, hpk_complete_v1 complete, void* user) noexcept {
   auto* channel = current_service_channel;
   if (!channel || channel->request.call != invocation) {
-    return static_cast<std::uint32_t>(ErrorCode::ServiceUnavailable);
+    return static_cast<std::uint32_t>(receiver ? ErrorCode::ReceiverClosed : ErrorCode::ServiceUnavailable);
   }
   if (channel->request.synchronous) return static_cast<std::uint32_t>(ErrorCode::CallbackUnavailable);
   try {
     if (!id || !fingerprint || !operation || (size && !data) || !complete || channel->callback == UINT32_MAX) {
       throw Error(ErrorCode::InvalidArgument, "Invalid host service call");
-    }
-    if (receiver && receiver != channel->request.receiver) {
-      throw Error(ErrorCode::ReceiverClosed, "The receiver is outside its owning invocation");
     }
     auto payload = ServicePayload({id, version, fingerprint}, std::as_bytes(std::span(data, size)));
     channel->Send({{0, channel->request.instance, operation, std::move(payload), FrameKind::ServiceCall,
@@ -101,12 +116,12 @@ std::uint32_t HPK_CALL CallStream(std::uint64_t invocation, std::uint32_t slot, 
                                  std::uint32_t count, hpk_buffer_v1 payload, hpk_complete_v1 complete,
                                  void* user) noexcept {
   auto* channel = current_service_channel;
-  if (!channel || channel->request.call != invocation || !(channel->request.streams & slot)) {
+  if (!channel || channel->request.call != invocation || !slot) {
     return static_cast<std::uint32_t>(ErrorCode::Closed);
   }
   try {
     if (!complete || (payload.size && !payload.data) || channel->callback == UINT32_MAX ||
-        !IsStreamOperation(slot, operation, count, payload.size)) {
+        !IsStreamOperation(operation, count, payload.size)) {
       throw Error(ErrorCode::InvalidArgument, "Invalid invocation stream operation");
     }
     Bytes bytes;
@@ -115,7 +130,7 @@ std::uint32_t HPK_CALL CallStream(std::uint64_t invocation, std::uint32_t slot, 
       bytes.assign(data.begin(), data.end());
     }
     channel->Send({{0, channel->request.instance, operation, std::move(bytes), FrameKind::StreamCall,
-                    channel->request.call, channel->callback + 1, 0, false, slot, count}, complete, user});
+                    channel->request.call, channel->callback + 1, slot, false, count}, complete, user});
     ++channel->callback;
     return 0;
   } catch (const Error& error) {
@@ -153,22 +168,19 @@ public:
 
   std::optional<Frame> Dispatch(ServiceChannel& channel) {
     const auto& request = channel.request;
-    const bool invoke = request.code == static_cast<std::uint32_t>(Command::Invoke);
-    if ((request.streams && !invoke) || (request.streams & ~(HPK_INPUT_STREAM | HPK_OUTPUT_STREAM))) {
-      InvalidRequest();
-    }
+    if (request.slot) InvalidRequest();
     if (request.code == static_cast<std::uint32_t>(Command::Shutdown)) {
-      if (request.instance || request.operation || request.receiver || request.synchronous || !request.payload.empty()) InvalidRequest();
+      if (request.instance || request.operation || request.synchronous || !request.payload.empty()) InvalidRequest();
       Shutdown();
       return Frame{};
     }
     if (request.code == static_cast<std::uint32_t>(Command::Activate)) {
-      if (binding_ || request.instance || request.operation || request.receiver || request.synchronous) InvalidRequest();
+      if (binding_ || request.instance || request.operation || request.synchronous) InvalidRequest();
       Activate(PluginStartup::Decode(request.payload));
       return Frame{};
     }
     if (request.code == static_cast<std::uint32_t>(Command::Create)) {
-      if (!binding_ || request.instance || request.operation || request.receiver || request.synchronous) InvalidRequest();
+      if (!binding_ || request.instance || request.operation || request.synchronous) InvalidRequest();
       Reader reader(request.payload);
       reader.Record(2);
       const auto point = reader.Text();
@@ -192,21 +204,20 @@ public:
     const auto instance = instances_.find(request.instance);
     if (instance == instances_.end()) throw Error(ErrorCode::Closed, "The worker instance is closed");
     if (request.code == static_cast<std::uint32_t>(Command::Close)) {
-      if (request.operation || request.receiver || request.synchronous || !request.payload.empty()) InvalidRequest();
+      if (request.operation || request.synchronous || !request.payload.empty()) InvalidRequest();
       instances_.erase(instance);
       return Frame{0, request.instance, 0, {}};
     }
-    if (request.code != static_cast<std::uint32_t>(Command::Invoke) || !request.operation || request.receiver > 1 ||
-        (request.synchronous && request.receiver)) {
+    if (request.code != static_cast<std::uint32_t>(Command::Invoke) || !request.operation) {
       InvalidRequest();
     }
 
     // Operation numbers are local to the instance's contract.
     auto& target = instance->second;
     current_service_channel = &channel;
-    CheckPluginStatus(target.factory.invoke(target.object.get(), &HostCallbacks, request.call, request.receiver,
-        request.streams, request.operation, reinterpret_cast<const std::uint8_t*>(request.payload.data()),
-        static_cast<std::uint32_t>(request.payload.size()), FinishInvoke, &channel));
+    CheckPluginStatus(target.factory.invoke(target.object.get(), &HostCallbacks, request.call, request.operation,
+        reinterpret_cast<const std::uint8_t*>(request.payload.data()), static_cast<std::uint32_t>(request.payload.size()),
+        FinishInvoke, &channel));
     return std::nullopt;
   }
 
@@ -263,13 +274,14 @@ void Exchange(Read& read, Write& write, const TaskScope& tasks, Server& server) 
       const bool stream = outgoing.kind == FrameKind::StreamCall;
       if (reply.kind != (stream ? FrameKind::StreamReply : FrameKind::ServiceReply) ||
           reply.call != outgoing.call || reply.callback != outgoing.callback || reply.instance != outgoing.instance ||
-          reply.receiver != outgoing.receiver || reply.streams != outgoing.streams || reply.synchronous ||
+          reply.slot != outgoing.slot || reply.synchronous ||
           reply.operation != (stream ? outgoing.operation : 0) ||
           (reply.code && !IsUtf8(AsText(reply.payload))) ||
           (!stream && reply.code && !IsErrorCode(reply.code)) ||
           (stream && !reply.code && reply.payload.size() > outgoing.read_limit)) {
         throw Error(ErrorCode::Protocol, "Invalid host callback response");
       }
+      channel->CompleteCallback();
       message.complete(message.user, reply.code, {reinterpret_cast<const std::uint8_t*>(reply.payload.data()),
                                                  static_cast<std::uint32_t>(reply.payload.size())});
     }

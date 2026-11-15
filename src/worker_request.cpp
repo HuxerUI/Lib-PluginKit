@@ -49,7 +49,7 @@ Task<void> ExecuteCallback(std::shared_ptr<CallbackReply<Result>> reply, std::fu
 
 template<class Result>
 Result RunHostCallback(const TaskScope& tasks, std::function<Task<Result>()> work, Deadline deadline,
-                       std::stop_token stop, CallStreams* streams) {
+                       std::stop_token stop, CallGrants* grants) {
   auto reply = std::make_shared<CallbackReply<Result>>();
   tasks.Post([tasks, reply, work = std::move(work), deadline, stop]() mutable {
     std::lock_guard lock(reply->mutex);
@@ -67,7 +67,7 @@ Result RunHostCallback(const TaskScope& tasks, std::function<Task<Result>()> wor
     reply->abandoned = true;
     auto task = reply->task;
     lock.unlock();
-    if (streams) streams->Revoke();
+    if (grants) grants->Revoke();
     task.Cancel();
     if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The invocation was cancelled");
     throw Error(ErrorCode::DeadlineExceeded, "The host callback exceeded the invocation deadline");
@@ -78,7 +78,7 @@ Result RunHostCallback(const TaskScope& tasks, std::function<Task<Result>()> wor
 
 Frame MakeStreamReply(const Frame& request, IoResult<Bytes> result) {
   Frame reply{0, request.instance, request.operation, {}, FrameKind::StreamReply, request.call, request.callback};
-  reply.streams = request.streams;
+  reply.slot = request.slot;
   if (result.Succeeded()) {
     reply.payload = std::move(result).Value();
   } else {
@@ -128,7 +128,7 @@ Frame Worker::RejectSynchronousCallback(const Frame& frame) {
   reply.call = frame.call;
   reply.callback = frame.callback;
   reply.instance = frame.instance;
-  reply.receiver = frame.receiver;
+  reply.slot = frame.slot;
   return reply;
 }
 
@@ -140,7 +140,7 @@ void Worker::CheckExchange(Deadline deadline, std::stop_token stop) {
 }
 
 Frame Worker::DispatchCallback(Frame frame, Deadline deadline, std::stop_token stop,
-                               const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams,
+                               const std::shared_ptr<CallGrants>& grants,
                                StreamIo* sync_io) {
   if (frame.kind == FrameKind::ServiceCall && sync_io) return RejectSynchronousCallback(frame);
   // The transport has no read pending while it waits for a host callback.
@@ -152,12 +152,12 @@ Frame Worker::DispatchCallback(Frame frame, Deadline deadline, std::stop_token s
   try {
     CheckExchange(deadline, token);
     auto reply = frame.kind == FrameKind::StreamCall
-        ? DispatchStream(std::move(frame), deadline, token, streams, sync_io)
-        : DispatchService(frame, deadline, token, receiver, streams.get());
+        ? DispatchStream(std::move(frame), deadline, token, grants, sync_io)
+        : DispatchService(frame, deadline, token, grants.get());
     CheckExchange(deadline, token);
     return reply;
   } catch (...) {
-    if (streams) streams->Revoke();
+    if (grants) grants->Revoke();
     if (callback_stop_.stop_requested()) throw Error(ErrorCode::Closed, "The plugin generation is closing");
     if (exited_stop_.stop_requested() && !stop.stop_requested()) {
       throw Error(ErrorCode::WorkerExited, "The plugin worker exited during a host callback");
@@ -167,23 +167,27 @@ Frame Worker::DispatchCallback(Frame frame, Deadline deadline, std::stop_token s
 }
 
 Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_token stop,
-                              const ReceiverRegistration* receiver, CallStreams* streams) {
+                              CallGrants* grants) {
   const auto request = ReadServicePayload(frame.payload);
   Frame reply{};
   try {
     const ContractInfo requested{request.id, request.version, request.fingerprint};
-    const ServiceDispatch* dispatch;
-    if (frame.receiver) {
-      if (!receiver || frame.receiver != 1) throw Error(ErrorCode::ReceiverClosed, "The receiver is unavailable");
-      if (receiver->contract != requested) throw Error(ErrorCode::ContractMismatch, "Receiver contract does not match");
-      dispatch = &receiver->dispatch;
+    const auto copy_arguments = [&] { return Bytes(request.request.begin(), request.request.end()); };
+    if (frame.slot) {
+      if (!grants) throw Error(ErrorCode::ReceiverClosed, "The receiver is unavailable");
+      auto access = grants->AcquireReceiver(frame.slot, requested);
+      const auto receiver = access.Get<ReceiverRegistration>();
+      reply.payload = RunHostCallback<Bytes>(callbacks_,
+          [receiver, operation = frame.operation, data = copy_arguments()]() mutable {
+            return receiver.dispatch(receiver.implementation.get(), operation, std::move(data));
+          }, deadline, stop, grants);
     } else {
-      dispatch = &RequireHostService(services_, requested).dispatch;
+      const auto& service = RequireHostService(services_, requested);
+      reply.payload = RunHostCallback<Bytes>(callbacks_,
+          [call = service.dispatch, operation = frame.operation, data = copy_arguments()]() mutable {
+            return call(operation, std::move(data));
+          }, deadline, stop, grants);
     }
-    reply.payload = RunHostCallback<Bytes>(callbacks_,
-        [call = *dispatch, operation = frame.operation, data = Bytes(request.request.begin(), request.request.end())]() mutable {
-          return call(operation, std::move(data));
-        }, deadline, stop, streams);
   } catch (const Error& error) {
     reply = ErrorReply(error);
   } catch (...) {
@@ -193,35 +197,35 @@ Frame Worker::DispatchService(const Frame& frame, Deadline deadline, std::stop_t
   reply.call = frame.call;
   reply.callback = frame.callback;
   reply.instance = frame.instance;
-  reply.receiver = frame.receiver;
+  reply.slot = frame.slot;
   return reply;
 }
 
 Frame Worker::DispatchStream(Frame frame, Deadline deadline, std::stop_token stop,
-                             const std::shared_ptr<CallStreams>& streams, StreamIo* sync_io) {
+                             const std::shared_ptr<CallGrants>& grants, StreamIo* sync_io) {
   if (sync_io) {
-    return sync_io->Run([streams, request = std::move(frame)] {
+    return sync_io->Run([grants, request = std::move(frame)] {
       if (request.operation == HPK_READ_STREAM) {
         Bytes bytes(request.read_limit);
-        auto count = streams->Read(bytes);
+        auto count = grants->Read(request.slot, bytes);
         if (!count.Succeeded()) return MakeStreamReply(request, IoResult<Bytes>(std::move(count).Error()));
         bytes.resize(count.Value());
         return MakeStreamReply(request, IoResult<Bytes>(std::move(bytes)));
       }
-      auto result = request.operation == HPK_WRITE_STREAM ? streams->Write(request.payload) : streams->Close();
+      auto result = request.operation == HPK_WRITE_STREAM ? grants->Write(request.slot, request.payload) : grants->Close(request.slot);
       return MakeStreamReply(request, AcknowledgeStream(std::move(result)));
     }, deadline, stop);
   }
   return RunHostCallback<Frame>(callbacks_,
-      [streams, request = std::move(frame)]() mutable -> Task<Frame> {
+      [grants, request = std::move(frame)]() mutable -> Task<Frame> {
         if (request.operation == HPK_READ_STREAM) {
-          co_return MakeStreamReply(request, co_await streams->ReadAsync(request.read_limit));
+          co_return MakeStreamReply(request, co_await grants->ReadAsync(request.slot, request.read_limit));
         }
         if (request.operation == HPK_WRITE_STREAM) {
-          co_return MakeStreamReply(request, AcknowledgeStream(co_await streams->WriteAsync(std::move(request.payload))));
+          co_return MakeStreamReply(request, AcknowledgeStream(co_await grants->WriteAsync(request.slot, std::move(request.payload))));
         }
-        co_return MakeStreamReply(request, AcknowledgeStream(co_await streams->CloseAsync()));
-      }, deadline, stop, streams.get());
+        co_return MakeStreamReply(request, AcknowledgeStream(co_await grants->CloseAsync(request.slot)));
+      }, deadline, stop, grants.get());
 }
 
 void Worker::ObserveRequestFailure(bool activate, const Error& error) noexcept {
@@ -244,20 +248,18 @@ void Worker::Abort(const Error& error) noexcept {
 }
 
 void Worker::Activate(Deadline deadline, std::stop_token stop, bool started, bool wait_for_slot) {
-  Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, deadline, nullptr, stop, wait_for_slot, {}, started);
+  Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, deadline, stop, wait_for_slot, {}, started);
 }
 
-Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver,
-                       std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams) {
+Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallGrants> grants) {
   if (timeout <= std::chrono::milliseconds::zero() || timeout > std::chrono::hours(24)) {
     throw Error(ErrorCode::InvalidArgument, "Worker timeout must be between 1 ms and 24 hours");
   }
-  return Request(std::move(request), std::chrono::steady_clock::now() + timeout, receiver, stop,
-                 wait_for_slot, std::move(streams));
+  return Request(std::move(request), std::chrono::steady_clock::now() + timeout, stop,
+                 wait_for_slot, std::move(grants));
 }
 
-Frame Worker::Request(Frame request, Deadline deadline, const ReceiverRegistration* receiver,
-                       std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams, bool started) {
+Frame Worker::Request(Frame request, Deadline deadline, std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallGrants> grants, bool started) {
   const bool shutdown = request.code == static_cast<std::uint32_t>(Command::Shutdown);
   const bool activate = request.code == static_cast<std::uint32_t>(Command::Activate);
   {
@@ -287,7 +289,7 @@ Frame Worker::Request(Frame request, Deadline deadline, const ReceiverRegistrati
     request_active_ = false;
     request_ready_.notify_all();
   }};
-  if (streams) streams->SetDeadline(deadline);
+  if (grants) grants->SetDeadline(deadline);
   if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
   if (!Pid()) {
     run_->Disconnected();
@@ -319,10 +321,8 @@ Frame Worker::Request(Frame request, Deadline deadline, const ReceiverRegistrati
       throw Error(ErrorCode::Closed, "The worker has exhausted its invocation IDs");
     }
     request.call = ++next_call_;
-    request.receiver = receiver ? 1u : 0u;
-    request.streams = streams ? streams->Slots() : 0u;
     if (activate) request.payload = startup_.Encode();
-    reply = Exchange(request, deadline, generation_stop_.get_token(), receiver, streams);
+    reply = Exchange(request, deadline, generation_stop_.get_token(), grants);
     CheckExchange(deadline, generation_stop_.get_token());
   } catch (const Error& error) {
     // Retire a failed exchange so a late reply cannot be read as the next request's response.
@@ -356,7 +356,7 @@ Frame Worker::Request(Frame request, Deadline deadline, const ReceiverRegistrati
   }
 
   if (reply.kind == FrameKind::Reply && reply.call == request.call && !reply.callback && !reply.operation &&
-      !reply.receiver && !reply.synchronous && !reply.streams) {
+      !reply.slot && !reply.synchronous) {
     if (reply.code == 0) {
       const auto valid = (shutdown || activate)
           ? reply.instance == 0 && reply.payload.empty()
@@ -366,7 +366,7 @@ Frame Worker::Request(Frame request, Deadline deadline, const ReceiverRegistrati
           activated_ = true;
           run_->Activated();
         }
-        if (streams) streams->CheckOutput();
+        if (grants) grants->Complete();
         return reply;
       }
     } else if (IsErrorCode(reply.code) && reply.instance == 0 &&
@@ -391,8 +391,8 @@ void Worker::ValidateFactories(std::stop_token stop) {
   for (const auto& extension : startup_.extensions) {
     auto factory = ExtensionPayload(extension.point, extension.ordinal);
     const auto reply = Request({static_cast<std::uint32_t>(Command::Create), 0, 0, std::move(factory)},
-                               DefaultTimeout, nullptr, stop);
-    Request({static_cast<std::uint32_t>(Command::Close), reply.instance, 0, {}}, DefaultTimeout, nullptr, stop);
+                               DefaultTimeout, stop);
+    Request({static_cast<std::uint32_t>(Command::Close), reply.instance, 0, {}}, DefaultTimeout, stop);
   }
 }
 

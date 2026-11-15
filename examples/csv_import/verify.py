@@ -281,6 +281,17 @@ def verify_streams(host, package, worker_csv, faults, scratch):
     expected = reference.read_bytes()
     assert min(source.stat().st_size, len(expected)) > 8 * 1024 * 1024
 
+    second_source = scratch / "second streamed file.ssv"
+    second_cell = b"z" * 2048
+    second_count = 4600
+    second_source.write_bytes(b"c;d\n" + (b"other;" + second_cell + b"\n") * second_count)
+    second_expected = b'"c","d"\r\n' + (b'"other","' + second_cell + b'"\r\n') * second_count
+    assert min(second_source.stat().st_size, len(second_expected)) > 8 * 1024 * 1024
+    small_first = scratch / "small first input.ssv"
+    small_second = scratch / "small second input.ssv"
+    small_first.write_bytes(b"first;value\n1;a\n")
+    small_second.write_bytes(b"second;value\n2;b\n3;c\n")
+
     import_limit = 32 * 1024 * 1024
     at_limit = scratch / "at the import limit.csv"
     with at_limit.open("wb") as bounded:
@@ -318,6 +329,35 @@ def verify_streams(host, package, worker_csv, faults, scratch):
                 result = run(host, profile, "check-local-stream-reentry", plugin_id, kind)
                 assert result == {"ok": True, "read": True, "write": True, "close": True}, result
 
+        first_output = scratch / f"{mode} first pair.csv"
+        second_output = scratch / f"{mode} second pair.csv"
+        for kind in ("sync", "async"):
+            pid, result = run(host, profile, commands=[
+                ("pid",), ("convert-pair", kind, source, first_output, second_source, second_output, plugin_id),
+            ])
+            assert result["ok"] and result["separator"] == ";", result
+            assert (result["plugin_pid"] == pid["pid"]) == (mode == "in_process"), result
+            for slot, original, encoded, rows in (
+                ("first", source, expected, count + 3), ("second", second_source, second_expected, second_count),
+            ):
+                assert result[slot] == {
+                    "rows": rows, "input_bytes": original.stat().st_size, "output_bytes": len(encoded),
+                    "progress_rows": rows if kind == "async" else None,
+                    "progress_bytes": original.stat().st_size if kind == "async" else None,
+                }, result
+            assert first_output.read_bytes() == expected and second_output.read_bytes() == second_expected
+
+        pair_args = ("convert-pair", "async", small_first, first_output, small_second, second_output)
+        for omitted in ("first", "second"):
+            result = run(host, profile, *pair_args, plugin_id, f"omit-{omitted}")
+            assert result["ok"], result
+            assert result["first"]["progress_rows"] == (None if omitted == "first" else 1), result
+            assert result["second"]["progress_rows"] == (None if omitted == "second" else 2), result
+        first_output.write_bytes(b"first retained")
+        second_output.write_bytes(b"second retained")
+        check_error(run(host, profile, *pair_args, plugin_id, "write-second"), "io")
+        assert first_output.read_bytes() == b"first retained" and second_output.read_bytes() == b"second retained"
+
         if mode == "worker_process":
             for operation in ("read", "receiver", "idle"):
                 result = run(host, profile, "check-worker-events", plugin_id, operation, fault["id"])
@@ -339,6 +379,10 @@ def verify_streams(host, package, worker_csv, faults, scratch):
             check_error(run(host, profile, "convert", "async", source, destination, fault["id"]), error)
             (data / flag).unlink()
             assert destination.read_bytes() == b"retained"
+        (data / "omit-second-output-close").touch()
+        check_error(run(host, profile, *pair_args, fault["id"]), "io")
+        (data / "omit-second-output-close").unlink()
+        assert first_output.read_bytes() == b"first retained" and second_output.read_bytes() == b"second retained"
         (data / "check-stale-stream").touch()
         assert run(host, profile, "check-stale-stream", fault["id"]) == {"ok": True, "old_source_reads": 0}
         for operation in ("read", "write"):
@@ -795,6 +839,7 @@ def verify_interrupted_upgrade(host, faults, replacement, scratch):
 
 
 def verify(host, package, faults, worker_csv, replacement, scratch):
+    assert run(host, scratch / "contract codecs", "check-contract-codecs") == {"ok": True}
     verify_default_profile(host, scratch)
     profile = scratch / "profile"
     valid = scratch / "quoted cells.csv"

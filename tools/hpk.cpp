@@ -4,9 +4,11 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 
@@ -107,24 +109,37 @@ struct Field {
   Type type;
 };
 
-struct Record {
-  std::string name;
+struct ValueCodec {
+  std::string cpp;
   std::vector<Field> fields;
+  std::optional<Type> representation;
+};
+
+enum class ParameterKind { Value, Stream, Receiver };
+
+struct Parameter {
+  ParameterKind kind;
+  Type type;
+  std::string name;
+  bool reference = false;
+  std::string receiver_header;
+  std::string receiver_schema;
 };
 
 struct Operation {
   std::string name;
-  Type request;
   Type response;
+  std::vector<Parameter> parameters;
   bool async;
   bool is_const;
-  bool reference;
-  std::string receiver;
-  std::string receiver_header;
-  std::string input;
-  std::string output;
 
-  bool HasStreams() const noexcept { return !input.empty() || !output.empty(); }
+  bool HasStreams() const {
+    return std::ranges::any_of(parameters, [](const auto& p) { return p.kind == ParameterKind::Stream; });
+  }
+
+  bool HasGrants() const {
+    return std::ranges::any_of(parameters, [](const auto& p) { return p.kind != ParameterKind::Value; });
+  }
 };
 
 std::string StreamType(CXType type) {
@@ -154,9 +169,79 @@ bool IsRemote(CXCursor cursor) {
   });
 }
 
+struct CodecDefinition {
+  CXType value;
+  CXCursor declaration;
+};
+
+struct StandardValue {
+  std::string_view name;
+  std::string_view wire;
+};
+
+constexpr std::array<StandardValue, 5> StandardValues{{
+    {"int32_t", "int32_t"}, {"uint32_t", "uint32_t"}, {"int64_t", "int64_t"}, {"uint64_t", "uint64_t"},
+    {"string", "text"},
+}};
+
+struct WireDefinitions {
+  std::vector<CodecDefinition> codecs;
+  std::array<CXType, StandardValues.size()> values{};
+};
+
+void FindWireDefinitions(CXCursor scope, WireDefinitions& definitions) {
+  for (const auto cursor : Children(scope)) {
+    if (cursor.kind == CXCursor_Namespace || cursor.kind == CXCursor_LinkageSpec) {
+      FindWireDefinitions(cursor, definitions);
+    } else if ((cursor.kind == CXCursor_StructDecl || cursor.kind == CXCursor_ClassDecl) &&
+               clang_isCursorDefinition(cursor) && Name(cursor) == "WireCodec") {
+      const auto primary = clang_getSpecializedCursorTemplate(cursor);
+      if (clang_Cursor_isNull(primary) || QualifiedName(primary) != "huxerui::pluginkit::WireCodec") continue;
+      const auto value = clang_Type_getTemplateArgumentAsType(clang_getCursorType(cursor), 0);
+      if (value.kind != CXType_Invalid) definitions.codecs.push_back({clang_getCanonicalType(value), cursor});
+    } else if (cursor.kind == CXCursor_TypedefDecl || cursor.kind == CXCursor_TypeAliasDecl) {
+      const auto name = Name(cursor);
+      const auto value = std::ranges::find(StandardValues, name, &StandardValue::name);
+      if (value == StandardValues.end()) continue;
+      // Some standard libraries make the C integer typedefs visible in std with using declarations.
+      const bool global_integer = name != "string" && clang_getCursorSemanticParent(cursor).kind == CXCursor_TranslationUnit &&
+          clang_Location_isInSystemHeader(clang_getCursorLocation(cursor));
+      if (global_integer || StandardTemplateName(cursor) == "std::" + name) {
+        definitions.values[value - StandardValues.begin()] = clang_getCanonicalType(clang_getCursorType(cursor));
+      }
+    }
+  }
+}
+
+CXFile SourceFile(CXCursor cursor) {
+  CXFile file = nullptr;
+  clang_getSpellingLocation(clang_getCursorLocation(cursor), &file, nullptr, nullptr, nullptr);
+  return file;
+}
+
+Json DescribeRecord(const ValueCodec& record) {
+  auto fields = Json::array();
+  for (const auto& field : record.fields) {
+    fields.push_back({{"number", fields.size() + 1}, {"name", field.name}, {"type", field.type.wire}});
+  }
+  return {{"name", record.cpp.substr(2)}, {"fields", std::move(fields)}};
+}
+
+std::optional<Type> BuiltinWireType(CXType type, const WireDefinitions& definitions) {
+  if (type.kind == CXType_Bool) return Type{"bool", "bool"};
+  for (std::size_t i = 0; i < StandardValues.size(); ++i) {
+    if (definitions.values[i].kind != CXType_Invalid && clang_equalTypes(type, definitions.values[i])) {
+      const auto& value = StandardValues[i];
+      return Type{"std::" + std::string(value.name), std::string(value.wire)};
+    }
+  }
+  return std::nullopt;
+}
+
 class Schema {
 public:
-  explicit Schema(CXCursor interface) : interface_name(QualifiedName(interface)) {
+  Schema(CXCursor interface, const WireDefinitions& definitions, bool receiver = false)
+      : interface_name(QualifiedName(interface)), definitions_(definitions) {
     if (!IsRemote(interface)) Reject(interface, "Mark the interface class with HPK_REMOTE");
     bool destructor = false;
     std::set<std::string> names;
@@ -169,9 +254,9 @@ public:
       }
       const auto count = clang_Cursor_getNumArguments(cursor);
       if (cursor.kind != CXCursor_CXXMethod || clang_getCXXAccessSpecifier(cursor) != CX_CXXPublic ||
-          !clang_CXXMethod_isPureVirtual(cursor) || count < 0 || count > 4 ||
+          !clang_CXXMethod_isPureVirtual(cursor) || count < 0 ||
           clang_Cursor_isVariadic(cursor) || clang_Type_getCXXRefQualifier(clang_getCursorType(cursor)) != CXRefQualifier_None) {
-        Reject(cursor, "Expected a public pure virtual operation with optional request, input, output, and receiver");
+        Reject(cursor, "Expected a public pure virtual operation with a typed parameter list");
       }
       const auto exception_spec = clang_getCursorExceptionSpecificationType(cursor);
       if (exception_spec != CXCursor_ExceptionSpecificationKind_None) {
@@ -190,69 +275,12 @@ public:
       auto result = clang_getCursorResultType(cursor);
       const auto task_result = PluginKitArgument(result, "huxerui::Task");
       const bool async = task_result.kind != CXType_Invalid;
+      if (receiver && !async) Reject(cursor, "An invocation callback operation must return Task");
       if (async) result = task_result;
-      Operation operation{name, {"void", "void"},
-                          result.kind == CXType_Void ? Type{"void", "void"} : ReadType(result, cursor, 0),
-                          async, clang_CXXMethod_isConst(cursor) != 0, false, {}, {}, {}, {}};
-      unsigned next = 0;
-      const auto first = count ? clang_getCursorType(clang_Cursor_getArgument(cursor, 0)) : CXType{CXType_Invalid, {}};
-      if (count && StreamType(first).empty() && PluginKitArgument(first, "std::shared_ptr").kind == CXType_Invalid) {
-        const auto argument = clang_Cursor_getArgument(cursor, next++);
-        auto type = clang_getCursorType(argument);
-        operation.reference = type.kind == CXType_LValueReference;
-        if (operation.reference) {
-          if (async) Reject(argument, "A coroutine operation must take its request by value");
-          type = clang_getPointeeType(type);
-          if (!clang_isConstQualifiedType(type) || clang_isVolatileQualifiedType(type)) {
-            Reject(argument, "A borrowed request must be a const reference");
-          }
-        }
-        operation.request = ReadType(clang_getUnqualifiedType(type), argument, 0);
-      }
-      const auto read_stream = [&](bool input) -> std::string {
-        if (next == static_cast<unsigned>(count)) return {};
-        const auto argument = clang_Cursor_getArgument(cursor, next);
-        const auto type = clang_getCursorType(argument);
-        auto stream = StreamType(type);
-        if (!stream.ends_with(input ? "InputStream" : "OutputStream")) return {};
-        if (clang_isConstQualifiedType(type) || clang_isVolatileQualifiedType(type) ||
-            stream.starts_with("Async") != async) {
-          Reject(argument, "Pass InputStream or OutputStream by value to synchronous methods and async streams to Task methods");
-        }
-        ++next;
-        return stream;
-      };
-      operation.input = read_stream(true);
-      operation.output = read_stream(false);
-      if (next < static_cast<unsigned>(count)) {
-        const auto receiver = clang_Cursor_getArgument(cursor, next++);
-        const auto receiver_type = PluginKitArgument(clang_getCursorType(receiver), "std::shared_ptr");
-        const auto declaration = clang_getTypeDeclaration(clang_getCanonicalType(receiver_type));
-        CXFile receiver_file = nullptr;
-        CXFile interface_file = nullptr;
-        clang_getSpellingLocation(clang_getCursorLocation(declaration), &receiver_file, nullptr, nullptr, nullptr);
-        clang_getSpellingLocation(clang_getCursorLocation(interface), &interface_file, nullptr, nullptr, nullptr);
-        if (!async || receiver_type.kind == CXType_Invalid || !receiver_file ||
-            clang_File_isEqual(receiver_file, interface_file) || !clang_isCursorDefinition(declaration) || !IsRemote(declaration)) {
-          Reject(receiver, "Use a by-value shared_ptr to an HPK_REMOTE receiver from a separate header on a Task operation");
-        }
-        for (const auto method : Children(declaration)) {
-          const auto arguments = clang_Cursor_getNumArguments(method);
-          if (method.kind == CXCursor_CXXMethod &&
-              (PluginKitArgument(clang_getCursorResultType(method), "huxerui::Task").kind == CXType_Invalid ||
-               arguments > 1 || (arguments == 1 && !StreamType(clang_getCursorType(clang_Cursor_getArgument(method, 0))).empty()))) {
-            Reject(method, "A receiver operation must return Task and accept at most one ordinary request");
-          }
-        }
-        auto binding = CursorPath(receiver_file).lexically_relative(CursorPath(interface_file).parent_path());
-        if (binding.empty()) Reject(receiver, "Could not locate the receiver contract relative to this header");
-        binding.replace_extension(".bindings.h");
-        operation.receiver = "::" + QualifiedName(declaration);
-        const auto relative = binding.generic_u8string();
-        operation.receiver_header.assign(relative.begin(), relative.end());
-      }
-      if (next != static_cast<unsigned>(count)) {
-        Reject(cursor, "Parameters must appear in request, input stream, output stream, receiver order");
+      Operation operation{name, clang_getCanonicalType(result).kind == CXType_Void ? Type{"void", "void"} : ReadType(result, cursor, 0),
+                          {}, async, clang_CXXMethod_isConst(cursor) != 0};
+      for (int index = 0; index < count; ++index) {
+        operation.parameters.push_back(ReadParameter(clang_Cursor_getArgument(cursor, index), interface, async, receiver));
       }
       operations.push_back(std::move(operation));
     }
@@ -262,48 +290,115 @@ public:
   Json Describe(std::string_view id, std::uint32_t version) const {
     auto methods = Json::array();
     for (const auto& method : operations) {
+      auto parameters = Json::array();
+      for (const auto& parameter : method.parameters) {
+        const auto kind = parameter.kind == ParameterKind::Stream ? "stream"
+            : parameter.kind == ParameterKind::Receiver ? "receiver" : "value";
+        Json item{{"name", parameter.name}, {"kind", kind}, {"type", parameter.type.wire}};
+        if (parameter.reference) item["const_ref"] = true;
+        if (!parameter.receiver_schema.empty()) item["schema"] = parameter.receiver_schema;
+        parameters.push_back(std::move(item));
+      }
       methods.push_back({{"number", methods.size() + 1}, {"name", method.name},
-                         {"request", method.request.wire}, {"response", method.response.wire}});
+                         {"parameters", std::move(parameters)}, {"response", method.response.wire}});
       if (method.async) methods.back()["async"] = true;
       if (method.is_const) methods.back()["const"] = true;
-      if (method.reference) methods.back()["const_ref"] = true;
-      if (!method.input.empty()) methods.back()["input"] = method.input;
-      if (!method.output.empty()) methods.back()["output"] = method.output;
-      if (!method.receiver.empty()) methods.back()["receiver"] = method.receiver;
     }
     auto types = Json::array();
-    for (const auto& record : records) {
-      auto fields = Json::array();
-      for (const auto& field : record.fields) {
-        fields.push_back({{"number", fields.size() + 1}, {"name", field.name}, {"type", field.type.wire}});
-      }
-      types.push_back({{"name", record.name}, {"fields", std::move(fields)}});
+    for (const auto& codec : value_codecs) {
+      if (!codec.representation) types.push_back(DescribeRecord(codec));
     }
     return {{"id", id}, {"version", version}, {"operations", std::move(methods)}, {"records", std::move(types)}};
   }
 
   std::string interface_name;
-  std::vector<Record> records;
+  std::vector<ValueCodec> value_codecs;
   std::vector<Operation> operations;
 
 private:
-  Type ReadType(CXType type, CXCursor origin, unsigned depth) {
-    if (depth >= 16) Reject(origin, "The wire type exceeds the nesting limit");
-    if (clang_isConstQualifiedType(type) || clang_isVolatileQualifiedType(type)) {
-      Reject(origin, "Wire values must be unqualified");
-    }
-    const auto spelling = Text(clang_getTypeSpelling(type));
-    if (spelling == "bool") return {"bool", "bool"};
-    if (spelling == "std::string") return {"std::string", "text"};
-    for (const auto integer : {"int32_t", "uint32_t", "int64_t", "uint64_t"}) {
-      if (spelling == integer || spelling == std::string("std::") + integer) {
-        return {std::string("std::") + integer, integer};
+  Parameter ReadParameter(CXCursor argument, CXCursor interface, bool async, bool receiver) {
+    auto type = clang_getCursorType(argument);
+    const auto canonical = clang_getCanonicalType(type);
+    const auto stream = StreamType(type);
+    if (!stream.empty()) {
+      if (receiver) Reject(argument, "Invocation callbacks accept only ordinary values");
+      if (clang_isConstQualifiedType(canonical) || clang_isVolatileQualifiedType(canonical) ||
+          stream.starts_with("Async") != async) {
+        Reject(argument, "Pass InputStream or OutputStream by value to synchronous methods and async streams to Task methods");
       }
+      return {ParameterKind::Stream, {stream, stream}, Name(argument), false, {}, {}};
     }
 
+    const auto callback = PluginKitArgument(type, "std::shared_ptr");
+    if (callback.kind != CXType_Invalid) {
+      const auto declaration = clang_getTypeDeclaration(clang_getCanonicalType(callback));
+      const auto file = SourceFile(declaration);
+      const auto interface_file = SourceFile(interface);
+      if (receiver || !async || !file || !interface_file || clang_File_isEqual(file, interface_file) ||
+          !clang_isCursorDefinition(declaration) || !IsRemote(declaration) ||
+          clang_isConstQualifiedType(callback) || clang_isVolatileQualifiedType(callback)) {
+        Reject(argument, "Use a by-value shared_ptr to an HPK_REMOTE callback from a separate header on a Task operation");
+      }
+      auto binding = CursorPath(file).lexically_relative(CursorPath(interface_file).parent_path());
+      if (binding.empty()) Reject(argument, "Could not locate the callback contract relative to this header");
+      binding.replace_extension(".bindings.h");
+      const auto relative = binding.generic_u8string();
+      const Schema reflected(declaration, definitions_, true);
+      const auto shape = reflected.Describe(reflected.interface_name, 1).dump();
+      return {ParameterKind::Receiver, {"::" + reflected.interface_name, reflected.interface_name}, Name(argument), false,
+              std::string(relative.begin(), relative.end()), Sha256(AsBytes(shape))};
+    }
+
+    const auto reference = canonical.kind == CXType_LValueReference;
+    if (reference) {
+      if (async) Reject(argument, "A Task operation must take its arguments by value");
+      type = clang_getPointeeType(canonical);
+      if (!clang_isConstQualifiedType(type) || clang_isVolatileQualifiedType(type)) {
+        Reject(argument, "A borrowed argument must be a const reference to an ordinary value");
+      }
+    }
+    return {ParameterKind::Value, ReadType(clang_getUnqualifiedType(type), argument, 0), Name(argument), reference, {}, {}};
+  }
+
+  std::optional<Type> ReadMapping(CXType canonical, CXCursor origin, unsigned depth) {
+    const bool named = canonical.kind == CXType_Record || canonical.kind == CXType_Enum;
+    if (!named && (canonical.kind < CXType_Bool || canonical.kind > CXType_LongDouble)) return std::nullopt;
+    const auto mapping = std::ranges::find_if(definitions_.codecs, [&](const auto& codec) {
+      return clang_equalTypes(canonical, codec.value);
+    });
+    if (mapping == definitions_.codecs.end()) return std::nullopt;
+
+    const auto name = Text(clang_getTypeSpelling(canonical));
+    const auto cpp = named ? "::" + name : name;
+    const auto found = std::ranges::find(value_codecs, cpp, &ValueCodec::cpp);
+    if (found != value_codecs.end()) {
+      return Type{cpp, "codec<" + name + "," + found->representation->wire + ">"};
+    }
+
+    const auto members = Children(mapping->declaration);
+    const auto alias = std::ranges::find_if(members, [](CXCursor member) {
+      return (member.kind == CXCursor_TypeAliasDecl || member.kind == CXCursor_TypedefDecl) && Name(member) == "WireType";
+    });
+    if (alias == members.end()) Reject(origin, "WireCodec for '" + name + "' must declare WireType");
+    if (!visiting_.insert(cpp).second) Reject(origin, "Recursive WireCodec for '" + name + "'");
+    auto wire = ReadType(clang_getTypedefDeclUnderlyingType(*alias), origin, depth + 1);
+    Type result{cpp, "codec<" + name + "," + wire.wire + ">"};
+    value_codecs.push_back({cpp, {}, std::move(wire)});
+    visiting_.erase(cpp);
+    return result;
+  }
+
+  Type ReadType(CXType type, CXCursor origin, unsigned depth) {
+    if (depth >= 16) Reject(origin, "The wire type exceeds the nesting limit");
     const auto canonical = clang_getCanonicalType(type);
+    if (clang_isConstQualifiedType(canonical) || clang_isVolatileQualifiedType(canonical)) {
+      Reject(origin, "Wire values must be unqualified");
+    }
+    if (auto mapped = ReadMapping(canonical, origin, depth)) return std::move(*mapped);
+    if (auto builtin = BuiltinWireType(canonical, definitions_)) return std::move(*builtin);
     const auto declaration = clang_getTypeDeclaration(canonical);
     const auto name = StandardTemplateName(declaration);
+
     if (name == "std::vector" || name == "std::optional") {
       auto element = clang_Type_getTemplateArgumentAsType(type, 0);
       if (element.kind == CXType_Invalid) element = clang_Type_getTemplateArgumentAsType(canonical, 0);
@@ -316,23 +411,25 @@ private:
       const auto nested = ReadType(element, origin, depth + 1);
       return {name + "<" + nested.cpp + ">", name.substr(5) + "<" + nested.wire + ">"};
     }
-    if (canonical.kind == CXType_Record && declaration.kind == CXCursor_StructDecl && InHeader(declaration)) {
+    if (canonical.kind == CXType_Record && declaration.kind == CXCursor_StructDecl &&
+        clang_Cursor_isNull(clang_getSpecializedCursorTemplate(declaration))) {
       const auto record = QualifiedName(declaration);
       ReadRecord(declaration, record, depth);
       return {"::" + record, record};
     }
-    Reject(origin, "Unsupported wire type '" + spelling + "'");
+    Reject(origin, "Unsupported wire type '" + Text(clang_getTypeSpelling(type)) + "'");
   }
 
   void ReadRecord(CXCursor declaration, const std::string& name, unsigned depth) {
     const auto parent = clang_getCursorSemanticParent(declaration);
     if (!clang_isCursorDefinition(declaration) || name.empty() || name.starts_with("::") ||
         (parent.kind != CXCursor_TranslationUnit && parent.kind != CXCursor_Namespace)) {
-      Reject(declaration, "Use a named record defined at namespace scope in the contract header");
+      Reject(declaration, "Use a named record defined at namespace scope in a shared contract header");
     }
-    if (std::ranges::find(records, name, &Record::name) != records.end()) return;
-    if (!visiting_.insert(name).second) Reject(declaration, "Recursive records are unsupported");
-    Record record{name, {}};
+    const auto cpp = "::" + name;
+    if (std::ranges::find(value_codecs, cpp, &ValueCodec::cpp) != value_codecs.end()) return;
+    if (!visiting_.insert(cpp).second) Reject(declaration, "Recursive records are unsupported");
+    ValueCodec record{cpp, {}, {}};
     for (const auto cursor : Children(declaration)) {
       if (cursor.kind == CXCursor_CXXAccessSpecifier || clang_isAttribute(cursor.kind)) continue;
       if (cursor.kind != CXCursor_FieldDecl || clang_getCXXAccessSpecifier(cursor) != CX_CXXPublic ||
@@ -341,10 +438,11 @@ private:
       }
       record.fields.push_back({Name(cursor), ReadType(clang_getCursorType(cursor), cursor, depth + 1)});
     }
-    records.push_back(std::move(record));
-    visiting_.erase(name);
+    value_codecs.push_back(std::move(record));
+    visiting_.erase(cpp);
   }
 
+  const WireDefinitions& definitions_;
   std::set<std::string> visiting_;
 };
 
@@ -353,60 +451,82 @@ void AppendArgument(std::string& arguments, const std::string& value) {
   arguments += value;
 }
 
+std::string ArgumentName(std::size_t index) { return "arg" + std::to_string(index + 1); }
+
+std::string ParameterType(const Parameter& parameter) {
+  if (parameter.kind == ParameterKind::Receiver) return "std::shared_ptr<" + parameter.type.cpp + ">";
+  if (parameter.reference) return "const " + parameter.type.cpp + "&";
+  return parameter.type.cpp;
+}
+
 std::string Signature(const Operation& operation) {
   const auto& result = operation.response.cpp;
   std::string parameters;
-  if (operation.request.cpp != "void") {
-    parameters = (operation.reference ? "const " + operation.request.cpp + "&" : operation.request.cpp) + " request";
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    AppendArgument(parameters, ParameterType(operation.parameters[i]) + " " + ArgumentName(i));
   }
-  if (!operation.input.empty()) AppendArgument(parameters, operation.input + " input");
-  if (!operation.output.empty()) AppendArgument(parameters, operation.output + " output");
-  if (!operation.receiver.empty()) AppendArgument(parameters, "Receiver<" + operation.receiver + "> receiver");
   return (operation.async ? "Task<" + result + ">" : result) + " " + operation.name +
       "(" + parameters + (operation.is_const ? ") const override" : ") override");
 }
 
-std::string Arguments(const Operation& operation, std::string request, std::string input, std::string output,
-                      std::string receiver) {
+std::string PassArgument(const Parameter& parameter, std::size_t index) {
+  const auto argument = ArgumentName(index);
+  return parameter.reference ? argument : "std::move(" + argument + ")";
+}
+
+std::string Arguments(const Operation& operation, bool native_binding = false) {
   std::string arguments;
-  if (operation.request.cpp != "void") AppendArgument(arguments, request);
-  if (!operation.input.empty()) AppendArgument(arguments, input);
-  if (!operation.output.empty()) AppendArgument(arguments, output);
-  if (!operation.receiver.empty()) AppendArgument(arguments, receiver);
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    const auto& parameter = operation.parameters[i];
+    const auto slot = std::to_string(i + 1);
+    auto argument = PassArgument(parameter, i);
+    if (native_binding && parameter.kind == ParameterKind::Stream) {
+      const auto factory = parameter.type.cpp.ends_with("InputStream") ? "detail::LocalInput(" : "detail::LocalOutput(";
+      const auto owner = operation.async ? "invocation->grants" : "grants";
+      argument = std::string(factory) + owner + ", " + slot +
+          (operation.async ? ", invocation->execution)" : ")");
+    } else if (native_binding && parameter.kind == ParameterKind::Receiver) {
+      argument = "detail::LocalReceiver<" + parameter.type.cpp + ">(invocation, " + slot + ")";
+    }
+    AppendArgument(arguments, argument);
+  }
   return arguments;
 }
 
-std::string Arguments(const Operation& operation) {
-  const std::string owner = operation.async ? "invocation->streams, invocation->execution" : "streams";
-  return Arguments(operation, operation.reference ? "request" : "std::move(request)",
-      "detail::LocalInput(" + owner + ")", "detail::LocalOutput(" + owner + ")", "std::move(receiver)");
-}
-
-std::string CaptureRequest(const Operation& operation) {
-  return operation.request.cpp == "void" ? "" : "request = std::move(request)";
-}
-
-std::string EncodedRequest(const Operation& operation) {
-  return operation.request.cpp == "void" ? "Bytes{}" : "detail::Encode(request)";
+std::string CaptureArguments(const Operation& operation, bool worker) {
+  std::string captures;
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    const auto& parameter = operation.parameters[i];
+    if (parameter.kind == ParameterKind::Value) {
+      const auto name = ArgumentName(i);
+      AppendArgument(captures, name + " = std::move(" + name + ")");
+    } else if (worker && parameter.kind == ParameterKind::Receiver) {
+      AppendArgument(captures, "slot" + std::to_string(i + 1));
+    }
+  }
+  return captures;
 }
 
 void EmitOperationDocumentation(std::ostream& out, const Operation& operation, std::string_view action) {
-  out << "  /// @brief " << action << " `" << operation.name << "()`"
+  out << "  /// @brief " << action << " " << operation.name << "()"
       << (operation.async ? " when the Task runs.\n" : " synchronously.\n");
-  if (operation.request.cpp != "void") {
-    out << "  /// @param request ";
-    if (operation.async) out << "Request value owned by the returned Task.\n";
-    else if (operation.reference) out << "Request value borrowed until the call returns.\n";
-    else out << "Request value passed to the implementation.\n";
-  }
-  if (!operation.receiver.empty()) {
-    out << "  /// @param receiver Optional host callback object retained for this call.\n";
-  }
-  if (!operation.input.empty()) {
-    out << "  /// @param input Sequential source moved into this invocation. Its read grant expires with the call.\n";
-  }
-  if (!operation.output.empty()) {
-    out << "  /// @param output Sequential destination moved into this invocation. Close it successfully before returning.\n";
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    const auto& parameter = operation.parameters[i];
+    out << "  /// @param " << ArgumentName(i) << " ";
+    switch (parameter.kind) {
+      case ParameterKind::Value:
+        out << (operation.async ? "Value owned by the returned Task.\n"
+                                 : parameter.reference ? "Value borrowed until the call returns.\n"
+                                                       : "Value passed to the implementation.\n");
+        break;
+      case ParameterKind::Stream:
+        out << (parameter.type.cpp.ends_with("InputStream") ? "Source granted for this invocation.\n"
+                                                           : "Destination to close before returning.\n");
+        break;
+      case ParameterKind::Receiver:
+        out << "Optional host object granted for this invocation.\n";
+        break;
+    }
   }
   if (operation.async) {
     out << (operation.response.cpp == "void" ? "  /// @return Lazy Task that completes when the operation finishes.\n"
@@ -416,20 +536,88 @@ void EmitOperationDocumentation(std::ostream& out, const Operation& operation, s
   }
 }
 
+void EmitGrants(std::ostream& out, const Operation& operation) {
+  out << "    auto grants = std::make_shared<detail::CallGrants>(" << operation.parameters.size() << ");\n";
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    const auto name = ArgumentName(i);
+    const auto slot = i + 1;
+    switch (operation.parameters[i].kind) {
+      case ParameterKind::Value:
+        break;
+      case ParameterKind::Stream:
+        out << "    grants->Add(" << slot << ", std::move(" << name << "));\n";
+        break;
+      case ParameterKind::Receiver:
+        out << "    const std::uint32_t slot" << slot << " = " << name << " ? " << slot << "u : 0u;\n"
+            << "    if (slot" << slot << ") detail::GrantReceiver(*grants, slot" << slot << ", std::move(" << name << "));\n";
+        break;
+    }
+  }
+}
+
+void EmitWriteArguments(std::ostream& out, const Operation& operation, std::string_view type, std::string_view indent) {
+  out << indent << "detail::Writer writer;\n" << indent << "writer.Array(" << operation.parameters.size() << ");\n";
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    const auto& parameter = operation.parameters[i];
+    const auto slot = i + 1;
+    switch (parameter.kind) {
+      case ParameterKind::Value:
+        out << indent << "detail::Codec<" << parameter.type.cpp << ", " << type << ">::Write(writer, " << ArgumentName(i) << ");\n";
+        break;
+      case ParameterKind::Stream:
+        out << indent << "detail::Codec<std::uint32_t>::Write(writer, " << slot << ");\n";
+        break;
+      case ParameterKind::Receiver:
+        out << indent << "if (slot" << slot << ") detail::Codec<std::uint32_t>::Write(writer, slot" << slot << ");\n"
+            << indent << "else writer.Byte(0xf6);\n";
+        break;
+    }
+  }
+}
+
+void EmitReadArguments(std::ostream& out, const Operation& operation, std::string_view type) {
+  out << "        detail::Reader reader(payload);\n"
+      << "        reader.Record(" << operation.parameters.size() << ");\n";
+  if (operation.HasStreams()) out << "        const detail::WorkerStreams streams(invocation);\n";
+  // Decode in declaration order before entering the C++ call, whose argument evaluation order can differ.
+  for (std::size_t i = 0; i < operation.parameters.size(); ++i) {
+    const auto& parameter = operation.parameters[i];
+    const auto read_slot = "detail::ReadSlot(reader, " + std::to_string(i + 1) + ")";
+    out << "        auto " << ArgumentName(i) << " = ";
+    switch (parameter.kind) {
+      case ParameterKind::Value:
+        out << "detail::Codec<" << parameter.type.cpp << ", " << type << ">::Read(reader)";
+        break;
+      case ParameterKind::Stream: {
+        const auto prefix = operation.async ? "streams.Async" : "streams.";
+        out << prefix << (parameter.type.cpp.ends_with("InputStream") ? "Input(" : "Output(") << read_slot << ")";
+        break;
+      }
+      case ParameterKind::Receiver:
+        out << "reader.TakeNull() ? nullptr : std::make_shared<Contract<" << parameter.type.cpp
+            << ">::Callback>(detail::HostEndpoint(invocation, " << read_slot << "))";
+        break;
+    }
+    out << ";\n";
+  }
+  out << "        reader.Finish();\n";
+  if (operation.HasStreams() && !operation.async) {
+    out << "        const detail::SynchronousStreamScope scope(streams.Owner());\n";
+  }
+}
+
 void EmitAsyncCallback(std::ostream& out, const Operation& operation, std::string_view type) {
-  const auto empty = operation.request.cpp == "void";
-  const auto qualifier = empty ? "[[maybe_unused]] " : "";
-  out << ", " << (empty ? "nullptr" : "std::move(request)") << ",\n"
-      << "        [](" << type << "& target, " << qualifier << "auto request) { return target."
-      << operation.name << "(" << Arguments(operation) << "); },\n"
-      << "        [](" << qualifier << "const auto& request) { return " << EncodedRequest(operation) << "; });\n";
+  out << ", &" << type << "::" << operation.name;
+  const auto arguments = Arguments(operation);
+  if (!arguments.empty()) out << ", " << arguments;
+  out << ");\n";
 }
 
 void EmitExtension(std::ostream& out, const Schema& schema, std::string_view type) {
   out << "/// @brief Adapts the published interface to its installed execution mode.\n"
       << "///\n"
       << "/// Call through ExtensionHandle on the owning HuxerUI application thread. In-process calls use\n"
-      << "/// the native C++ implementation. Worker calls encode the request and response over IPC.\n"
+      << "/// the native C++ implementation. Worker calls encode the arguments and result over IPC.\n"
       << "/// @see PluginManager::CreateExtension()\n"
       << "class Contract<" << type << ">::Extension final : public " << type << " {\npublic:\n"
       << "  /// @brief Binds the interface adapter to the handle's invocation target.\n"
@@ -438,91 +626,101 @@ void EmitExtension(std::ostream& out, const Schema& schema, std::string_view typ
   for (std::size_t i = 0; i < schema.operations.size(); ++i) {
     const auto& operation = schema.operations[i];
     const auto& result = operation.response.cpp;
-    const auto arguments = Arguments(operation);
+    const auto grants = operation.HasGrants() ? "std::move(grants)" : "nullptr";
     EmitOperationDocumentation(out, operation, "Invokes the extension's");
     out << "  /// @throws Error With Closed for a released or retired target, DeadlineExceeded if its time budget\n"
         << "  /// expires, or PluginFailed if the implementation fails.\n"
         << "  /// @throws Error With WorkerExited if the worker exits, Protocol for a malformed exchange, or\n"
-        << "  /// PayloadTooLarge if the encoded request or response exceeds a wire limit.\n";
+        << "  /// PayloadTooLarge if the encoded request or result exceeds a wire limit.\n";
     if (operation.async) {
-      out << "  /// @note A queued timeout or cancellation affects only this call. An active worker exchange\n"
-          << "  /// is retired on timeout or cancellation. In process, PluginKit requests cooperative stop.\n";
+      out << "  /// @note Cancellation of an active worker exchange retires its generation. In-process\n"
+          << "  /// cancellation requests cooperative stop. Invocation grants are revoked in either mode.\n";
     } else {
       out << "  /// @throws Error With Busy if the plugin is handling another invocation, or CallbackUnavailable\n"
-          << "  /// if a synchronous worker call attempts to call the host.\n"
+          << "  /// if a synchronous worker call attempts to call a host service.\n"
           << "  /// @note A synchronous worker call blocks until its reply or failure. The in-process time budget\n"
           << "  /// is checked at call boundaries.\n";
     }
     out << "  " << Signature(operation) << " {\n";
-    if (operation.HasStreams()) {
-      out << "    auto streams = std::make_shared<detail::CallStreams>("
-          << (operation.input.empty() ? "detail::StreamInput{}" : "std::move(input)") << ", "
-          << (operation.output.empty() ? "detail::StreamOutput{}" : "std::move(output)") << ");\n";
-    }
+    if (operation.HasGrants()) EmitGrants(out, operation);
     out << "    if (target_->Mode() == ExecutionMode::InProcess) {\n";
+    const auto call = "static_cast<" + std::string(type) + "*>(object)->" + operation.name +
+        "(" + Arguments(operation, true) + ")";
     if (operation.async) {
-      out << "      return detail::InvokeLocal<" << result << ">(target_, [" << CaptureRequest(operation)
-          << "](void* object, " << (operation.receiver.empty() ? "[[maybe_unused]] " : "")
-          << "std::shared_ptr<detail::LocalInvocation> invocation";
+      out << "      return detail::InvokeLocal<" << result << ">(target_, [" << CaptureArguments(operation, false)
+          << "](void* object, [[maybe_unused]] std::shared_ptr<detail::LocalInvocation> invocation";
       if (result != "void") out << ", auto result";
       out << ") mutable {\n";
-      if (!operation.receiver.empty()) {
-        out << "        auto receiver = invocation->receiver ? std::make_shared<Contract<" << operation.receiver
-            << ">::Callback>(invocation) : nullptr;\n";
-      }
-      const auto call = "static_cast<" + std::string(type) + "*>(object)->" + operation.name + "(" + arguments + ")";
       if (result == "void") out << "        return " << call << ";\n";
       else out << "        return detail::StoreLocalResult<" << result << ">(" << call << ", result);\n";
-      out << "      }";
-      if (!operation.receiver.empty()) out << ", receiver";
-      else if (operation.HasStreams()) out << ", {}";
-      if (operation.HasStreams()) out << ", std::move(streams)";
-      out << ");\n";
+      out << "      }, " << grants << ");\n";
     } else {
       out << "      return detail::InvokeLocalSync<" << result << ">(*target_, [&](void* object) {\n"
-          << "        return static_cast<" << type << "*>(object)->" << operation.name << "(" << arguments << ");\n"
-          << "      }" << (operation.HasStreams() ? ", streams" : "") << ");\n";
+          << "        return " << call << ";\n"
+          << "      }, " << (operation.HasGrants() ? "grants" : "nullptr") << ");\n";
     }
     out << "    }\n";
     if (operation.async) {
-      out << "    return detail::InvokeWorker<" << result << ">(target_, " << i + 1 << ", [" << CaptureRequest(operation)
-          << "] { return " << EncodedRequest(operation) << "; }";
-      if (!operation.receiver.empty()) out << ", detail::BindReceiver(std::move(receiver))";
-      else if (operation.HasStreams()) out << ", {}";
-      if (operation.HasStreams()) out << ", std::move(streams)";
+      out << "    return detail::InvokeWorker<" << result << ", " << type << ">(target_, " << i + 1 << ", ["
+          << CaptureArguments(operation, true) << "] {\n";
+      EmitWriteArguments(out, operation, type, "      ");
+      out << "      return std::move(writer).Finish();\n    }, " << grants << ");\n";
     } else {
-      out << "    return detail::DecodeResult<" << result << ">(target_->CallWorker(" << i + 1 << ", "
-          << EncodedRequest(operation) << (operation.HasStreams() ? ", std::move(streams)" : "") << ")";
+      EmitWriteArguments(out, operation, type, "    ");
+      out << "    return detail::DecodeResult<" << result << ", " << type << ">(target_->CallWorkerSync(" << i + 1
+          << ", std::move(writer).Finish(), " << grants << "));\n";
     }
-    out << ");\n  }\n\n";
+    out << "  }\n\n";
   }
   out << "private:\n  std::shared_ptr<detail::ExtensionTarget> target_;\n};\n\n";
 }
 
 void EmitCallback(std::ostream& out, const Schema& schema, std::string_view type) {
-  out << "/// @brief Typed receiver for a single local or worker invocation.\n"
+  out << "/// @brief Typed callback object for a single local or worker invocation.\n"
       << "///\n"
       << "/// Await operations from the owning invocation or an awaited child Task. The adapter expires when\n"
       << "/// the invocation finishes or is cancelled.\n"
       << "class Contract<" << type << ">::Callback final : public " << type << " {\npublic:\n"
-      << "  /// @brief Binds a worker receiver to the current invocation.\n"
-      << "  /// @param worker Host endpoint carrying the invocation identity and receiver slot.\n"
-      << "  explicit Callback(detail::HostEndpoint worker) : worker_(worker) {}\n"
-      << "  /// @brief Binds an in-process receiver to the current invocation.\n"
-      << "  /// @param local Weak reference to the invocation that owns the host receiver.\n"
-      << "  explicit Callback(std::weak_ptr<detail::LocalInvocation> local) : local_(std::move(local)) {}\n\n";
+      << "  /// @brief Binds a worker callback to its invocation and parameter slot.\n"
+      << "  /// @param worker Host endpoint carrying the invocation identity and slot.\n"
+      << "  explicit Callback(detail::HostEndpoint worker) : worker_(worker) {}\n\n"
+      << "  /// @brief Binds an in-process callback to its invocation and parameter slot.\n"
+      << "  /// @param local Weak reference to the invocation that owns the host object.\n"
+      << "  /// @param slot One-based position of the argument in that call.\n"
+      << "  Callback(std::weak_ptr<detail::LocalInvocation> local, std::uint32_t slot) : local_(std::move(local)), slot_(slot) {}\n\n";
   for (std::size_t i = 0; i < schema.operations.size(); ++i) {
     const auto& operation = schema.operations[i];
-    const auto& result = operation.response.cpp;
-    EmitOperationDocumentation(out, operation, "Calls the host receiver's");
-    out << "  /// @throws Error With ReceiverClosed if the receiver expired or the Task runs outside its\n"
-        << "  /// owning invocation. The Task also reports failures from the host callback.\n";
-    out << "  " << Signature(operation) << " {\n";
-    out << "    return detail::InvokeReceiver<" << result << ", " << type << ">(local_, worker_, " << i + 1;
+    EmitOperationDocumentation(out, operation, "Calls the host object's");
+    out << "  /// @throws Error With ReceiverClosed if the grant expired or the Task runs outside the owning invocation.\n"
+        << "  " << Signature(operation) << " {\n"
+        << "    return detail::InvokeReceiver<" << operation.response.cpp << ", " << type << ">(local_, slot_, worker_, " << i + 1;
     EmitAsyncCallback(out, operation, type);
     out << "  }\n\n";
   }
-  out << "private:\n  std::optional<detail::HostEndpoint> worker_;\n  std::weak_ptr<detail::LocalInvocation> local_;\n};\n\n";
+  out << "private:\n  std::optional<detail::HostEndpoint> worker_;\n  std::weak_ptr<detail::LocalInvocation> local_;\n"
+      << "  std::uint32_t slot_ = 0;\n};\n\n";
+}
+
+void EmitValueCodec(std::ostream& out, const ValueCodec& codec, std::string_view type) {
+  out << "template<>\nstruct Codec<" << codec.cpp << ", " << type << ">";
+  if (codec.representation) {
+    out << " : MappedCodec<" << codec.cpp << ", " << type << ", " << codec.representation->cpp << "> {};\n\n";
+    return;
+  }
+  out << " {\n"
+      << "  static void Write(Writer& writer, const " << codec.cpp << "& value) {\n"
+      << "    writer.Array(" << codec.fields.size() << ");\n";
+  if (codec.fields.empty()) out << "    (void)value;\n";
+  for (const auto& field : codec.fields) {
+    out << "    Codec<" << field.type.cpp << ", " << type << ">::Write(writer, value." << field.name << ");\n";
+  }
+  out << "  }\n\n  static " << codec.cpp << " Read(Reader& reader) {\n"
+      << "    reader.Record(" << codec.fields.size() << ");\n    return {";
+  for (std::size_t i = 0; i < codec.fields.size(); ++i) {
+    if (i != 0) out << ", ";
+    out << "Codec<" << codec.fields[i].type.cpp << ", " << type << ">::Read(reader)";
+  }
+  out << "};\n  }\n};\n\n";
 }
 
 std::string EmitBindings(const Schema& schema, std::string_view header, std::string_view id, std::uint32_t version,
@@ -534,87 +732,64 @@ std::string EmitBindings(const Schema& schema, std::string_view header, std::str
       << "#include \"" << header << "\"\n#include <huxerui/pluginkit/detail/extension.h>\n";
   std::set<std::string> receiver_headers;
   for (const auto& operation : schema.operations) {
-    if (!operation.receiver_header.empty()) receiver_headers.insert(operation.receiver_header);
+    for (const auto& parameter : operation.parameters) {
+      if (!parameter.receiver_header.empty()) receiver_headers.insert(parameter.receiver_header);
+    }
   }
   for (const auto& receiver : receiver_headers) out << "#include \"" << receiver << "\"\n";
-  out << "\nnamespace huxerui::pluginkit::detail {\n\n";
-  for (const auto& record : schema.records) {
-    const auto type = "::" + record.name;
-    out << "template<>\nstruct Codec<" << type << "> {\n"
-        << "  static void Write(Writer& writer, const " << type << "& value) {\n"
-        << "    writer.Array(" << record.fields.size() << ");\n";
-    if (record.fields.empty()) out << "    (void)value;\n";
-    for (const auto& field : record.fields) {
-      out << "    Codec<" << field.type.cpp << ">::Write(writer, value." << field.name << ");\n";
-    }
-    out << "  }\n\n  static " << type << " Read(Reader& reader) {\n"
-        << "    reader.Record(" << record.fields.size() << ");\n    return {";
-    for (std::size_t i = 0; i < record.fields.size(); ++i) {
-      if (i != 0) out << ", ";
-      out << "Codec<" << record.fields[i].type.cpp << ">::Read(reader)";
-    }
-    out << "};\n  }\n};\n\n";
-  }
   const auto type = "::" + schema.interface_name;
-  out << "} // namespace huxerui::pluginkit::detail\n\nnamespace huxerui::pluginkit {\n\n"
+  if (!schema.value_codecs.empty()) {
+    out << "\nnamespace huxerui::pluginkit::detail {\n\n";
+    for (const auto& codec : schema.value_codecs) EmitValueCodec(out, codec, type);
+    out << "} // namespace huxerui::pluginkit::detail\n";
+  }
+  out << "\nnamespace huxerui::pluginkit {\n\n"
       << "/// @brief Generated contract identity and operation dispatcher for " << schema.interface_name << ".\n"
       << "template<>\nstruct Contract<" << type << "> {\n"
       << "  /// Exact contract identifier, version, and schema fingerprint used by the host and plugin.\n"
       << "  static constexpr ContractInfo Info{\"" << id << "\", " << version << ", \"" << fingerprint << "\"};\n\n"
       << "  /// Generated implementation used by ExtensionHandle.\n"
       << "  class Extension;\n";
-  const auto host_service = receiver_headers.empty() && std::ranges::none_of(schema.operations, &Operation::HasStreams);
+  const auto host_service = std::ranges::none_of(schema.operations, &Operation::HasGrants);
   const auto receiver_contract = host_service && std::ranges::all_of(schema.operations, &Operation::async);
   if (host_service) {
     out << "  /// This interface can be registered as a host service.\n"
         << "  static constexpr bool HostService = true;\n";
   }
   if (receiver_contract) {
-    out << "  /// Generated implementation passed to a plugin as an invocation-scoped receiver.\n"
+    out << "  /// Generated implementation passed to a plugin as an invocation-scoped host object.\n"
         << "  class Callback;\n";
   }
   out << "\n"
-      << "  /// @brief Decodes the request and invokes the selected operation.\n"
+      << "  /// @brief Decodes the arguments and invokes the selected operation.\n"
       << "  /// @param implementation Instance that implements the interface. Keep it alive until the Task completes.\n"
       << "  /// @param operation Operation number from the published contract.\n"
-      << "  /// @param payload Encoded request owned by the task.\n"
-      << "  /// @param context Invocation data used to bind the caller's receiver and streams.\n"
+      << "  /// @param payload Encoded argument list owned by the Task.\n"
+      << "  /// @param invocation Worker call identity used to bind the caller's callback and stream slots.\n"
       << "  /// @return Lazy Task yielding the encoded result, or an empty buffer for a void result.\n"
       << "  /// @throws Error With Protocol for an unknown operation or invalid payload, or PayloadTooLarge\n"
       << "  /// if a wire limit is exceeded. Failures from the implementation also propagate.\n"
       << "  static Task<Bytes> Dispatch(" << type << "& implementation, std::uint32_t operation, Bytes payload,\n"
-      << "                              [[maybe_unused]] detail::DispatchContext context) {\n"
+      << "                              [[maybe_unused]] detail::HostInvocation invocation) {\n"
       << "    switch (operation) {\n";
   for (std::size_t i = 0; i < schema.operations.size(); ++i) {
     const auto& operation = schema.operations[i];
     out << "      case " << i + 1 << ": {\n";
-    if (operation.request.cpp == "void") {
-      out << "        if (!payload.empty()) throw Error(ErrorCode::Protocol, \"Unexpected request payload\");\n";
-    }
-    out << "        if (context.streams != ";
-    if (!operation.input.empty()) out << "HPK_INPUT_STREAM";
-    if (!operation.input.empty() && !operation.output.empty()) out << " + ";
-    if (!operation.output.empty()) out << "HPK_OUTPUT_STREAM";
-    if (!operation.HasStreams()) out << "0";
-    out << ") throw Error(ErrorCode::Protocol, \"Unexpected invocation stream slots\");\n";
-    if (operation.HasStreams()) {
-      out << "        const detail::WorkerStreams streams(context.invocation);\n";
-      if (!operation.async) out << "        const detail::SynchronousStreamScope scope(streams.Owner());\n";
-    }
+    EmitReadArguments(out, operation, type);
     const bool returns_value = operation.response.cpp != "void";
     out << "        ";
     if (returns_value) out << "auto result = ";
     if (operation.async) out << "co_await ";
-    out << "implementation." << operation.name << "(" << Arguments(operation,
-        "detail::Decode<" + operation.request.cpp + ">(payload)",
-        operation.async ? "streams.AsyncInput()" : "streams.Input()",
-        operation.async ? "streams.AsyncOutput()" : "streams.Output()",
-        "context.receiver ? std::make_shared<Contract<" + operation.receiver +
-            ">::Callback>(detail::HostEndpoint(context.invocation, context.receiver)) : nullptr")
-        << ");\n        co_return " << (returns_value ? "detail::Encode(result)" : "Bytes{}") << ";\n      }\n";
+    out << "implementation." << operation.name << "(" << Arguments(operation) << ");\n"
+        << "        co_return ";
+    if (returns_value) out << "detail::Encode<" << type << ">(result)";
+    else out << "Bytes{}";
+    out << ";\n      }\n";
   }
   out << "      default: throw Error(ErrorCode::Protocol, \"Unknown contract operation\");\n"
-      << "    }\n  }\n};\n\n";
+      << "    }\n"
+      << "  }\n};\n\n";
+
   EmitExtension(out, schema, type);
   if (receiver_contract) EmitCallback(out, schema, type);
   if (host_service) {
@@ -697,7 +872,9 @@ void Generate(const fs::path& header, std::string_view interface_name, std::stri
   if (failed) throw Error(ErrorCode::InvalidArgument, "Clang rejected the contract header");
   const auto interface = FindInterface(clang_getTranslationUnitCursor(unit.get()), interface_name);
   if (clang_Cursor_isNull(interface)) throw Error(ErrorCode::InvalidArgument, "Interface definition was not found in the contract header");
-  const Schema schema(interface);
+  WireDefinitions definitions;
+  FindWireDefinitions(clang_getTranslationUnitCursor(unit.get()), definitions);
+  const Schema schema(interface, definitions);
   auto manifest = schema.Describe(id, version);
   // Hash the compact schema before adding its fingerprint to the published manifest.
   const auto fingerprint = Sha256(AsBytes(manifest.dump()));

@@ -95,6 +95,8 @@ Run the host with just a profile directory for a session that accepts one comman
 
 `convert <sync|async> <ssv-file> <csv-file> <plugin-id> [chunk-kib]` converts semicolon-delimited data to CSV using input and output streams. Reads default to 512 KiB. The reply reports rows, transferred byte counts, and the plugin process ID. The host publishes the output after the plugin closes its stream and the conversion succeeds.
 
+`convert-pair <sync|async> <first-input> <first-output> <second-input> <second-output> <plugin-id>` converts two semicolon-delimited inputs in one call. The async contract accepts two optional progress objects. The host stages both outputs and begins publishing them when the call succeeds and both streams have closed.
+
 Use `install <package> <approved-digest> <in_process|worker_process> [status]` to select the mode and grant access to the registered `ImportStatus` service. The profile keeps the installed snapshot, enablement, and approval. Starting the host with the same profile reuses these records and the installed files, even if the original package directory has moved. For `sample.csv`, the import reply reports `progress_rows` as 2 and the `status` command reports `last_imported_rows` as 2.
 
 Use `upgrade <package> <installed-digest> <approved-digest> [status]` to replace a local package with another release of the same plugin. A worker upgrade takes effect in the current session. An in-process upgrade is applied when the preview starts in a new process. `uninstall <id> <installed-digest> [delete-data]` removes the plugin and its grants. The default preserves its current data for a later installation.
@@ -121,7 +123,9 @@ python examples/csv_import/verify.py $CsvHostExe $CsvPackageDir .\build\csv-plug
 
 The script installs two builds of the same CSV package in one profile, one per execution mode. It verifies ordered batch creation, ambiguous plugin ID lookup, candidate selection, and a round trip through the package's two importers and one exporter. It checks that the factories share a process and context, activate once, and are enabled or disabled together. It also moves the original package and verifies that a new host process can reuse the installed snapshot and grants. A changed host contract for the exporter rejects the whole factory table before activation, even when the first call targets an importer. The script checks requests above the IPC size limit, receiver lifetime, catalog queries during callbacks, cancellation, and worker recovery. On Linux and macOS it checks that the worker exits when the host is killed during a pending call.
 
-The stream tests convert the same input and check the output byte for byte with both sync and async methods in both execution modes. Both files exceed 8 MiB. They check the import size limit, progress before EOF, rejection of in-process callback reentry, cancellation during read and write, and revocation when a worker exits during a stream operation or receiver callback. They also check stale stream rejection and retention of an existing destination when writing, closing, or the plugin call fails.
+The contract checks cover same-type parameter reordering, independent codecs for a shared value, type aliases, and explicit scalar mappings found in a shared SDK included as a system header.
+
+The stream tests check single and paired conversions byte for byte with both sync and async methods in both execution modes. Each large input and output exceeds 8 MiB. The paired cases check parameter routing, custom value encoding, independent progress objects, and cleanup when the second output fails. They check the import size limit, progress before EOF, rejection of in-process callback reentry, cancellation during read and write, and revocation when a worker exits during a stream operation or receiver callback. They also check stale stream rejection and retention of an existing destination when writing, closing, or the plugin call fails.
 
 The script compares numeric and nested metadata in `inspect` and candidate lists before and after a restart. It also distinguishes omitted metadata from an empty object. The CSV importers read their cell limit from a generated HuxerUI resource. Verification covers whole-package approval, resource changes in the installed snapshot, and reopening the profile after moving the source package. The upgrade fixture checks that the resource switches with the package and that failed or interrupted upgrades preserve the committed resource.
 
@@ -135,7 +139,9 @@ Acquire `HuxerUI::PluginKit` with `huxerui_use_library`. The C++ API is in `huxe
 
 Mark each IPC-capable interface class with `HPK_REMOTE`. `hpk gen` takes its self-contained header, qualified interface name, contract ID, positive integer version, and output directory. Arguments after `--` are passed to Clang. Publish the generated files and the PluginKit include tree to plugin authors. `HPK_BUILD_GENERATOR=OFF` builds the library and worker without the generator. Set `HPK_LLVM_ROOT` if LLVM is outside `PATH`.
 
-The generator preserves synchronous value or `void` results and asynchronous `huxerui::Task<T>` results. Declare parameters in request, input stream, output stream, and receiver order. Each is optional. Synchronous methods also accept a const-reference ordinary request. Pass streams by value and use their async types on Task methods. A Task method may take a `Receiver<T>`, an alias of `std::shared_ptr<T>`. Generate its Task-returning receiver interface from a separate header. Wire values include fixed-width integers, `bool`, `std::string`, vectors, optional values, and aggregate records. Both sides check the exact contract fingerprint.
+The generator preserves synchronous value or `void` results and asynchronous `huxerui::Task<T>` results. Declare zero or more parameters in C++ declaration order, with values, streams, and callback objects interleaved as needed. Synchronous methods accept const-reference values. Task methods own their arguments. Pass streams by value and use async stream types on Task methods. To pass a host object to a Task, use `std::shared_ptr<T>` and generate its `HPK_REMOTE` interface from a separate header. Its callback operations return Task and accept ordinary value parameters. Each non-null object and each stream grants access for that invocation.
+
+Wire values include fixed-width integers, `bool`, `std::string`, vectors, optional values, and aggregate records. For a type with a custom representation, publish a `WireCodec<T>` specialization with a supported `WireType`, `Encode(const T&)`, and `Decode(WireType)` in the shared contract SDK. IPC encodes that representation as CBOR. In-process calls pass C++ values directly. The generated binding selects each codec for its own contract. The fingerprint covers the declared parameter names, their order, and the selected wire representations.
 
 Register each extension point and the host services with an application-scoped `PluginManager`. Choose one execution mode and a set of service grants when approving the package. Managed calls on a package are serialized across its instances.
 
@@ -155,7 +161,7 @@ auto selected = std::ranges::find_if(candidates, [](const auto& candidate) {
 if (selected == candidates.end()) throw Error(ErrorCode::NotFound, "CSV importer unavailable");
 auto importer = plugins.CreateExtension(Importers, *selected);
 auto delimiter = importer->Delimiter();
-auto result = co_await importer->Import(request, progress);
+auto result = co_await importer->Import(std::move(input), progress);
 
 auto all_importers = plugins.CreateExtensions(Importers);
 auto package_importers = plugins.CreateExtensions(Importers, "example.csv");

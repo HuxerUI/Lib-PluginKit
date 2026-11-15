@@ -10,6 +10,7 @@
 
 #include <concepts>
 #include <limits>
+#include <new>
 #include <optional>
 #include <span>
 #include <string>
@@ -161,11 +162,35 @@ private:
   std::span<const std::byte> remaining_;
 };
 
-template<class T>
+// Generated record and mapping specializations belong to the interface that selected their wire shape.
+template<class T, class Interface = void>
 struct Codec;
 
-template<std::integral T>
-struct Codec<T> {
+template<class T, class Interface, class WireType>
+struct MappedCodec {
+  using Mapping = WireCodec<T>;
+  static_assert(std::same_as<typename Mapping::WireType, WireType>, "WireCodec::WireType differs from the generated contract");
+
+  static void Write(Writer& writer, const T& value) {
+    static_assert(std::same_as<decltype(Mapping::Encode(value)), WireType>, "WireCodec::Encode must return WireType");
+    Codec<WireType, Interface>::Write(writer, Mapping::Encode(value));
+  }
+
+  static T Read(Reader& reader) {
+    auto value = Codec<WireType, Interface>::Read(reader);
+    static_assert(std::same_as<decltype(Mapping::Decode(std::move(value))), T>, "WireCodec::Decode must return T");
+    try {
+      return Mapping::Decode(std::move(value));
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (...) {
+      throw Error(ErrorCode::Protocol, "Invalid representation for a custom contract value");
+    }
+  }
+};
+
+template<std::integral T, class Interface>
+struct Codec<T, Interface> {
   static void Write(Writer& writer, T value) {
     if constexpr (std::signed_integral<T>) {
       if (value < 0) {
@@ -185,8 +210,8 @@ struct Codec<T> {
   }
 };
 
-template<>
-struct Codec<bool> {
+template<class Interface>
+struct Codec<bool, Interface> {
   static void Write(Writer& writer, bool value) { writer.Byte(value ? 0xf5 : 0xf4); }
   static bool Read(Reader& reader) {
     const auto value = reader.Byte();
@@ -195,35 +220,35 @@ struct Codec<bool> {
   }
 };
 
-template<>
-struct Codec<std::string> {
+template<class Interface>
+struct Codec<std::string, Interface> {
   static void Write(Writer& writer, const std::string& value) { writer.Text(value); }
   static std::string Read(Reader& reader) { return reader.Text(); }
 };
 
-template<class T>
-struct Codec<std::vector<T>> {
+template<class T, class Interface>
+struct Codec<std::vector<T>, Interface> {
   static void Write(Writer& writer, const std::vector<T>& values) {
     writer.Array(values.size());
-    for (const auto& value : values) Codec<T>::Write(writer, value);
+    for (const auto& value : values) Codec<T, Interface>::Write(writer, value);
   }
 
   static std::vector<T> Read(Reader& reader) {
     const auto count = reader.Array();
     std::vector<T> values;
     values.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) values.push_back(Codec<T>::Read(reader));
+    for (std::size_t i = 0; i < count; ++i) values.push_back(Codec<T, Interface>::Read(reader));
     return values;
   }
 };
 
-template<class T>
-struct Codec<std::optional<T>> {
+template<class T, class Interface>
+struct Codec<std::optional<T>, Interface> {
   // Wrap present values in an array so an empty inner optional has its own representation.
   static void Write(Writer& writer, const std::optional<T>& value) {
     if (value) {
       writer.Array(1);
-      Codec<T>::Write(writer, *value);
+      Codec<T, Interface>::Write(writer, *value);
     } else {
       writer.Byte(0xf6);
     }
@@ -232,21 +257,34 @@ struct Codec<std::optional<T>> {
   static std::optional<T> Read(Reader& reader) {
     if (reader.TakeNull()) return std::nullopt;
     reader.Record(1);
-    return std::optional<T>(std::in_place, Codec<T>::Read(reader));
+    return std::optional<T>(std::in_place, Codec<T, Interface>::Read(reader));
   }
 };
 
-template<class T>
+template<class Interface, class T>
 Bytes Encode(const T& value) {
   Writer writer;
-  Codec<T>::Write(writer, value);
+  Codec<T, Interface>::Write(writer, value);
   return std::move(writer).Finish();
 }
 
-template<class T>
+template<class Interface, class... Args>
+Bytes EncodeArguments(const Args&... args) {
+  Writer writer;
+  writer.Array(sizeof...(Args));
+  (Codec<Args, Interface>::Write(writer, args), ...);
+  return std::move(writer).Finish();
+}
+
+inline std::uint32_t ReadSlot(Reader& reader, std::uint32_t expected) {
+  if (Codec<std::uint32_t>::Read(reader) != expected) Reader::Invalid();
+  return expected;
+}
+
+template<class T, class Interface>
 T Decode(std::span<const std::byte> bytes) {
   Reader reader(bytes);
-  auto result = Codec<T>::Read(reader);
+  auto result = Codec<T, Interface>::Read(reader);
   reader.Finish();
   return result;
 }

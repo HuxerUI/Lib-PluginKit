@@ -11,6 +11,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,9 +20,6 @@ namespace csv_import {
 
 /// @brief Maximum input size for an import that materializes a table.
 inline constexpr std::size_t MaxImportBytes = 32 * 1024 * 1024;
-
-/// @brief Optional progress callback scoped to one import invocation.
-using ImportReceiver = huxerui::pluginkit::Receiver<ImportProgress>;
 
 /// @brief Parsed CSV data with a header and ordered records.
 struct Table {
@@ -69,7 +67,7 @@ public:
   /// @param receiver Optional host object that receives progress before the import returns.
   /// @return Lazy Task yielding a parsed table or input diagnostics.
   /// @throws huxerui::pluginkit::Error If activation or execution fails, including failure to update the host status.
-  virtual huxerui::Task<ImportResult> Import(huxerui::AsyncInputStream input, ImportReceiver receiver) = 0;
+  virtual huxerui::Task<ImportResult> Import(huxerui::AsyncInputStream input, std::shared_ptr<ImportProgress> receiver) = 0;
 };
 
 /// @brief Extension point for importers that produce a table from delimited text.

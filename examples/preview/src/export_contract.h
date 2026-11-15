@@ -10,7 +10,9 @@
 #include <huxerui/task.h>
 
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace csv_import {
@@ -31,6 +33,35 @@ struct CsvSummary {
   std::uint64_t input_bytes;
   /// Bytes written to the output stream.
   std::uint64_t output_bytes;
+};
+
+/// @brief Validated CSV input separator.
+class Separator {
+public:
+  /// @brief Constructs a comma or semicolon separator.
+  /// @param text Separator text used by the CSV parser.
+  /// @throws huxerui::pluginkit::Error With InvalidArgument for other values.
+  explicit Separator(std::string text) : text_(std::move(text)) {
+    if (text_ != "," && text_ != ";") {
+      throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::InvalidArgument, "Invalid CSV separator");
+    }
+  }
+
+  /// @brief Returns the validated separator text.
+  const std::string& Text() const noexcept { return text_; }
+
+private:
+  std::string text_;
+};
+
+/// @brief Results of two independent conversions using the same separator.
+struct PairSummary {
+  /// Counts for the first source and destination.
+  CsvSummary first;
+  /// Counts for the second source and destination.
+  CsvSummary second;
+  /// Separator applied to both inputs.
+  Separator separator;
 };
 
 /// @brief Maximum amount the converter asks the source to produce for one read.
@@ -72,10 +103,55 @@ public:
   /// @param progress Optional receiver for row counts reported as data is written.
   /// @return Lazy Task yielding counts for the completed conversion.
   virtual huxerui::Task<CsvSummary> ConvertAsync(ConversionOptions options, huxerui::AsyncInputStream input,
-      huxerui::AsyncOutputStream output, huxerui::pluginkit::Receiver<ImportProgress> progress) = 0;
+      huxerui::AsyncOutputStream output, std::shared_ptr<ImportProgress> progress) = 0;
+
+  /// @brief Converts two sources to separate CSV destinations synchronously.
+  /// @param first First source.
+  /// @param separator Input separator for both sources.
+  /// @param first_csv First destination, closed before returning.
+  /// @param read_bytes Maximum increment requested from either source.
+  /// @param second_csv Second destination, closed before returning.
+  /// @param second Second source.
+  /// @return Counts for each completed conversion and the input separator.
+  virtual PairSummary ConvertPair(
+      huxerui::InputStream first, const Separator& separator,
+      huxerui::OutputStream first_csv, std::uint32_t read_bytes,
+      huxerui::OutputStream second_csv, huxerui::InputStream second) = 0;
+
+  /// @brief Converts two sources to separate CSV destinations in a Task.
+  /// @param first First source.
+  /// @param separator Input separator for both sources.
+  /// @param first_progress Optional progress object for the first conversion.
+  /// @param first_csv First destination, closed before the Task succeeds.
+  /// @param read_bytes Maximum increment requested from either source.
+  /// @param second_csv Second destination, closed before the Task succeeds.
+  /// @param second_progress Optional progress object for the second conversion.
+  /// @param second Second source.
+  /// @return Lazy Task yielding counts for each completed conversion and the input separator.
+  virtual huxerui::Task<PairSummary> ConvertPairAsync(
+      huxerui::AsyncInputStream first, Separator separator, std::shared_ptr<ImportProgress> first_progress,
+      huxerui::AsyncOutputStream first_csv, std::uint32_t read_bytes, huxerui::AsyncOutputStream second_csv,
+      std::shared_ptr<ImportProgress> second_progress, huxerui::AsyncInputStream second) = 0;
 };
 
 /// @brief Extension point for exporters that encode a table as text.
 inline constexpr huxerui::pluginkit::ExtensionPoint<TableExporter> Exporters{"example.table-exporters"};
 
 } // namespace csv_import
+
+namespace huxerui::pluginkit {
+
+/// @brief Transfers the validated CSV separator as text.
+template<>
+struct WireCodec<csv_import::Separator> {
+  /// CBOR representation of a separator.
+  using WireType = std::string;
+
+  /// @brief Projects a validated separator to its text representation.
+  static WireType Encode(const csv_import::Separator& value) { return value.Text(); }
+
+  /// @brief Reconstructs a separator and validates the received text.
+  static csv_import::Separator Decode(WireType text) { return csv_import::Separator(std::move(text)); }
+};
+
+} // namespace huxerui::pluginkit

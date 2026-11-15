@@ -175,14 +175,14 @@ struct PluginContextAccess {
 
 template<class Interface>
 Task<void> DispatchPlugin(Interface& instance, const hpk_host_v1* host, std::uint64_t invocation,
-                          std::uint32_t receiver, std::uint32_t streams, std::uint32_t operation, Bytes request,
+                          std::uint32_t operation, Bytes request,
                           hpk_complete_v1 complete, void* user, std::int32_t (*status)(const Error&) noexcept) {
   try {
     Bytes bytes;
     {
       const auto execution = co_await CurrentTaskExecution{};
-      DispatchContext context{{host, invocation, execution}, receiver, streams};
-      const Invocation call{execution, HostEndpoint(context.invocation), nullptr, nullptr, {}};
+      const HostInvocation context{host, invocation, execution};
+      const Invocation call{execution, HostEndpoint(context), nullptr, nullptr, {}};
       InvocationScope scope(call);
       bytes = co_await Contract<Interface>::Dispatch(instance, operation, std::move(request), context);
     }
@@ -270,7 +270,7 @@ template<class Interface, class Implementation>
            std::has_virtual_destructor_v<Interface> &&
            (std::constructible_from<Implementation, const PluginContext&> || std::default_initializable<Implementation>)
 constexpr hpk_extension_v1 BindExtension(ExtensionPoint<Interface> point) noexcept {
-  constexpr bool remote = requires(Interface& instance, Bytes request, detail::DispatchContext context) {
+  constexpr bool remote = requires(Interface& instance, Bytes request, detail::HostInvocation context) {
     Contract<Interface>::Dispatch(instance, std::uint32_t{}, std::move(request), context);
   };
   return {
@@ -292,7 +292,7 @@ constexpr hpk_extension_v1 BindExtension(ExtensionPoint<Interface> point) noexce
         }
       },
       remote ? +[](void* instance, const hpk_host_v1* host, std::uint64_t invocation,
-          std::uint32_t receiver, std::uint32_t streams, std::uint32_t operation, const std::uint8_t* data, std::uint32_t size,
+          std::uint32_t operation, const std::uint8_t* data, std::uint32_t size,
          hpk_complete_v1 complete, void* user) noexcept -> std::int32_t {
         if constexpr (remote) {
           try {
@@ -304,7 +304,7 @@ constexpr hpk_extension_v1 BindExtension(ExtensionPoint<Interface> point) noexce
               request.assign(bytes.begin(), bytes.end());
             }
             (void)UseApplicationTaskScope().Launch(detail::DispatchPlugin<Interface>(
-                *static_cast<Interface*>(instance), host, invocation, receiver, streams, operation, std::move(request),
+                *static_cast<Interface*>(instance), host, invocation, operation, std::move(request),
                 complete, user, detail::PluginStatus));
             return HPK_OK;
           } catch (const Error& error) {

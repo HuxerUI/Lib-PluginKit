@@ -24,8 +24,8 @@ public:
 
   std::optional<std::uint32_t> Pid() const noexcept;
   void Activate(Deadline deadline, std::stop_token stop, bool started, bool wait_for_slot = true);
-  Frame Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver = nullptr,
-                std::stop_token stop = {}, bool wait_for_slot = true, std::shared_ptr<CallStreams> streams = {});
+  Frame Request(Frame request, std::chrono::milliseconds timeout, std::stop_token stop = {},
+                bool wait_for_slot = true, std::shared_ptr<CallGrants> grants = {});
   void ValidateFactories(std::stop_token stop);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
   /// Waits for the process to exit after shutdown, including when handles still reference this Worker.
@@ -36,21 +36,21 @@ public:
   bool Available() const noexcept { return active_ && !shutting_down_; }
 
 private:
-  Frame Request(Frame request, Deadline deadline, const ReceiverRegistration* receiver,
-                std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams, bool started = false);
+  Frame Request(Frame request, Deadline deadline, std::stop_token stop, bool wait_for_slot,
+                std::shared_ptr<CallGrants> grants, bool started = false);
   Frame Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
-                 const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams);
+                 const std::shared_ptr<CallGrants>& grants);
   Frame DispatchCallback(Frame request, Deadline deadline, std::stop_token stop,
-                         const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams,
+                         const std::shared_ptr<CallGrants>& grants,
                          StreamIo* sync_io);
   Frame DispatchService(const Frame& request, Deadline deadline, std::stop_token stop,
-                        const ReceiverRegistration* receiver, CallStreams* streams);
+                        CallGrants* grants);
   Frame DispatchStream(Frame request, Deadline deadline, std::stop_token stop,
-                       const std::shared_ptr<CallStreams>& streams, StreamIo* sync_io);
+                       const std::shared_ptr<CallGrants>& grants, StreamIo* sync_io);
 
   template<class Transact>
   Frame ExchangeFrames(const Frame& request, Deadline deadline, std::stop_token stop,
-                       const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams,
+                       const std::shared_ptr<CallGrants>& grants,
                        StreamIo* sync_io, Transact transact) {
     auto frame = transact(request);
     std::uint32_t callback = 0;
@@ -64,14 +64,10 @@ private:
         throw Error(ErrorCode::Protocol, "Invalid worker callback request");
       }
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
-      if (frame.kind == FrameKind::StreamCall) {
-        if (frame.receiver || !streams || !(request.streams & frame.streams)) {
-          throw Error(ErrorCode::Protocol, "The invocation did not authorize this stream");
-        }
-      } else if (frame.streams) {
-        throw Error(ErrorCode::Protocol, "A host service call has an unexpected stream slot");
+      if (frame.kind == FrameKind::StreamCall && (!grants || !grants->Has(frame.slot))) {
+        throw Error(ErrorCode::Protocol, "The invocation did not authorize this stream");
       }
-      const auto reply = DispatchCallback(std::move(frame), deadline, stop, receiver, streams, sync_io);
+      const auto reply = DispatchCallback(std::move(frame), deadline, stop, grants, sync_io);
       CheckExchange(deadline, stop);
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
       frame = transact(reply);

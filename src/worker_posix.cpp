@@ -77,10 +77,10 @@ void Worker::Reap(pid_t child) noexcept {
 }
 
 Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
-                        const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams) {
+                        const std::shared_ptr<CallGrants>& grants) {
   const SocketStream stream(socket_.get(), deadline);
   StreamIo stream_io;
-  return ExchangeFrames(request, deadline, stop, receiver, streams, request.synchronous ? &stream_io : nullptr,
+  return ExchangeFrames(request, deadline, stop, grants, request.synchronous ? &stream_io : nullptr,
                         [&stream](const Frame& outgoing) {
     WriteFrame([&stream](std::span<const std::byte> bytes) { stream.Write(bytes); }, outgoing);
     return ReadFrame([&stream](std::span<std::byte> bytes) { stream.Read(bytes); });

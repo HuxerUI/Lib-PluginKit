@@ -60,7 +60,8 @@ The Kit ABI and protocol, application contract version, and plugin release versi
 | `ExtensionHandle<T>` | A typed, revocable handle to an opened extension instance. |
 | `PluginContext` | Shared activation context containing the approved plugin identity, installed bundle directory, optional HuxerUI resources, and writable data directory. |
 | `Task<T>` | Lazy operation whose coroutine runs on its owning thread. |
-| `Receiver<T>` | Typed proxy for a caller-owned callback interface, scoped to one invocation. |
+| `std::shared_ptr<T>` | Typed proxy for a caller-owned callback interface, scoped to one invocation. |
+| `WireCodec<T>` | Optional mapping of a C++ value to a supported IPC representation. |
 
 The application owns one `huxerui::pluginkit::PluginManager` for each plugin profile it manages. `PluginManagerOptions` supplies the profile directory, trusted sources, execution policy, and callback executor. Registration of application extension points and host services completes before startup.
 
@@ -82,7 +83,7 @@ A package activation owns a single `PluginContext` for all factories and their i
 
 The activation opens the installed `resources/` directory once with `huxerui::Resources::OpenPackage()`, before `OnActivate()`. `PluginContext::Resources()` exposes this independent package in both execution modes. Its owner survives through `OnDeactivate()`. Resource indices, keys, lazy payload reads, and resolved asset lifetimes follow the HuxerUI SDK.
 
-The host records service grants and execution mode with the approved package digest. During a call, `GetService<T>()` synchronously returns a typed handle. The service implementation resolves the grant from the invocation. The caller supplies a `Receiver<T>` as a shared C++ callback argument, with access scoped to that invocation. See the [CSV example](../README.md#sdk-and-runtime).
+The host records service grants and execution mode with the approved package digest. During a call, `GetService<T>()` synchronously returns a typed handle. The service implementation resolves the grant from the invocation. The caller supplies a `std::shared_ptr<T>` as a shared C++ callback argument, with access scoped to that invocation. See the [CSV example](../README.md#sdk-and-runtime).
 
 The broader lifecycle design includes settings, logging, and lifetime cancellation. Kit tracks the tasks, subscriptions, streams, and grants acquired through the lifecycle API.
 
@@ -141,7 +142,9 @@ Worker exit completes pending calls with a failure and marks the generation faul
 
 ### Invocation streams
 
-An extension operation can take one HuxerUI input stream and one output stream by value. Synchronous operations use `InputStream` and `OutputStream`. Task operations use `AsyncInputStream` and `AsyncOutputStream`. The generator includes both stream types in the contract fingerprint. The host grants sequential access by providing an opened source or sink for that invocation. Local adapters call the original streams on the application's execution context. Worker adapters bind the stream slots to the invocation and exchange raw data in chunks up to 1 MiB. One chunk is in flight at a time, and each write waits for the host acknowledgement. The ordinary CBOR request and result limit remains 8 MiB.
+An extension operation can take multiple values, HuxerUI streams, and invocation-scoped host callback objects in declaration order. Synchronous operations use `InputStream` and `OutputStream`. Task operations use `AsyncInputStream` and `AsyncOutputStream` and can accept `std::shared_ptr<T>` to a published Task callback interface. The caller grants access to the supplied endpoints. The generated parameter list and value types are part of the contract fingerprint. A `WireCodec<T>` specialization can project an owning C++ value to a supported wire value for IPC.
+
+Local adapters call the original endpoints in the application execution context. Worker adapters use the one-based parameter position as the endpoint slot and route stream operations in chunks up to 1 MiB. Each call has one reverse operation in flight at a time. Output close state is tracked per slot, and success requires all outputs to be closed. The ordinary CBOR request and result limit is 8 MiB.
 
 Synchronous worker stream operations run on an independent host I/O thread. Their sources and sinks must be safe to move to that thread, and their callbacks must complete without the waiting application thread. Async stream operations run on the host application scope. Both modes share the invocation deadline and revoke access on termination. Pending native operations retain their own state until they finish, and late completions are discarded.
 

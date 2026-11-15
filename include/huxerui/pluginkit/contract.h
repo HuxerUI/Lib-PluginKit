@@ -13,11 +13,14 @@
 ///
 /// Place it on the class definition, as in `class HPK_REMOTE Importer`. Declare a public virtual
 /// destructor and public pure virtual operations with unique names. Operations may return a synchronous
-/// value, void, or HuxerUI Task<T>. Use contract-supported types and pass Task requests by value.
-/// An extension operation can take one SDK input stream and one SDK output stream by value. Declare the
-/// ordinary request first, then the input stream, output stream, and optional Receiver. Use synchronous
-/// stream types on synchronous methods and asynchronous types on Task methods. A Receiver requires a Task.
-/// Moving a stream into a call grants access for that invocation. Close a supplied output before returning.
+/// value, void, or HuxerUI Task<T>. Pass Task arguments by value. Synchronous methods can also borrow
+/// supported ordinary values by const reference for the duration of the call.
+/// Declare ordinary values and invocation endpoints in any order. Synchronous methods take InputStream
+/// and OutputStream. Task methods take AsyncInputStream and AsyncOutputStream and can also accept
+/// std::shared_ptr<T> to an HPK_REMOTE interface with Task operations. A null pointer omits that callback.
+/// Each stream or callback is granted for the invocation that receives it. Await callbacks from that
+/// invocation or an awaited child Task. Access expires at completion or cancellation. Successfully
+/// close every supplied output before returning.
 /// Leave operations able to throw so the binding can report failures. The macro expands to an annotation
 /// only when hpk gen parses the header.
 #if defined(HPK_GENERATOR)
@@ -83,16 +86,15 @@ class ExtensionHandle;
 template<class Interface>
 class ServiceHandle;
 
-/// @brief Optional host callback object supplied to one managed Task invocation.
+/// @brief Maps an application value to a supported wire value for IPC.
+/// @tparam T Owning value type used in a published contract.
 ///
-/// Pass an empty pointer to omit callbacks. When supplied, the host object is retained for the call and the
-/// plugin receives an invocation-scoped implementation. Await its methods from the owning invocation or an
-/// awaited child Task. A retained proxy fails with ReceiverClosed after completion, cancellation, or when
-/// called from a different execution.
-/// @tparam Interface HPK_REMOTE callback interface declared in its own header, with Task operations and
-/// at most one ordinary request per operation.
-template<class Interface>
-using Receiver = std::shared_ptr<Interface>;
+/// Specialize in the shared contract SDK. Declare a WireType alias, static WireType Encode(const T&),
+/// and static T Decode(WireType). Encode and Decode preserve the value's meaning. Decode constructs
+/// an independent value and reports an invalid representation by throwing. PluginKit encodes the
+/// representation with its bounded CBOR implementation. In-process calls use T directly.
+template<class T>
+struct WireCodec;
 
 /// @brief Machine-readable reason for a failed PluginKit operation.
 enum class ErrorCode : std::uint32_t {

@@ -74,12 +74,6 @@ enum hpk_status_v1 {
   HPK_IO = 12,
 };
 
-/// @brief Stream slots supplied by the caller for one invocation.
-enum hpk_stream_slot_v1 {
-  HPK_INPUT_STREAM = 1,
-  HPK_OUTPUT_STREAM = 2,
-};
-
 /// @brief Operations on the sequential stream slots.
 enum hpk_stream_operation_v1 {
   HPK_READ_STREAM = 1,
@@ -105,7 +99,7 @@ typedef void (HPK_CALL *hpk_complete_v1)(void* user, uint32_t status, hpk_buffer
 typedef struct hpk_host_v1 {
   /// @brief Queues a host service or receiver call on the application thread.
   /// @param invocation ID passed to invoke for the current call.
-  /// @param receiver Receiver slot passed to invoke, or zero to use a registered service.
+  /// @param receiver Receiver parameter position, or zero to use a registered service.
   /// @param service_id Null-terminated callback contract ID.
   /// @param version Callback contract version.
   /// @param fingerprint Null-terminated callback contract fingerprint.
@@ -173,8 +167,6 @@ typedef struct hpk_extension_v1 {
   /// @param instance Instance created by create.
   /// @param host Borrowed worker callbacks for this invocation.
   /// @param invocation Worker-assigned ID that identifies this call.
-  /// @param receiver Slot for the caller's receiver, or zero when there is none.
-  /// @param streams Bit mask of the input and output slots supplied by the caller.
   /// @param operation Operation number from the generated contract.
   /// @param data Encoded request bytes borrowed until this function returns.
   /// @param size Length of the request in bytes.
@@ -182,7 +174,7 @@ typedef struct hpk_extension_v1 {
   /// @param user Completion state borrowed from the worker until completion.
   /// @return HPK_OK on admission or an error from hpk_status_v1. A rejected call has no completion callback.
   int32_t (HPK_CALL *invoke)(void* instance, const hpk_host_v1* host, uint64_t invocation,
-                            uint32_t receiver, uint32_t streams, uint32_t operation, const uint8_t* data, uint32_t size,
+                            uint32_t operation, const uint8_t* data, uint32_t size,
                             hpk_complete_v1 complete, void* user);
 
   /// @brief Destroys an instance allocated by this factory.

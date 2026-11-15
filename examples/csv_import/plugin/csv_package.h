@@ -58,11 +58,11 @@ inline std::span<const std::byte> CsvBytes(std::string_view text) {
   return std::as_bytes(std::span(text.data(), text.size()));
 }
 
-inline std::size_t ConversionChunk(ConversionOptions options) {
-  if (!options.read_bytes || options.read_bytes > HPK_MAX_STREAM_CHUNK) {
+inline std::size_t ConversionChunk(std::uint32_t read_bytes) {
+  if (!read_bytes || read_bytes > HPK_MAX_STREAM_CHUNK) {
     throw huxerui::pluginkit::Error(huxerui::pluginkit::ErrorCode::InvalidArgument, "Invalid CSV conversion read size");
   }
-  return options.read_bytes;
+  return read_bytes;
 }
 
 inline huxerui::Bytes TakeBytes(std::string& text) {
@@ -73,7 +73,7 @@ inline huxerui::Bytes TakeBytes(std::string& text) {
 }
 
 struct CsvConversion {
-  explicit CsvConversion(std::uint32_t limit) : records(';', limit) {}
+  CsvConversion(char separator, std::uint32_t limit) : records(separator, limit) {}
 
   void Feed(std::span<const std::byte> bytes) {
     summary.input_bytes += bytes.size();
@@ -132,8 +132,38 @@ public:
   }
 
   CsvSummary Convert(ConversionOptions options, huxerui::InputStream input, huxerui::OutputStream output) override {
-    CsvConversion conversion(cell_limit_);
-    huxerui::Bytes bytes(ConversionChunk(options));
+    return ConvertOne(std::move(input), ';', std::move(output), options.read_bytes);
+  }
+
+  huxerui::Task<CsvSummary> ConvertAsync(ConversionOptions options, huxerui::AsyncInputStream input,
+      huxerui::AsyncOutputStream output, std::shared_ptr<ImportProgress> progress) override {
+    return ConvertOneAsync(std::move(input), ';', std::move(output), options.read_bytes, std::move(progress));
+  }
+
+  PairSummary ConvertPair(huxerui::InputStream first, const Separator& separator,
+      huxerui::OutputStream first_csv, std::uint32_t read_bytes,
+      huxerui::OutputStream second_csv, huxerui::InputStream second) override {
+    const auto a = ConvertOne(std::move(first), separator.Text().front(), std::move(first_csv), read_bytes);
+    const auto b = ConvertOne(std::move(second), separator.Text().front(), std::move(second_csv), read_bytes);
+    return {a, b, separator};
+  }
+
+  huxerui::Task<PairSummary> ConvertPairAsync(huxerui::AsyncInputStream first, Separator separator,
+      std::shared_ptr<ImportProgress> first_progress, huxerui::AsyncOutputStream first_csv,
+      std::uint32_t read_bytes, huxerui::AsyncOutputStream second_csv,
+      std::shared_ptr<ImportProgress> second_progress, huxerui::AsyncInputStream second) override {
+    const auto a = co_await ConvertOneAsync(
+        std::move(first), separator.Text().front(), std::move(first_csv), read_bytes, std::move(first_progress));
+    const auto b = co_await ConvertOneAsync(
+        std::move(second), separator.Text().front(), std::move(second_csv), read_bytes, std::move(second_progress));
+    co_return PairSummary{a, b, std::move(separator)};
+  }
+
+private:
+  CsvSummary ConvertOne(huxerui::InputStream input, char separator, huxerui::OutputStream output,
+                        std::uint32_t read_bytes) {
+    CsvConversion conversion(separator, cell_limit_);
+    huxerui::Bytes bytes(ConversionChunk(read_bytes));
     const auto flush = [&] {
       RequireIo(output.Write(CsvBytes(conversion.buffer)));
       conversion.summary.output_bytes += conversion.buffer.size();
@@ -149,10 +179,10 @@ public:
     return conversion.summary;
   }
 
-  huxerui::Task<CsvSummary> ConvertAsync(ConversionOptions options, huxerui::AsyncInputStream input,
-      huxerui::AsyncOutputStream output, huxerui::pluginkit::Receiver<ImportProgress> progress) override {
-    CsvConversion conversion(cell_limit_);
-    const auto chunk = ConversionChunk(options);
+  huxerui::Task<CsvSummary> ConvertOneAsync(huxerui::AsyncInputStream input, char separator,
+      huxerui::AsyncOutputStream output, std::uint32_t read_bytes, std::shared_ptr<ImportProgress> progress) {
+    CsvConversion conversion(separator, cell_limit_);
+    const auto chunk = ConversionChunk(read_bytes);
     const auto flush = [&]() -> huxerui::Task<void> {
       const auto size = conversion.buffer.size();
       if (size) RequireIo(co_await output.WriteAsync(TakeBytes(conversion.buffer)));
@@ -166,17 +196,18 @@ public:
       if (conversion.buffer.size() >= CsvChunkSize) co_await flush();
       if (progress && reported != conversion.summary.rows) {
         reported = conversion.summary.rows;
-        co_await progress->OnRows({reported});
+        co_await progress->OnRows(reported, conversion.summary.input_bytes);
       }
     }
     conversion.Finish();
     co_await flush();
-    if (progress && reported != conversion.summary.rows) co_await progress->OnRows({conversion.summary.rows});
+    if (progress && reported != conversion.summary.rows) {
+      co_await progress->OnRows(conversion.summary.rows, conversion.summary.input_bytes);
+    }
     RequireIo(co_await output.CloseAsync());
     co_return conversion.summary;
   }
 
-private:
   std::uint32_t cell_limit_;
 };
 

@@ -52,7 +52,7 @@ class HostEndpoint {
 public:
   /// @brief Binds to the worker invocation and the selected callback target.
   /// @param invocation Worker invocation that owns the endpoint.
-  /// @param receiver Slot passed to plugin dispatch, or zero to look up a service by contract.
+  /// @param receiver Parameter slot in the current invocation, or zero to look up a service by contract.
   explicit HostEndpoint(HostInvocation invocation, std::uint32_t receiver = 0)
       : invocation_(invocation), receiver_(receiver) {}
 
@@ -100,17 +100,6 @@ private:
 
   HostInvocation invocation_;
   std::uint32_t receiver_;
-};
-
-/// @brief Worker invocation information used to bind the caller's receiver and streams.
-/// Host service and receiver dispatch use an empty context.
-struct DispatchContext {
-  /// Worker callback table and identity, borrowed for the duration of the invocation.
-  HostInvocation invocation{};
-  /// Invocation's receiver slot, or zero if the caller supplied no receiver.
-  std::uint32_t receiver = 0;
-  /// Bit mask of the invocation's supplied stream slots.
-  std::uint32_t streams = 0;
 };
 
 // The plugin owns its thread-local storage even when it is loaded into the host process.
@@ -166,23 +155,23 @@ ServiceTarget<Interface> ResolveService(const Invocation& invocation) {
   throw Error(ErrorCode::ServiceUnavailable, "The invocation has no host service endpoint");
 }
 
-template<class Result>
+template<class Result, class Interface>
 Result DecodeResult(std::span<const std::byte> payload) {
   if constexpr (std::is_void_v<Result>) {
     if (!payload.empty()) throw Error(ErrorCode::Protocol, "A void operation returned a payload");
   } else {
-    return Decode<Result>(payload);
+    return Decode<Result, Interface>(payload);
   }
 }
 
-template<class Result>
+template<class Result, class Interface>
 Task<Result> InvokeHost(HostEndpoint endpoint, ContractInfo contract, std::uint32_t operation, Bytes request) {
   auto execution = co_await CurrentTaskExecution{};
   auto response = co_await AwaitCallback<Bytes>([&](CallbackCompletion<Bytes> complete) {
     endpoint.Start(contract, operation, request, execution, std::move(complete));
     return std::function<void()>{};
   });
-  co_return DecodeResult<Result>(response);
+  co_return DecodeResult<Result, Interface>(response);
 }
 
 } // namespace detail

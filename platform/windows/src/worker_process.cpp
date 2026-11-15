@@ -144,10 +144,10 @@ void Worker::ObserveProcessExit() noexcept {
 }
 
 Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
-                        const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams) {
+                        const std::shared_ptr<CallGrants>& grants) {
   StreamIo stream_io;
   // A separate pipe helper lets the request thread enforce the I/O deadline.
-  return ExchangeFrames(request, deadline, stop, receiver, streams, request.synchronous ? &stream_io : nullptr,
+  return ExchangeFrames(request, deadline, stop, grants, request.synchronous ? &stream_io : nullptr,
                         [this, deadline, activate = request.code == static_cast<std::uint32_t>(Command::Activate)]
                         (const Frame& outgoing) {
     std::packaged_task<Frame()> exchange([this, &outgoing] {

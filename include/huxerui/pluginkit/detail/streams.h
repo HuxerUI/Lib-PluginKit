@@ -1,7 +1,7 @@
 #pragma once
 
 /// @file
-/// @brief Invocation-owned sources and SDK stream adapters used by generated bindings.
+/// @brief Invocation grants and SDK stream adapters used by generated bindings.
 
 #include <huxerui/pluginkit/detail/invocation.h>
 #include <huxerui/stream.h>
@@ -10,142 +10,202 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <type_traits>
 #include <variant>
 
 namespace huxerui::pluginkit::detail {
 
 inline constexpr std::size_t MaxStreamChunk = HPK_MAX_STREAM_CHUNK;
 
-using StreamInput = std::variant<std::monostate, InputStream, AsyncInputStream>;
-using StreamOutput = std::variant<std::monostate, OutputStream, AsyncOutputStream>;
-
-struct StreamSources {
-  StreamInput input;
-  StreamOutput output;
+struct ReceiverRegistration {
+  ContractInfo contract;
+  std::shared_ptr<void> implementation;
+  Task<Bytes> (*dispatch)(void*, std::uint32_t, Bytes);
 };
 
-// An active operation retains the endpoints while the call revokes access to them.
-class CallStreams {
-public:
-  CallStreams(StreamInput input, StreamOutput output)
-      : slots_((input.index() ? static_cast<std::uint32_t>(HPK_INPUT_STREAM) : 0u) |
-               (output.index() ? static_cast<std::uint32_t>(HPK_OUTPUT_STREAM) : 0u)),
-        sources_(std::make_shared<StreamSources>(StreamSources{std::move(input), std::move(output)})) {}
+class CallGrants : public std::enable_shared_from_this<CallGrants> {
+  using Endpoint = std::variant<InputStream, OutputStream, AsyncInputStream, AsyncOutputStream, ReceiverRegistration>;
+  struct Slot {
+    Endpoint endpoint;
+    bool output_closed = false;
+    bool output_failed = false;
+  };
 
-  std::uint32_t Slots() const noexcept { return slots_; }
+public:
+  // Revocation drops the table's references. An admitted operation keeps only its own endpoint alive.
+  class Access {
+  public:
+    Access() = default;
+    Access(Access&&) noexcept = default;
+    Access(const Access&) = delete;
+    Access& operator=(const Access&) = delete;
+    ~Access() {
+      if (owner_) {
+        std::lock_guard lock(owner_->mutex_);
+        owner_->active_ = false;
+      }
+    }
+
+    template<class T>
+    T& Get() const { return std::get<T>(slot_->endpoint); }
+
+  private:
+    friend class CallGrants;
+    Access(std::shared_ptr<CallGrants> owner, std::shared_ptr<Slot> slot)
+        : owner_(std::move(owner)), slot_(std::move(slot)) {}
+    std::shared_ptr<CallGrants> owner_;
+    std::shared_ptr<Slot> slot_;
+  };
+
+  explicit CallGrants(std::size_t count) : slots_(count) {}
+
+  // Bind arguments before publishing the invocation. Slots are the one-based parameter positions.
+  template<class T>
+  void Add(std::uint32_t slot, T endpoint) {
+    slots_.at(slot - 1) = std::make_shared<Slot>(Slot{Endpoint(std::move(endpoint))});
+  }
+
+  bool Has(std::uint32_t slot) {
+    std::lock_guard lock(mutex_);
+    return Find(slot) != nullptr;
+  }
+
+  void SetDeadline(std::chrono::steady_clock::time_point deadline) {
+    std::lock_guard lock(mutex_);
+    deadline_ = deadline;
+  }
 
   void Revoke() noexcept {
-    std::shared_ptr<StreamSources> released;
+    std::vector<std::shared_ptr<Slot>> released;
     {
       std::lock_guard lock(mutex_);
-      released = std::move(sources_);
+      revoked_ = true;
+      released.swap(slots_);
     }
   }
 
-  void SetDeadline(std::chrono::steady_clock::time_point deadline) noexcept { deadline_ = deadline; }
+  void Complete() {
+    std::vector<std::shared_ptr<Slot>> released;
+    {
+      std::lock_guard lock(mutex_);
+      if (revoked_) throw Error(ErrorCode::Closed, "The invocation grants have been revoked");
+      if (active_) throw Error(ErrorCode::Busy, "An invocation callback is still active");
+      for (const auto& slot : slots_) {
+        if (slot && (std::holds_alternative<OutputStream>(slot->endpoint) ||
+                     std::holds_alternative<AsyncOutputStream>(slot->endpoint)) && !slot->output_closed) {
+          throw Error(ErrorCode::Io, "The plugin did not successfully close every output stream");
+        }
+      }
+      revoked_ = true;
+      released.swap(slots_);
+    }
+  }
 
-  void CheckOutput() {
+  Access AcquireService() {
     std::lock_guard lock(mutex_);
-    if (active_) throw Error(ErrorCode::Busy, "A stream operation is still active");
-    if ((slots_ & HPK_OUTPUT_STREAM) && !output_closed_) {
-      throw Error(ErrorCode::Io, "The plugin did not successfully close its output stream");
+    if (revoked_) throw Error(ErrorCode::Closed, "The invocation grants have been revoked");
+    return Begin({});
+  }
+
+  Access AcquireReceiver(std::uint32_t slot, ContractInfo contract) {
+    auto access = Acquire<ReceiverRegistration>(slot, ErrorCode::ReceiverClosed);
+    if (access.Get<ReceiverRegistration>().contract != contract) {
+      throw Error(ErrorCode::ContractMismatch, "Receiver contract does not match");
     }
+    return access;
   }
 
-  IoResult<std::size_t> Read(std::span<std::byte> buffer) {
-    auto access = Acquire(HPK_INPUT_STREAM);
-    return Get<InputStream>(access.sources->input).Read(buffer);
+  IoResult<std::size_t> Read(std::uint32_t slot, std::span<std::byte> buffer) {
+    auto access = Acquire<InputStream>(slot);
+    return access.Get<InputStream>().Read(buffer);
   }
 
-  Task<IoResult<Bytes>> ReadAsync(std::size_t count) {
-    auto access = Acquire(HPK_INPUT_STREAM);
-    co_return co_await Get<AsyncInputStream>(access.sources->input).ReadAsync(count);
+  Task<IoResult<Bytes>> ReadAsync(std::uint32_t slot, std::size_t count) {
+    auto access = Acquire<AsyncInputStream>(slot);
+    co_return co_await access.Get<AsyncInputStream>().ReadAsync(count);
   }
 
-  IoResult<void> Write(std::span<const std::byte> bytes) {
-    auto access = Acquire(HPK_OUTPUT_STREAM);
-    auto result = Get<OutputStream>(access.sources->output).Write(bytes);
-    SetOutputState(result, false);
+  IoResult<void> Write(std::uint32_t slot, std::span<const std::byte> bytes) {
+    auto access = Acquire<OutputStream>(slot);
+    auto result = access.Get<OutputStream>().Write(bytes);
+    RecordOutput(access, result, false);
     return result;
   }
 
-  Task<IoResult<void>> WriteAsync(Bytes bytes) {
-    auto access = Acquire(HPK_OUTPUT_STREAM);
-    auto result = co_await Get<AsyncOutputStream>(access.sources->output).WriteAsync(std::move(bytes));
-    SetOutputState(result, false);
+  Task<IoResult<void>> WriteAsync(std::uint32_t slot, Bytes bytes) {
+    auto access = Acquire<AsyncOutputStream>(slot);
+    auto result = co_await access.Get<AsyncOutputStream>().WriteAsync(std::move(bytes));
+    RecordOutput(access, result, false);
     co_return result;
   }
 
-  IoResult<void> Close() {
-    auto access = Acquire(HPK_OUTPUT_STREAM);
-    auto result = Get<OutputStream>(access.sources->output).Close();
-    SetOutputState(result, true);
+  IoResult<void> Close(std::uint32_t slot) {
+    auto access = Acquire<OutputStream>(slot);
+    auto result = access.Get<OutputStream>().Close();
+    RecordOutput(access, result, true);
     return result;
   }
 
-  Task<IoResult<void>> CloseAsync() {
-    auto access = Acquire(HPK_OUTPUT_STREAM);
-    auto result = co_await Get<AsyncOutputStream>(access.sources->output).CloseAsync();
-    SetOutputState(result, true);
+  Task<IoResult<void>> CloseAsync(std::uint32_t slot) {
+    auto access = Acquire<AsyncOutputStream>(slot);
+    auto result = co_await access.Get<AsyncOutputStream>().CloseAsync();
+    RecordOutput(access, result, true);
     co_return result;
   }
 
 private:
-  struct Access {
-    Access(CallStreams& owner, std::shared_ptr<StreamSources> sources) : owner(owner), sources(std::move(sources)) {}
-    Access(const Access&) = delete;
-    Access& operator=(const Access&) = delete;
+  std::shared_ptr<Slot> Find(std::uint32_t slot) const {
+    return slot && slot <= slots_.size() ? slots_[slot - 1] : nullptr;
+  }
 
-    CallStreams& owner;
-    std::shared_ptr<StreamSources> sources;
-    ~Access() {
-      std::lock_guard lock(owner.mutex_);
-      owner.active_ = false;
-    }
-  };
-
-  Access Acquire(std::uint32_t slot) {
-    std::lock_guard lock(mutex_);
-    if (!sources_ || !(slots_ & slot)) throw Error(ErrorCode::Closed, "The stream is outside its owning invocation");
+  Access Begin(std::shared_ptr<Slot> entry) {
     if (std::chrono::steady_clock::now() >= deadline_) {
-      throw Error(ErrorCode::DeadlineExceeded, "The stream operation exceeded the invocation deadline");
+      throw Error(ErrorCode::DeadlineExceeded, "The callback exceeded the invocation deadline");
     }
-    if (active_) throw Error(ErrorCode::Busy, "The invocation already has an active stream operation");
-    if (slot == HPK_OUTPUT_STREAM) {
-      if (output_failed_ || output_closed_) throw Error(ErrorCode::Closed, "The invocation output stream is closed");
-      // Only a completed write or close can clear this state, including when the backend throws.
-      output_failed_ = true;
-    }
+    if (active_) throw Error(ErrorCode::Busy, "The invocation already has an active callback");
+    auto owner = shared_from_this();
     active_ = true;
-    return {*this, sources_};
+    return {std::move(owner), std::move(entry)};
   }
 
-  template<class Stream, class Sources>
-  static Stream& Get(Sources& sources) {
-    const auto stream = std::get_if<Stream>(&sources);
-    if (!stream) throw Error(ErrorCode::Protocol, "The stream type differs from the invoked contract");
-    return *stream;
-  }
-
-  void SetOutputState(const IoResult<void>& result, bool close) {
+  template<class T>
+  Access Acquire(std::uint32_t slot, ErrorCode closed = ErrorCode::Closed) {
     std::lock_guard lock(mutex_);
-    output_failed_ = !result.Succeeded();
-    output_closed_ = close && result.Succeeded();
+    auto entry = Find(slot);
+    if (!entry) throw Error(closed, "The endpoint is outside its owning invocation");
+    if (!std::holds_alternative<T>(entry->endpoint)) {
+      throw Error(ErrorCode::Protocol, "The invocation endpoint has a different type");
+    }
+    if constexpr (std::is_same_v<T, OutputStream> || std::is_same_v<T, AsyncOutputStream>) {
+      if (entry->output_failed || entry->output_closed) {
+        throw Error(ErrorCode::Closed, "The invocation output stream is closed");
+      }
+      auto access = Begin(entry);
+      // A failed or interrupted write or close must prevent a successful invocation.
+      entry->output_failed = true;
+      return access;
+    } else {
+      return Begin(std::move(entry));
+    }
   }
 
-  const std::uint32_t slots_;
+  void RecordOutput(const Access& access, const IoResult<void>& result, bool close) {
+    std::lock_guard lock(mutex_);
+    access.slot_->output_failed = !result.Succeeded();
+    access.slot_->output_closed = close && result.Succeeded();
+  }
+
   std::chrono::steady_clock::time_point deadline_ = std::chrono::steady_clock::time_point::max();
   std::mutex mutex_;
-  std::shared_ptr<StreamSources> sources_;
+  std::vector<std::shared_ptr<Slot>> slots_;
   bool active_ = false;
-  bool output_failed_ = false;
-  bool output_closed_ = false;
+  bool revoked_ = false;
 };
 
-struct RevokeStreams {
-  std::shared_ptr<CallStreams> streams;
-  ~RevokeStreams() {
-    if (streams) streams->Revoke();
+struct RevokeGrants {
+  std::shared_ptr<CallGrants> grants;
+  ~RevokeGrants() {
+    if (grants) grants->Revoke();
   }
 };
 
@@ -175,10 +235,10 @@ inline void CheckAsyncStream(const TaskExecution& owner, const TaskExecution& cu
   }
 }
 
-InputStream LocalInput(const std::shared_ptr<CallStreams>& streams);
-OutputStream LocalOutput(const std::shared_ptr<CallStreams>& streams);
-AsyncInputStream LocalInput(const std::shared_ptr<CallStreams>& streams, TaskExecution execution);
-AsyncOutputStream LocalOutput(const std::shared_ptr<CallStreams>& streams, TaskExecution execution);
+InputStream LocalInput(const std::shared_ptr<CallGrants>& grants, std::uint32_t slot);
+OutputStream LocalOutput(const std::shared_ptr<CallGrants>& grants, std::uint32_t slot);
+AsyncInputStream LocalInput(const std::shared_ptr<CallGrants>& grants, std::uint32_t slot, TaskExecution execution);
+AsyncOutputStream LocalOutput(const std::shared_ptr<CallGrants>& grants, std::uint32_t slot, TaskExecution execution);
 
 // The callback's diagnostic storage belongs to the transport. Copy a bounded reply before returning.
 inline IoResult<Bytes> ReceiveStreamReply(std::uint32_t status, hpk_buffer_v1 buffer) {
@@ -203,10 +263,10 @@ public:
 
   const void* Owner() const noexcept { return invocation_.get(); }
 
-  InputStream Input() const {
-    return InputStream::FromReader([self = *this](std::span<std::byte> buffer) -> IoResult<std::size_t> {
+  InputStream Input(std::uint32_t slot) const {
+    return InputStream::FromReader([self = *this, slot](std::span<std::byte> buffer) -> IoResult<std::size_t> {
       const auto count = (std::min)(buffer.size(), MaxStreamChunk);
-      auto data = self.Sync(HPK_INPUT_STREAM, HPK_READ_STREAM, count);
+      auto data = self.Sync(slot, HPK_READ_STREAM, count);
       if (!data.Succeeded()) return IoResult<std::size_t>(std::move(data).Error());
       const auto& bytes = data.Value();
       if (bytes.size() > count) throw Error(ErrorCode::Protocol, "The host returned more than the requested bytes");
@@ -215,25 +275,25 @@ public:
     });
   }
 
-  OutputStream Output() const {
+  OutputStream Output(std::uint32_t slot) const {
     return OutputStream::FromWriter(
-        [self = *this](std::span<const std::byte> bytes) -> IoResult<void> {
+        [self = *this, slot](std::span<const std::byte> bytes) -> IoResult<void> {
           while (!bytes.empty()) {
             const auto chunk = bytes.first((std::min)(bytes.size(), MaxStreamChunk));
-            auto result = Acknowledge(self.Sync(HPK_OUTPUT_STREAM, HPK_WRITE_STREAM, 0, chunk));
+            auto result = Acknowledge(self.Sync(slot, HPK_WRITE_STREAM, 0, chunk));
             if (!result.Succeeded()) return result;
             bytes = bytes.subspan(chunk.size());
           }
           return IoResult<void>::Success();
         },
-        [self = *this] { return Acknowledge(self.Sync(HPK_OUTPUT_STREAM, HPK_CLOSE_STREAM, 0)); });
+        [self = *this, slot] { return Acknowledge(self.Sync(slot, HPK_CLOSE_STREAM, 0)); });
   }
 
-  AsyncInputStream AsyncInput() const {
+  AsyncInputStream AsyncInput(std::uint32_t slot) const {
     return AsyncInputStream::FromReader(
-        [self = *this](std::stop_token stop, std::size_t count) -> Task<IoResult<Bytes>> {
+        [self = *this, slot](std::stop_token stop, std::size_t count) -> Task<IoResult<Bytes>> {
           count = (std::min)(count, MaxStreamChunk);
-          auto result = co_await self.Async(HPK_INPUT_STREAM, HPK_READ_STREAM, count, {}, stop);
+          auto result = co_await self.Async(slot, HPK_READ_STREAM, count, {}, stop);
           if (result.Succeeded() && result.Value().size() > count) {
             throw Error(ErrorCode::Protocol, "The host returned more than the requested bytes");
           }
@@ -241,21 +301,21 @@ public:
         });
   }
 
-  AsyncOutputStream AsyncOutput() const {
+  AsyncOutputStream AsyncOutput(std::uint32_t slot) const {
     return AsyncOutputStream::FromWriter(
-        [self = *this](std::stop_token stop, Bytes bytes) -> Task<IoResult<void>> {
+        [self = *this, slot](std::stop_token stop, Bytes bytes) -> Task<IoResult<void>> {
           auto remaining = std::span<const std::byte>(bytes);
           while (!remaining.empty()) {
             const auto chunk = remaining.first((std::min)(remaining.size(), MaxStreamChunk));
-            auto response = co_await self.Async(HPK_OUTPUT_STREAM, HPK_WRITE_STREAM, 0, chunk, stop);
+            auto response = co_await self.Async(slot, HPK_WRITE_STREAM, 0, chunk, stop);
             auto result = Acknowledge(std::move(response));
             if (!result.Succeeded()) co_return result;
             remaining = remaining.subspan(chunk.size());
           }
           co_return IoResult<void>::Success();
         },
-        [self = *this](std::stop_token stop) -> Task<IoResult<void>> {
-          co_return Acknowledge(co_await self.Async(HPK_OUTPUT_STREAM, HPK_CLOSE_STREAM, 0, {}, stop));
+        [self = *this, slot](std::stop_token stop) -> Task<IoResult<void>> {
+          co_return Acknowledge(co_await self.Async(slot, HPK_CLOSE_STREAM, 0, {}, stop));
         });
   }
 

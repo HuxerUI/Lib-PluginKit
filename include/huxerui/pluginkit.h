@@ -371,9 +371,9 @@ private:
 /// huxerui::Task<csv_import::ImportResult> ReadTable(huxerui::pluginkit::PluginManager& plugins,
 ///                                                const huxerui::pluginkit::ExtensionInfo& candidate,
 ///                                                std::shared_ptr<csv_import::ImportProgress> progress,
-///                                                const std::string& csv) {
+///                                                huxerui::AsyncInputStream input) {
 ///   auto importer = plugins.CreateExtension(csv_import::Importers, candidate);
-///   co_return co_await importer->Import({csv}, std::move(progress));
+///   co_return co_await importer->Import(std::move(input), std::move(progress));
 /// }
 /// @endcode
 /// @see ExtensionPoint, ExtensionHandle

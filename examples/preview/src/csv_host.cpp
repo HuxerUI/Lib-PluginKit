@@ -1,6 +1,9 @@
 #include "csv_host.h"
 #include "windowless_runtime.h"
 
+#include "record/codec_record.bindings.h"
+#include "reordered/codec_record.bindings.h"
+#include "mapped/codec_mapped.bindings.h"
 #include "csv_contract.host.h"
 #include "exporters/export_contract.host.h"
 #include "services/import_status.bindings.h"
@@ -54,7 +57,35 @@ constexpr char CommandHelp[] =
     "inspect <package>, install <package> <digest> <in_process|worker_process> [status], list, "
     "upgrade <package> <installed-digest> <approved-digest> [status], uninstall <id> <digest> [delete-data], "
     "enable <id>, disable <id>, status, import <file> [plugin-id] [timeout-ms], "
-    "round-trip <csv-file> <ssv-file> <plugin-id>, convert <sync|async> <ssv-file> <csv-file> <plugin-id> [chunk-kib], quit";
+    "round-trip <csv-file> <ssv-file> <plugin-id>, convert <sync|async> <ssv-file> <csv-file> <plugin-id> [chunk-kib], "
+    "convert-pair <sync|async> <first-input> <first-output> <second-input> <second-output> <plugin-id>, quit";
+
+void CheckContractCodecs() {
+  using namespace csv_import::codec_check;
+  using huxerui::Bytes;
+  using huxerui::pluginkit::Contract;
+  using huxerui::pluginkit::detail::Decode;
+  using huxerui::pluginkit::detail::Encode;
+
+  static_assert(Contract<RecordColumns>::Info.id == Contract<ReorderedColumns>::Info.id);
+  static_assert(Contract<RecordColumns>::Info.fingerprint != Contract<ReorderedColumns>::Info.fingerprint);
+
+  const ColumnCounts counts{ColumnCount{19}};
+  const auto record = Encode<RecordColumns>(counts);
+  const auto mapped = Encode<MappedColumns>(counts);
+  // The same nested value is a CBOR record in one contract and a scalar in the other.
+  if (record != Bytes{std::byte{0x81}, std::byte{0x81}, std::byte{0x81}, std::byte{19}} ||
+      mapped != Bytes{std::byte{0x81}, std::byte{0x81}, std::byte{19}} ||
+      Decode<ColumnCounts, RecordColumns>(record).at(0).value().value != 19 ||
+      Decode<ColumnCounts, MappedColumns>(mapped).at(0).value().value != 19) {
+    throw Error(ErrorCode::PluginFailed, "The generated contracts did not retain their wire representations");
+  }
+
+  constexpr double scale = 1.25;
+  if (Decode<double, MappedColumns>(Encode<MappedColumns>(scale)) != scale) {
+    throw Error(ErrorCode::PluginFailed, "The explicit scalar mapping did not round-trip");
+  }
+}
 
 void RegisterPoints(PluginManager& manager) {
   manager.RegisterExtensionPoint(Importers);
@@ -97,8 +128,8 @@ private:
 
 class PreviewProgress final : public csv_import::ImportProgress {
 public:
-  Task<void> OnRows(csv_import::ImportedRows update) override {
-    const auto value = co_await huxerui::RunWorker([](std::uint32_t rows) { return rows; }, update.rows);
+  Task<void> OnRows(std::uint32_t count, std::uint64_t) override {
+    const auto value = co_await huxerui::RunWorker([](std::uint32_t rows) { return rows; }, count);
     if (std::this_thread::get_id() != owner_) {
       throw Error(ErrorCode::PluginFailed, "Import progress must be handled on the preview thread");
     }
@@ -122,7 +153,7 @@ class HeldProgress final : public csv_import::ImportProgress {
 public:
   explicit HeldProgress(std::shared_ptr<ProgressGate> gate) : gate_(std::move(gate)) {}
 
-  Task<void> OnRows(csv_import::ImportedRows) override {
+  Task<void> OnRows(std::uint32_t, std::uint64_t) override {
     gate_->rows = co_await AwaitCallback<std::uint32_t>([gate = gate_](auto resolve) {
       gate->complete = std::move(resolve);
       gate->started = true;
@@ -190,13 +221,15 @@ huxerui::AsyncInputStream StringInput(std::string text) {
 
 class ConversionProgress final : public csv_import::ImportProgress {
 public:
-  Task<void> OnRows(csv_import::ImportedRows update) override {
-    rows = update.rows;
+  Task<void> OnRows(std::uint32_t count, std::uint64_t bytes) override {
+    rows = count;
+    input_bytes = bytes;
     before_eof = before_eof || !eof;
     co_return;
   }
 
   std::uint32_t rows = 0;
+  std::uint64_t input_bytes = 0;
   bool before_eof = false;
   bool eof = false;
 };
@@ -455,6 +488,46 @@ Task<Json> Convert(PluginManager& manager, const std::vector<std::string>& args)
                  {"plugin_pid", pid}, {"progress_before_eof", progress->before_eof}, {"progress_rows", progress->rows}};
 }
 
+Task<Json> ConvertPair(PluginManager& manager, const std::vector<std::string>& args) {
+  const bool synchronous = args[1] == "sync";
+  if (!synchronous && args[1] != "async") throw Error(ErrorCode::InvalidArgument, "Expected sync or async conversion");
+  const File first_source(args[2]), first_destination(args[3]), second_source(args[4]), second_destination(args[5]);
+  const auto option = args.size() == 8 ? std::string_view(args[7]) : std::string_view{};
+  auto exporter = manager.CreateExtension(Exporters, args[6], std::chrono::seconds(30));
+  auto first_stage = StageOutput(first_destination);
+  auto second_stage = StageOutput(second_destination);
+  constexpr std::uint32_t read_bytes = 512 * 1024;
+  auto first_progress = !synchronous && option != "omit-first" ? std::make_shared<ConversionProgress>() : nullptr;
+  auto second_progress = !synchronous && option != "omit-second" ? std::make_shared<ConversionProgress>() : nullptr;
+  const auto pid = exporter->ProcessId();
+  std::optional<csv_import::PairSummary> summary;
+  if (synchronous) {
+    auto first = RequireIo(first_source.OpenRead());
+    auto second = RequireIo(second_source.OpenRead());
+    summary.emplace(exporter->ConvertPair(std::move(first), csv_import::Separator(";"), OpenStaged(first_stage),
+        read_bytes, OpenStaged(second_stage), std::move(second)));
+  } else {
+    auto first = RequireIo(co_await first_source.OpenReadAsync());
+    auto second = RequireIo(co_await second_source.OpenReadAsync());
+    const auto fault = option == "write-second" ? std::string_view("write") : std::string_view{};
+    summary.emplace(co_await exporter->ConvertPairAsync(
+        std::move(first), csv_import::Separator(";"), first_progress, OpenStagedAsync(first_stage, {}), read_bytes,
+        OpenStagedAsync(second_stage, fault), second_progress, std::move(second)));
+  }
+  // Both staged outputs have closed successfully before the host begins either publication.
+  if (!(co_await first_stage->file.MoveToAsync(first_destination, true)) ||
+      !(co_await second_stage->file.MoveToAsync(second_destination, true))) {
+    throw Error(ErrorCode::Io, "Cannot publish CSV output");
+  }
+  const auto counts = [](const csv_import::CsvSummary& converted, const std::shared_ptr<ConversionProgress>& progress) {
+    return Json{{"rows", converted.rows}, {"input_bytes", converted.input_bytes}, {"output_bytes", converted.output_bytes},
+                {"progress_rows", progress ? Json(progress->rows) : Json(nullptr)},
+                {"progress_bytes", progress ? Json(progress->input_bytes) : Json(nullptr)}};
+  };
+  co_return Json{{"first", counts(summary->first, first_progress)}, {"second", counts(summary->second, second_progress)},
+                 {"separator", summary->separator.Text()}, {"plugin_pid", pid}};
+}
+
 struct HeldStreamOperation {
   template<class T>
   Task<IoResult<T>> Hold(std::stop_token token) {
@@ -483,12 +556,19 @@ Task<Json> CheckStreamInterruption(PluginManager& manager, std::string_view plug
         if (writing) co_return co_await gate->Hold<void>(stop);
         co_return IoResult<void>::Success();
       });
+  auto first_output = AsyncOutputStream::FromWriter(
+      [](std::stop_token, huxerui::Bytes) -> Task<IoResult<void>> { co_return IoResult<void>::Success(); });
+  auto first_progress = std::make_shared<ConversionProgress>();
+  auto second_progress = std::make_shared<ConversionProgress>();
+  const std::weak_ptr<ConversionProgress> first_callback = first_progress;
+  const std::weak_ptr<ConversionProgress> second_callback = second_progress;
   auto outcome = std::make_shared<CallOutcome>();
-  const auto tasks = UseApplicationTaskScope();
-  const auto handle = tasks.Launch(ObserveCall(exporter->ConvertAsync({}, std::move(input), std::move(output), nullptr), outcome));
+  const auto handle = UseApplicationTaskScope().Launch(ObserveCall(
+      exporter->ConvertPairAsync(StringInput("x;y\n1;2\n"), csv_import::Separator(";"), std::move(first_progress),
+          std::move(first_output), 512 * 1024, std::move(output), std::move(second_progress), std::move(input)), outcome));
   co_await WaitFor([gate] { return gate->started; });
   if (!deadline) handle.Cancel();
-  co_await WaitFor([gate] { return gate->cancelled; });
+  co_await WaitFor([&] { return gate->cancelled && first_callback.expired() && second_callback.expired(); });
   gate->late();
   if (deadline) {
     co_await WaitFor([outcome] { return outcome->done; });
@@ -611,19 +691,27 @@ Task<void> CheckWorkerExitDuringCallback(PluginManager& manager, std::string_vie
       [stream](std::stop_token stop, std::size_t) { return stream->Hold<huxerui::Bytes>(stop); });
   auto written = std::make_shared<std::size_t>(0);
   const std::weak_ptr<std::size_t> output_lifetime = written;
-  auto output = AsyncOutputStream::FromWriter(
-      [written = std::move(written)](std::stop_token, huxerui::Bytes bytes) -> Task<IoResult<void>> {
-        *written += bytes.size();
-        co_return IoResult<void>::Success();
-      });
+  const auto make_output = [&written] {
+    return AsyncOutputStream::FromWriter(
+        [written](std::stop_token, huxerui::Bytes bytes) -> Task<IoResult<void>> {
+          *written += bytes.size();
+          co_return IoResult<void>::Success();
+        });
+  };
+  auto first_output = make_output();
+  auto output = make_output();
+  written.reset();
+  auto first_progress = std::make_shared<ConversionProgress>();
+  const std::weak_ptr<ConversionProgress> first_lifetime = first_progress;
   const auto outcome = std::make_shared<CallOutcome>();
-  (void)UseApplicationTaskScope().Launch(
-      ObserveCall(exporter->ConvertAsync({}, std::move(input), std::move(output), std::move(receiver)), outcome));
+  (void)UseApplicationTaskScope().Launch(ObserveCall(
+      exporter->ConvertPairAsync(StringInput("x;y\n1;2\n"), csv_import::Separator(";"), std::move(first_progress),
+          std::move(first_output), 512 * 1024, std::move(output), std::move(receiver), std::move(input)), outcome));
   co_await WaitFor([&] { return during_receiver ? progress->started : stream->started; });
   TerminateFixtureWorker(pid);
   co_await WaitFor([&] {
     const bool cancelled = during_receiver ? progress->cancelled : stream->cancelled && stream->stop_requested;
-    return cancelled && outcome->done && receiver_lifetime.expired() && output_lifetime.expired();
+    return cancelled && outcome->done && first_lifetime.expired() && receiver_lifetime.expired() && output_lifetime.expired();
   });
   if (during_receiver) progress->complete->Complete(9);
   else stream->late();
@@ -1205,6 +1293,10 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
     co_await manager.SetEnabled(args[1], name == "enable");
     co_return Json::object();
   }
+  if (name == "check-contract-codecs" && args.size() == 1) {
+    CheckContractCodecs();
+    co_return Json::object();
+  }
   if (name == "list" && args.size() == 1) co_return List(manager);
   if (name == "import" && args.size() >= 2 && args.size() <= 4) co_return co_await Import(manager, args);
   if (name == "round-trip" && args.size() == 4) co_return co_await RoundTrip(manager, args);
@@ -1212,6 +1304,7 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
       (name == "check-output-failure" && args.size() == 6)) {
     co_return co_await Convert(manager, args);
   }
+  if (name == "convert-pair" && (args.size() == 7 || args.size() == 8)) co_return co_await ConvertPair(manager, args);
   if (name == "check-stream-interruption" && args.size() == 4) {
     co_return co_await CheckStreamInterruption(manager, args[1], args[2] == "write", args[3] == "deadline");
   }

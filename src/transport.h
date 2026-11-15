@@ -20,9 +20,9 @@ struct Frame {
   FrameKind kind = FrameKind::Request;
   std::uint32_t call = 0;
   std::uint32_t callback = 0;
-  std::uint32_t receiver = 0;
+  // Reverse calls carry a one-based parameter slot. Zero identifies a registered host service.
+  std::uint32_t slot = 0;
   bool synchronous = false;
-  std::uint32_t streams = 0;
   std::uint32_t read_limit = 0;
 };
 
@@ -134,12 +134,9 @@ inline std::size_t FramePayloadLimit(FrameKind kind) noexcept {
   return kind == FrameKind::StreamCall || kind == FrameKind::StreamReply ? MaxStreamChunk : MaxPayload;
 }
 
-inline bool IsStreamOperation(std::uint32_t slot, std::uint32_t operation, std::uint32_t count,
-                              std::size_t payload_size) noexcept {
-  if (slot == HPK_INPUT_STREAM) {
-    return operation == HPK_READ_STREAM && count > 0 && count <= MaxStreamChunk && !payload_size;
-  }
-  if (slot != HPK_OUTPUT_STREAM || count) return false;
+inline bool IsStreamOperation(std::uint32_t operation, std::uint32_t count, std::size_t payload_size) noexcept {
+  if (operation == HPK_READ_STREAM) return count > 0 && count <= MaxStreamChunk && !payload_size;
+  if (count) return false;
   return (operation == HPK_WRITE_STREAM && payload_size > 0 && payload_size <= MaxStreamChunk) ||
          (operation == HPK_CLOSE_STREAM && !payload_size);
 }
@@ -149,27 +146,27 @@ void WriteFrame(Write&& write, const Frame& frame) {
   if (frame.payload.size() > FramePayloadLimit(frame.kind)) {
     throw Error(ErrorCode::PayloadTooLarge, "Worker frame exceeds the byte limit");
   }
-  const std::array<std::uint32_t, 12> header{
+  const std::array<std::uint32_t, 11> header{
       FrameMagic, static_cast<std::uint32_t>(frame.kind), frame.call, frame.callback, frame.code, frame.instance,
-      frame.operation, static_cast<std::uint32_t>(frame.payload.size()), frame.receiver, frame.synchronous,
-      frame.streams, frame.read_limit};
+      frame.operation, static_cast<std::uint32_t>(frame.payload.size()), frame.slot, frame.synchronous,
+      frame.read_limit};
   write(std::as_bytes(std::span(header)));
   write(std::span<const std::byte>(frame.payload));
 }
 
 template<class Read>
 Frame ReadFrame(Read&& read) {
-  std::array<std::uint32_t, 12> header{};
+  std::array<std::uint32_t, 11> header{};
   read(std::as_writable_bytes(std::span(header)));
   const auto kind = static_cast<FrameKind>(header[1]);
   if (header[0] != FrameMagic || kind < FrameKind::Request || kind > FrameKind::StreamReply ||
       header[7] > FramePayloadLimit(kind) || header[9] > 1 ||
-      (kind == FrameKind::StreamCall && !IsStreamOperation(header[10], header[6], header[11], header[7])) ||
-      (kind != FrameKind::StreamCall && header[11])) {
+      (kind == FrameKind::StreamCall && (!header[8] || !IsStreamOperation(header[6], header[10], header[7]))) ||
+      (kind != FrameKind::StreamCall && header[10])) {
     throw Error(ErrorCode::Protocol, "Invalid worker frame header");
   }
   Frame frame{header[4], header[5], header[6], Bytes(header[7]), kind,
-              header[2], header[3], header[8], header[9] != 0, header[10], header[11]};
+              header[2], header[3], header[8], header[9] != 0, header[10]};
   read(std::span(frame.payload));
   return frame;
 }

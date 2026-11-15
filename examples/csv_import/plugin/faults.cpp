@@ -73,7 +73,7 @@ public:
   std::uint32_t ProcessId() const override { return csv_import::ProcessId(); }
 
   huxerui::Task<csv_import::ImportResult> Import(huxerui::AsyncInputStream input,
-                                                  csv_import::ImportReceiver receiver) override {
+                                                  std::shared_ptr<csv_import::ImportProgress> receiver) override {
     std::string source;
     auto remaining = csv_import::MaxImportBytes;
     for (;;) {
@@ -115,9 +115,9 @@ public:
     }
     if (source == "remember") {
       saved_ = receiver;
-      if (receiver) co_await receiver->OnRows({1});
+      if (receiver) co_await receiver->OnRows(1, 0);
     }
-    if (source == "stale" && saved_) co_await saved_->OnRows({2});
+    if (source == "stale" && saved_) co_await saved_->OnRows(2, 0);
     if (source == "status-wait") co_await SetRows(42);
     if (source == "background-stop") {
       co_await huxerui::pluginkit::RunInvocationWorker([this](std::stop_token stop) {
@@ -149,7 +149,7 @@ private:
   }
 
   const huxerui::pluginkit::PluginContext& context_;
-  csv_import::ImportReceiver saved_;
+  std::shared_ptr<csv_import::ImportProgress> saved_;
 };
 
 class FaultExporter final : public csv_import::fixture::CsvExporter {
@@ -157,7 +157,7 @@ public:
   using CsvExporter::CsvExporter;
 
   huxerui::Task<csv_import::CsvSummary> ConvertAsync(csv_import::ConversionOptions, huxerui::AsyncInputStream input,
-      huxerui::AsyncOutputStream output, huxerui::pluginkit::Receiver<csv_import::ImportProgress> progress) override {
+      huxerui::AsyncOutputStream output, std::shared_ptr<csv_import::ImportProgress> progress) override {
     using csv_import::fixture::RequireIo;
     if (active_context->DataDirectory().Child("check-stale-stream").Exists()) {
       if (saved_) {
@@ -174,8 +174,25 @@ public:
     if (data.Child("omit-output-close").Exists()) co_return csv_import::CsvSummary{};
     RequireIo(co_await output.CloseAsync());
     if (data.Child("fail-after-output-close").Exists()) throw std::runtime_error("Failure after output close");
-    if (progress) co_await progress->OnRows({0});
+    if (progress) co_await progress->OnRows(0, 0);
     co_return csv_import::CsvSummary{};
+  }
+
+  huxerui::Task<csv_import::PairSummary> ConvertPairAsync(huxerui::AsyncInputStream first,
+      csv_import::Separator separator, std::shared_ptr<csv_import::ImportProgress> first_progress,
+      huxerui::AsyncOutputStream first_csv, std::uint32_t read_bytes, huxerui::AsyncOutputStream second_csv,
+      std::shared_ptr<csv_import::ImportProgress> second_progress, huxerui::AsyncInputStream second) override {
+    if (!active_context->DataDirectory().Child("omit-second-output-close").Exists()) {
+      co_return co_await CsvExporter::ConvertPairAsync(std::move(first), std::move(separator),
+          std::move(first_progress), std::move(first_csv), read_bytes, std::move(second_csv),
+          std::move(second_progress), std::move(second));
+    }
+    using csv_import::fixture::RequireIo;
+    const auto a = co_await CsvExporter::ConvertAsync(
+        {read_bytes}, std::move(first), std::move(first_csv), std::move(first_progress));
+    auto bytes = RequireIo(co_await second.ReadAsync(read_bytes));
+    RequireIo(co_await second_csv.WriteAsync(std::move(bytes)));
+    co_return csv_import::PairSummary{a, {}, std::move(separator)};
   }
 
 private:
