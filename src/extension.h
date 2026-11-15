@@ -2,7 +2,7 @@
 
 #include "transport.h"
 
-#include <huxerui/pluginkit/detail/extension.h>
+#include <huxerui/pluginkit.h>
 
 namespace huxerui::pluginkit::detail {
 
@@ -18,18 +18,28 @@ struct RegisteredService {
 const RegisteredService& RequireHostService(std::span<const RegisteredService> services, ContractInfo contract);
 
 class LocalPlugin;
+class PluginEvents;
+class PluginRun;
 class Worker;
 
+struct WorkerStart {
+  std::shared_ptr<Worker> worker;
+  bool started;
+};
+
+using WorkerStarter = std::function<WorkerStart(Deadline, std::stop_token)>;
+
 std::shared_ptr<LocalPlugin> CreateLocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load,
-                                               PluginStartup startup, std::vector<RegisteredService> services);
-void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin);
+                                               PluginStartup startup, std::vector<RegisteredService> services,
+                                               std::weak_ptr<PluginEvents> events, std::shared_ptr<PluginRun> run);
+void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin,
+                        PluginStopReason reason = PluginStopReason::Shutdown);
 Task<void> FinishLocalShutdown(std::shared_ptr<LocalPlugin> plugin);
 void ValidateLocalPlugin(const std::shared_ptr<LocalPlugin>& plugin);
 
 std::shared_ptr<ExtensionTarget> MakeLocalExtension(std::shared_ptr<LocalPlugin> plugin,
     std::string point, std::uint32_t ordinal, std::chrono::milliseconds timeout);
-std::shared_ptr<ExtensionTarget> MakeWorkerExtension(
-    std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start, std::chrono::milliseconds timeout,
-    std::stop_token admission, Bytes factory);
+std::shared_ptr<ExtensionTarget> MakeWorkerExtension(WorkerStarter start, std::chrono::milliseconds timeout,
+                                                     std::stop_token admission, Bytes factory);
 
 } // namespace huxerui::pluginkit::detail

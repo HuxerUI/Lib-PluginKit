@@ -149,6 +149,16 @@ In-process stream callbacks use the same reentry guard as host services and rece
 
 An output must be closed successfully on the host side before the invocation can report success. Closing completes the supplied sink. The host controls publication and can stage a file until the extension succeeds. A raw sink can retain a successfully written prefix after an error or cancellation.
 
+### Catalog events and diagnostics
+
+The host can retain a move-only subscription from `SubscribeEvents()` and read initial snapshots with `ListPlugins()` and `ListExtensions()`. Future events arrive in sequence on the manager's application task scope after the corresponding state update. Each event owns its package identity and includes a generation and worker process ID when applicable. Handlers run outside internal locks and can read current snapshots. Releasing a subscription skips pending deliveries to it. Shutdown closes all subscriptions.
+
+Catalog notifications follow the profile commit. Disabling a package closes admission before announcing the changed catalog. The runtime emits a separate stop event after retiring. Upgrade notifications distinguish a staged replacement, a committed replacement, and a failed attempt. Successful replacements are announced after releasing the management reservation that excludes them from discovery. Candidate activation is observable only after the replacement commits.
+
+Startup and initial activation share the invocation's deadline. An expired attempt retires a newly started worker before it becomes available or while it owns the initial activation. A call that expires waiting for another exchange leaves that exchange and its worker alone. An unexpected worker exit produces one event for that generation after its PID is withdrawn from live queries, even while the worker is idle. The next successful activation has a new generation.
+
+`Diagnostics(plugin_id)` returns the current installed and runtime state and the latest recorded infrastructure failure for that plugin. A failed upgrade names its candidate while the installed snapshot remains selected. The last failure survives recovery and is replaced by a later one. Uninstall or manager shutdown clears it. Diagnostics are kept in memory for the manager session.
+
 ## Management transactions and persisted state
 
 A profile records the selected local package, enabled flag, granted services, and data directory per installed plugin. A new host process reopens the profile and uses the managed snapshot without reinstalling. Register its current extension points and service objects before using the installed plugins. One manager owns write access to that profile. Readers consume committed snapshots. Other writers receive a busy result and can use a separate profile or retry after the owner releases it.

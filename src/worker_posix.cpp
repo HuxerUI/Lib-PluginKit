@@ -10,9 +10,11 @@ namespace huxerui::pluginkit::detail {
 
 void Worker::StartReaper(pid_t child) {
   pid_ = child;
+  run_->SetPid(static_cast<std::uint32_t>(child));
   try {
     reaper_ = std::thread([this, child] { Reap(child); });
   } catch (...) {
+    run_->ActivationFailed(PluginFailureStage::StartWorker, std::current_exception());
     Stop();
     Reap(child);
     throw;
@@ -57,13 +59,19 @@ void Worker::Reap(pid_t child) noexcept {
     result = ::waitid(P_PID, static_cast<id_t>(child), &info, WEXITED | WNOWAIT);
   } while (result < 0 && errno == EINTR);
   std::lock_guard lock(stop_);
+  std::optional<std::uint32_t> exit_code;
+  std::optional<int> signal;
   if (result == 0) {
+    if (info.si_code == CLD_EXITED) exit_code = static_cast<std::uint32_t>(info.si_status);
+    if (info.si_code == CLD_KILLED || info.si_code == CLD_DUMPED) signal = info.si_status;
     // The unreaped child keeps the process group ID reserved until cleanup is complete.
     ::kill(-child, SIGKILL);
     while (::waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
   }
+  // A subscriber can query the catalog and reopen the plugin as soon as the event is posted.
   pid_ = 0;
   exited_stop_.request_stop();
+  run_->WorkerExited(exit_code, signal);
   exited_.notify_all();
   ::shutdown(socket_.get(), SHUT_RDWR);
 }

@@ -151,6 +151,139 @@ struct PluginInfo {
   std::optional<PackageInfo> pending_upgrade;
 };
 
+/// @brief Catalog or runtime change reported by a plugin manager.
+enum class PluginEventKind {
+  CatalogChanged,   ///< A catalog change committed. See PluginEvent::change.
+  Activated,        ///< The selected package completed activation.
+  ActivationFailed, ///< The selected package could not activate.
+  Stopped,          ///< A runtime generation finished retiring. See PluginEvent::stop_reason.
+  WorkerExited,     ///< A worker exited unexpectedly, including while idle.
+  UpgradeFailed,    ///< An accepted replacement failed. See PluginEvent::package for the candidate.
+};
+
+/// @brief Change to the committed catalog.
+enum class PluginCatalogChange {
+  Installed,      ///< A newly installed package became available.
+  Enabled,        ///< The installed package was enabled.
+  Disabled,       ///< The package was disabled and admission to new calls closed.
+  UpgradePending, ///< A replacement was approved for application after host restart.
+  Upgraded,       ///< The replacement became the installed package.
+  Uninstalled,    ///< The package was removed from the catalog.
+};
+
+/// @brief Runtime state of an installed package, independent of its enablement.
+enum class PluginRuntimeState {
+  Inactive,   ///< No activation is running.
+  Activating, ///< The package is being verified, loaded, or activated.
+  Active,     ///< The package completed activation and is available for calls.
+  Stopping,   ///< The existing runtime is being retired.
+  Faulted,    ///< The most recent runtime attempt failed or terminated unexpectedly.
+};
+
+/// @brief Reason for retiring a runtime generation.
+enum class PluginStopReason {
+  Disabled,         ///< The host disabled the package.
+  Upgrading,        ///< The host is validating or applying a replacement.
+  Uninstalled,      ///< The host is uninstalling the package.
+  Shutdown,         ///< The manager or a temporary activation is shutting down.
+  Cancelled,        ///< Cancelling an active exchange retired its worker.
+  DeadlineExceeded, ///< An exchange timed out and its worker was retired.
+  TransportError,   ///< A failed exchange required retiring the worker.
+};
+
+/// @brief Operation stage in which PluginKit detected a failure.
+enum class PluginFailureStage {
+  VerifyPackage,     ///< Checking the selected package and its approval.
+  StagePackage,      ///< Staging the approved package snapshot.
+  RetirePrevious,    ///< Retiring the installed runtime before a change.
+  PrepareData,       ///< Preparing the candidate package and its data copy.
+  StartWorker,       ///< Starting the worker process.
+  Activate,          ///< Loading the module, validating its descriptor, or running its activation hook.
+  ValidateFactories, ///< Probing the replacement's factories.
+  Commit,            ///< Writing the resulting profile state.
+  Exchange,          ///< Exchanging an IPC request or callback.
+  WorkerExit,        ///< Observing an unexpected process exit.
+};
+
+/// @brief Structured failure details for an event or a diagnostic snapshot.
+struct PluginFailure {
+  /// Stage at which the failure was observed.
+  PluginFailureStage stage;
+  /// Stable category for host decisions.
+  ErrorCode code;
+  /// UTF-8 diagnostic summary, at most 1 KiB.
+  std::string message;
+  /// Native exit code when the process exited with a status and one was available.
+  std::optional<std::uint32_t> exit_code;
+  /// Native signal when the process was terminated by a signal and one was available.
+  std::optional<int> signal;
+};
+
+/// @brief Owned snapshot of one catalog or runtime change.
+struct PluginEvent {
+  /// The reason for the notification.
+  PluginEventKind kind;
+  /// Increasing event sequence within this manager session.
+  std::uint64_t sequence;
+  /// Wall clock time when the library recorded the event.
+  std::chrono::system_clock::time_point time;
+  /// Affected snapshot. Upgrade events identify the replacement and uninstall identifies the removed package.
+  PluginIdentity package;
+  /// Manager-local activation number, when the event refers to a runtime generation.
+  std::optional<std::uint64_t> generation;
+  /// Process ID of the affected worker, including after exit, when one was started.
+  std::optional<std::uint32_t> worker_pid;
+  /// Committed catalog action for CatalogChanged.
+  std::optional<PluginCatalogChange> change;
+  /// Retirement reason for Stopped.
+  std::optional<PluginStopReason> stop_reason;
+  /// Failure details when the event records a management or runtime failure.
+  std::optional<PluginFailure> failure;
+};
+
+/// @brief Installed and runtime state of a plugin, with its latest failure in this manager session.
+struct PluginDiagnostics {
+  /// Current installed package, enablement, mode, available worker PID, and any pending upgrade.
+  PluginInfo plugin;
+  /// Current runtime state of the installed package.
+  PluginRuntimeState state = PluginRuntimeState::Inactive;
+  /// Generation of the activating, active, or stopping runtime, when present.
+  std::optional<std::uint64_t> generation;
+  /// True when a new host process is needed to load the currently installed in-process snapshot.
+  bool restart_required = false;
+  /// Most recent recorded failure, which may refer to a previous generation or a rejected upgrade candidate.
+  std::optional<PluginEvent> last_failure;
+};
+
+namespace detail {
+struct PluginEventSubscriber;
+}
+
+/// @brief Move-only subscription to plugin manager events.
+///
+/// Keep the handle on the owning application thread. Its destruction cancels pending deliveries to
+/// this subscriber. A callback already running can return normally, including when it releases its
+/// own subscription. A handle can outlive the manager.
+class PluginEventSubscription {
+public:
+  /// Creates an empty subscription.
+  PluginEventSubscription() noexcept = default;
+  /// Transfers the subscription and leaves the original handle empty.
+  PluginEventSubscription(PluginEventSubscription&&) noexcept = default;
+  /// Releases the current subscription and takes ownership of the supplied subscription.
+  PluginEventSubscription& operator=(PluginEventSubscription&& other) noexcept;
+  PluginEventSubscription(const PluginEventSubscription&) = delete;
+  PluginEventSubscription& operator=(const PluginEventSubscription&) = delete;
+  /// Cancels delivery to this subscriber.
+  ~PluginEventSubscription();
+
+private:
+  friend class PluginManager;
+  explicit PluginEventSubscription(std::weak_ptr<detail::PluginEventSubscriber> subscriber);
+  void Release() noexcept;
+  std::weak_ptr<detail::PluginEventSubscriber> subscriber_;
+};
+
 /// @brief Move-only owner of one extension instance in the package's approved execution mode.
 ///
 /// Call published methods through operator->() on the owning application thread. Generated bindings keep the
@@ -388,6 +521,26 @@ public:
   /// @return A snapshot of installed packages, enablement flags, and available worker process IDs.
   /// @see ListExtensions()
   std::vector<PluginInfo> ListPlugins() const;
+
+  /// @brief Queues future catalog and runtime notifications on the manager's application thread.
+  ///
+  /// Call on the owning application thread. Callbacks run serially outside internal locks. They can
+  /// query the current catalog and diagnostics. The event reference is valid during the callback.
+  /// Take an initial snapshot separately. Events recorded before subscription are not replayed.
+  /// @param callback A nonempty handler for each new event. An exception from a handler ends that delivery.
+  /// @return A subscription that cancels delivery when released. Shutdown cancels all pending deliveries.
+  /// @throws Error With InvalidArgument for an empty handler or Closed after shutdown begins.
+  /// @see Diagnostics(), ListPlugins(), ListExtensions()
+  PluginEventSubscription SubscribeEvents(std::function<void(const PluginEvent&)> callback);
+
+  /// @brief Reads the installed and runtime state, including the most recent recorded failure.
+  ///
+  /// The failure survives successful recovery until replaced, uninstall, or manager shutdown. It is kept
+  /// in memory for the current manager session. This query does not activate the plugin or enter its IPC queue.
+  /// @param plugin_id The installed package identifier.
+  /// @return An owned snapshot, or std::nullopt if the plugin is not installed.
+  /// @throws Error With Closed after shutdown begins.
+  std::optional<PluginDiagnostics> Diagnostics(std::string_view plugin_id) const;
 
   /// @brief Lists candidates declared at a registered extension point without activating packages.
   ///

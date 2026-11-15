@@ -148,6 +148,13 @@ struct CallOutcome {
   std::exception_ptr error;
 };
 
+PluginEventSubscription RecordPluginEvents(PluginManager& manager, std::string_view plugin,
+                                           std::vector<PluginEvent>& events) {
+  return manager.SubscribeEvents([id = std::string(plugin), &events](const PluginEvent& event) {
+    if (event.package.id == id) events.push_back(event);
+  });
+}
+
 template<class T>
 Task<void> ObserveCall(Task<T> call, std::shared_ptr<CallOutcome> outcome) {
   try {
@@ -586,7 +593,7 @@ void TerminateFixtureWorker(std::uint32_t pid) {
   throw Error(ErrorCode::PluginFailed, "Cannot terminate the CSV fixture worker");
 }
 
-Task<Json> CheckWorkerExitDuringCallback(PluginManager& manager, std::string_view plugin, bool during_receiver) {
+Task<void> CheckWorkerExitDuringCallback(PluginManager& manager, std::string_view plugin, bool during_receiver) {
   // Leave a longer invocation deadline than the fixture's wait for a worker-exit response.
   auto exporter = manager.CreateExtension(Exporters, plugin, DefaultTimeout * 3);
   const auto pid = exporter->ProcessId();
@@ -626,7 +633,114 @@ Task<Json> CheckWorkerExitDuringCallback(PluginManager& manager, std::string_vie
   } catch (const Error& error) {
     if (error.Code() != ErrorCode::WorkerExited) throw;
   }
-  co_return Json{{"callback_cancelled", true}, {"grants_released", true}};
+}
+
+Task<Json> CheckWorkerEvents(PluginManager& manager, const std::vector<std::string>& args) {
+  const auto& plugin = args[1];
+  const bool idle = args[2] == "idle";
+  auto other = manager.CreateExtension(Exporters, args[3]);
+  const auto other_pid = other->ProcessId();
+  std::vector<PluginEvent> events;
+  std::optional<PluginDiagnostics> faulted;
+  std::optional<ExtensionHandle<csv_import::TableExporter>> recovered;
+  std::exception_ptr callback_error;
+  auto subscription = manager.SubscribeEvents([&](const PluginEvent& event) {
+    if (event.package.id != plugin) return;
+    events.push_back(event);
+    if (event.kind != PluginEventKind::WorkerExited) return;
+    try {
+      faulted = manager.Diagnostics(plugin);
+      const auto catalog = manager.ListPlugins();
+      const auto listed = std::ranges::find_if(catalog, [&](const auto& entry) { return entry.package.id == plugin; });
+      if (listed == catalog.end() || listed->worker_pid) {
+        throw Error(ErrorCode::PluginFailed, "The exited worker is still listed");
+      }
+      recovered.emplace(manager.CreateExtension(Exporters, plugin));
+      (void)(*recovered)->ProcessId();
+    } catch (...) {
+      callback_error = std::current_exception();
+    }
+  });
+  auto exporter = manager.CreateExtension(Exporters, plugin);
+  const auto pid = exporter->ProcessId();
+  if (!pid || pid == ProcessId()) throw Error(ErrorCode::InvalidArgument, "Expected a CSV worker");
+  co_await WaitFor([&] { return !events.empty(); });
+
+  if (idle) TerminateFixtureWorker(pid);
+  else co_await CheckWorkerExitDuringCallback(manager, plugin, args[2] == "receiver");
+  co_await WaitFor([&] { return events.size() >= 2; });
+  if (callback_error) std::rethrow_exception(callback_error);
+  if (events[0].kind != PluginEventKind::Activated ||
+      !events[0].generation || events[1].kind != PluginEventKind::WorkerExited ||
+      events[1].generation != events[0].generation || events[1].worker_pid != pid ||
+      !events[1].failure || events[1].failure->code != ErrorCode::WorkerExited ||
+      (!events[1].failure->exit_code && !events[1].failure->signal) ||
+      !faulted || !faulted->plugin.enabled || faulted->plugin.worker_pid ||
+      faulted->state != PluginRuntimeState::Faulted || !faulted->last_failure ||
+      faulted->last_failure->sequence != events[1].sequence || other->ProcessId() != other_pid) {
+    throw Error(ErrorCode::PluginFailed, "Unexpected worker exit diagnostics");
+  }
+  auto output = AsyncOutputStream::FromWriter([](std::stop_token, huxerui::Bytes) -> Task<IoResult<void>> {
+    co_return IoResult<void>::Success();
+  });
+  const auto summary = co_await (*recovered)->ConvertAsync({}, StringInput("name;city\nAlice;Paris\n"),
+                                                           std::move(output), nullptr);
+  co_await WaitFor([&] { return events.size() >= 3; });
+  const auto active = manager.Diagnostics(plugin);
+  if (summary.rows != 1 || events.size() != 3 || events[2].kind != PluginEventKind::Activated ||
+      events[2].generation <= events[0].generation || !active || active->state != PluginRuntimeState::Active ||
+      active->generation != events[2].generation || !active->last_failure ||
+      active->last_failure->sequence != events[1].sequence) {
+    throw Error(ErrorCode::PluginFailed, "Worker recovery did not preserve the last failure");
+  }
+  co_return Json{{"recovered", true}};
+}
+
+Task<Json> CheckCatalogEvents(PluginManager& manager, const std::string& plugin) {
+  std::vector<PluginEvent> events;
+  bool valid = true;
+  const auto thread = std::this_thread::get_id();
+  auto throwing = manager.SubscribeEvents([](const PluginEvent&) { throw std::runtime_error("Observer fixture"); });
+  auto subscription = manager.SubscribeEvents([&](const PluginEvent& event) {
+    if (event.package.id != plugin) return;
+    valid = valid && std::this_thread::get_id() == thread &&
+        (events.empty() || event.sequence > events.back().sequence);
+    events.push_back(event);
+    if (event.change == PluginCatalogChange::Disabled) {
+      const auto diagnostic = manager.Diagnostics(plugin);
+      const auto candidates = manager.ListExtensions(Exporters);
+      valid = valid && diagnostic && !diagnostic->plugin.enabled &&
+          std::ranges::find(candidates, plugin, &ExtensionInfo::PluginId) == candidates.end();
+    }
+  });
+  PluginEventSubscription once;
+  unsigned once_calls = 0;
+  once = manager.SubscribeEvents([&](const PluginEvent&) {
+    ++once_calls;
+    once = {};
+  });
+  unsigned released_calls = 0;
+  auto exporter = manager.CreateExtension(Exporters, plugin);
+  {
+    auto released = manager.SubscribeEvents([&](const PluginEvent&) { ++released_calls; });
+    (void)exporter->ProcessId();
+  }
+  unsigned later_calls = 0;
+  auto later = manager.SubscribeEvents([&](const PluginEvent&) { ++later_calls; });
+  if (!events.empty()) throw Error(ErrorCode::PluginFailed, "A plugin event was delivered inline");
+  co_await WaitFor([&] { return !events.empty(); });
+  if (later_calls) throw Error(ErrorCode::PluginFailed, "An event was replayed to a new subscriber");
+  co_await manager.SetEnabled(plugin, false);
+  co_await manager.SetEnabled(plugin, false);
+  co_await manager.SetEnabled(plugin, true);
+  co_await WaitFor([&] { return !events.empty() && events.back().change == PluginCatalogChange::Enabled; });
+  if (!valid || once_calls != 1 || released_calls || later_calls != 3 || events.size() != 4 ||
+      events[0].kind != PluginEventKind::Activated || events[1].change != PluginCatalogChange::Disabled ||
+      events[2].kind != PluginEventKind::Stopped || events[2].stop_reason != PluginStopReason::Disabled ||
+      events[2].generation != events[0].generation || events[2].failure) {
+    throw Error(ErrorCode::PluginFailed, "Unexpected catalog events or subscription lifetime");
+  }
+  co_return Json{{"catalog_events", true}};
 }
 
 Task<Json> CheckStaleStream(PluginManager& manager, std::string_view plugin) {
@@ -918,6 +1032,41 @@ Task<UpgradeStatus> Upgrade(PluginManager& manager, const std::vector<std::strin
   return manager.UpgradePackage(File(args[1]), std::move(approval));
 }
 
+Task<Json> CheckUpgradeFailureEvents(PluginManager& manager, std::string plugin,
+                                     const std::vector<std::string>* command = nullptr) {
+  std::vector<PluginEvent> events;
+  auto subscription = RecordPluginEvents(manager, plugin, events);
+  if (command) {
+    try {
+      (void)co_await Upgrade(manager, *command);
+      throw std::runtime_error("The CSV upgrade unexpectedly succeeded");
+    } catch (const Error& error) {
+      if (error.Code() != ErrorCode::PluginFailed) throw;
+    }
+  } else {
+    const auto changes = co_await manager.ApplyPendingChanges();
+    if (changes.size() != 1 || changes[0].plugin_id != plugin || changes[0].error != ErrorCode::PluginFailed ||
+        !changes[0].restart_required) {
+      throw Error(ErrorCode::PluginFailed, "Expected an unsuccessful pending CSV upgrade");
+    }
+  }
+  co_await WaitFor([&] { return !events.empty(); });
+  const auto diagnostics = manager.Diagnostics(plugin);
+  if (events.size() != 1 || events[0].kind != PluginEventKind::UpgradeFailed ||
+      !diagnostics || !diagnostics->last_failure || diagnostics->last_failure->sequence != events[0].sequence ||
+      diagnostics->plugin.pending_upgrade || !events[0].failure || events[0].failure->code != ErrorCode::PluginFailed) {
+    throw Error(ErrorCode::PluginFailed, "Unexpected upgrade failure diagnostics");
+  }
+  if (!command && (std::ranges::count(manager.ListExtensions(Importers), plugin, &ExtensionInfo::PluginId) ||
+                   std::ranges::count(manager.ListExtensions(Exporters), plugin, &ExtensionInfo::PluginId))) {
+    throw Error(ErrorCode::PluginFailed, "A failed in-process replacement still exposes factories before restart");
+  }
+  co_return Json{{"installed", diagnostics->plugin.package.digest}, {"candidate", events[0].package.digest},
+                 {"failed_at_activation", events[0].failure->stage == PluginFailureStage::Activate},
+                 {"failed_at_factory", events[0].failure->stage == PluginFailureStage::ValidateFactories},
+                 {"restart_required", diagnostics->restart_required}};
+}
+
 Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::string>& args) {
   const auto package = PluginManager::InspectPackage(File(args[1]));
   const auto& id = package.id;
@@ -932,6 +1081,15 @@ Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::str
   auto pending = manager.CreateExtension(Importers, id);
   const auto old_pid = previous->ProcessId();
   if (previous_exporter->ProcessId() != old_pid) throw Error(ErrorCode::PluginFailed, "Expected one worker per package");
+  std::vector<PluginEvent> promoted;
+  bool listed = false;
+  auto subscription = manager.SubscribeEvents([&](const PluginEvent& event) {
+    if (event.package.digest != package.digest) return;
+    promoted.push_back(event);
+    if (event.change == PluginCatalogChange::Upgraded) {
+      listed = std::ranges::count(manager.ListExtensions(Exporters), id, &ExtensionInfo::PluginId) == 1;
+    }
+  });
   if (co_await Upgrade(manager, args) != UpgradeStatus::Applied) {
     throw Error(ErrorCode::PluginFailed, "The worker upgrade requires a restart");
   }
@@ -956,6 +1114,11 @@ Task<Json> CheckWorkerUpgrade(PluginManager& manager, const std::vector<std::str
   auto exporter = manager.CreateExtension(Exporters, *replacement);
   const auto new_pid = next->ProcessId();
   if (exporter->ProcessId() != new_pid) throw Error(ErrorCode::PluginFailed, "Expected one replacement worker");
+  co_await WaitFor([&] { return promoted.size() >= 2; });
+  if (!listed || promoted.size() != 2 || promoted[0].change != PluginCatalogChange::Upgraded ||
+      promoted[1].kind != PluginEventKind::Activated || !promoted[1].generation || promoted[1].worker_pid != new_pid) {
+    throw Error(ErrorCode::PluginFailed, "The replacement was announced before it became available");
+  }
   co_return Json{{"old_pid", old_pid}, {"new_pid", new_pid}};
 }
 
@@ -970,8 +1133,15 @@ Task<Json> CheckInProcessUpgrade(const File& profile, const std::vector<std::str
     auto exporter = manager.CreateExtension(Exporters, id);
     (void)handle->Delimiter();
     (void)exporter->Format();
+    std::vector<PluginEvent> events;
+    auto subscription = RecordPluginEvents(manager, id, events);
     if (co_await Upgrade(manager, args) != UpgradeStatus::RestartRequired) {
       throw Error(ErrorCode::PluginFailed, "The in-process upgrade applied without a restart");
+    }
+    co_await WaitFor([&] { return !events.empty(); });
+    if (events.size() != 1 || events[0].change != PluginCatalogChange::UpgradePending ||
+        events[0].package.digest != package.digest) {
+      throw Error(ErrorCode::PluginFailed, "Unexpected pending upgrade notification");
     }
     (void)handle->Delimiter();
     (void)exporter->Format();
@@ -1048,8 +1218,18 @@ Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportSt
   if (name == "check-local-stream-reentry" && args.size() == 3) {
     co_return co_await CheckLocalStreamReentry(manager, args[1], args[2] == "sync");
   }
-  if (name == "check-worker-exit-during-callback" && args.size() == 3) {
-    co_return co_await CheckWorkerExitDuringCallback(manager, args[1], args[2] == "receiver");
+  if (name == "check-worker-events" && args.size() == 4) {
+    co_return co_await CheckWorkerEvents(manager, args);
+  }
+  if (name == "check-catalog-events" && args.size() == 2) {
+    co_return co_await CheckCatalogEvents(manager, args[1]);
+  }
+  if (name == "check-upgrade-failure-events" && args.size() == 4) {
+    co_return co_await CheckUpgradeFailureEvents(manager, PluginManager::InspectPackage(File(args[1])).id, &args);
+  }
+  if (name == "check-clean-diagnostics" && args.size() == 2) {
+    const auto diagnostic = manager.Diagnostics(args[1]);
+    co_return Json{{"installed", diagnostic.has_value()}, {"clean", !diagnostic || !diagnostic->last_failure}};
   }
   if (name == "check-stale-stream" && args.size() == 2) co_return co_await CheckStaleStream(manager, args[1]);
   if (name == "check-sync-stream-deadline" && args.size() == 3) {
@@ -1120,6 +1300,14 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
     auto status = std::make_shared<PreviewImportStatus>(manager);
     manager.ProvideService<csv_import::ImportStatus>(status);
     RegisterPoints(manager);
+    if (args.size() == 3 && args[1] == "check-pending-upgrade-events") {
+      auto result = co_await CheckUpgradeFailureEvents(manager, Utf8(args[2]));
+      result["ok"] = true;
+      Print(result);
+      co_await manager.Shutdown();
+      runtime.RequestShutdown();
+      co_return;
+    }
     for (const auto& change : co_await manager.ApplyPendingChanges()) {
       if (!change.error) continue;
       std::cerr << "Plugin upgrade failed for " << change.plugin_id << " (" << ErrorName(*change.error) << ") "

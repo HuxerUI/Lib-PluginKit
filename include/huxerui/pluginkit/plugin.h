@@ -26,16 +26,6 @@ namespace detail {
 struct PluginContextAccess;
 }
 
-/// @brief Identity of the installed package selected by the host.
-struct PluginIdentity {
-  /// Plugin identifier from the manifest.
-  std::string id;
-  /// Plugin release version from the manifest.
-  std::string version;
-  /// SHA-256 digest of the approved package snapshot.
-  std::string digest;
-};
-
 /// @brief Read-only context shared by every extension instance in one plugin activation.
 ///
 /// The binding passes the same object to the optional activation and deactivation hooks and to constructors

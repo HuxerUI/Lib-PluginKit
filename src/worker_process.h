@@ -2,6 +2,7 @@
 
 #include "extension.h"
 #include "platform_files.h"
+#include "plugin_events.h"
 
 #include <huxerui/pluginkit.h>
 
@@ -18,21 +19,25 @@ class Worker : public std::enable_shared_from_this<Worker> {
 public:
   Worker(const std::filesystem::path& executable, const std::filesystem::path& module_path,
          const Handle& verified_module, std::vector<RegisteredService> services, TaskScope callbacks,
-         PluginStartup startup);
+         PluginStartup startup, std::shared_ptr<PluginRun> run);
   ~Worker();
 
   std::optional<std::uint32_t> Pid() const noexcept;
+  void Activate(Deadline deadline, std::stop_token stop, bool started, bool wait_for_slot = true);
   Frame Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver = nullptr,
                 std::stop_token stop = {}, bool wait_for_slot = true, std::shared_ptr<CallStreams> streams = {});
   void ValidateFactories(std::stop_token stop);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
   /// Waits for the process to exit after shutdown, including when handles still reference this Worker.
   void WaitForExit(std::chrono::milliseconds timeout = DefaultTimeout);
-  void BeginShutdown() noexcept;
+  void BeginShutdown(PluginStopReason reason = PluginStopReason::Shutdown) noexcept;
   void Stop() noexcept;
+  void Abort(const Error& error) noexcept;
   bool Available() const noexcept { return active_ && !shutting_down_; }
 
 private:
+  Frame Request(Frame request, Deadline deadline, const ReceiverRegistration* receiver,
+                std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams, bool started = false);
   Frame Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
                  const ReceiverRegistration* receiver, const std::shared_ptr<CallStreams>& streams);
   Frame DispatchCallback(Frame request, Deadline deadline, std::stop_token stop,
@@ -75,10 +80,12 @@ private:
 
   static void CheckExchange(Deadline deadline, std::stop_token stop);
   static Frame RejectSynchronousCallback(const Frame& frame);
+  void ObserveRequestFailure(bool activate, const Error& error) noexcept;
 
   const std::vector<RegisteredService> services_;
   const TaskScope callbacks_;
   const PluginStartup startup_;
+  const std::shared_ptr<PluginRun> run_;
   bool activated_ = false;
   std::uint32_t next_call_ = 0;
   std::atomic_bool active_{true};
@@ -94,6 +101,8 @@ private:
   std::stop_source exited_stop_;
 
 #if defined(_WIN32)
+  void ObserveProcessExit() noexcept;
+
   Handle process_;
   Handle to_worker_;
   Handle from_worker_;

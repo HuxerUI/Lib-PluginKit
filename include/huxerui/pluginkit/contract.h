@@ -28,6 +28,16 @@
 
 namespace huxerui::pluginkit {
 
+/// @brief Identity of one plugin package snapshot.
+struct PluginIdentity {
+  /// Plugin identifier from the manifest.
+  std::string id;
+  /// Plugin release version from the manifest.
+  std::string version;
+  /// SHA-256 digest of the package snapshot.
+  std::string digest;
+};
+
 /// @brief Exact identity of a generated contract.
 ///
 /// String views borrow their underlying storage. Generated bindings use static storage for both strings.

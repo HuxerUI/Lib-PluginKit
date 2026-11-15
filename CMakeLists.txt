@@ -13,7 +13,7 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
     return()
 endif ()
 
-set(kit_sources src/manager.cpp src/extension.cpp src/worker_request.cpp)
+set(kit_sources src/manager.cpp src/extension.cpp src/plugin_events.cpp src/worker_request.cpp)
 set(kit_private_includes "${CMAKE_CURRENT_SOURCE_DIR}/src")
 if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     if (WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)

@@ -1,5 +1,6 @@
 #include "digest.h"
 #include "extension.h"
+#include "plugin_events.h"
 #include "plugin_module.h"
 #include "run_transport.h"
 #include "worker_process.h"
@@ -24,6 +25,10 @@ constexpr std::size_t MaxManifest = 64 * 1024;
 constexpr std::size_t MaxModule = 64 * 1024 * 1024;
 constexpr std::size_t MaxProfile = 1024 * 1024;
 constexpr int MaxManifestDepth = 16;
+
+PluginIdentity Identity(const PackageInfo& package) {
+  return {package.id, package.version, package.digest};
+}
 
 fs::path NativePath(const File& file) {
   const auto path = file.Path();
@@ -415,7 +420,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   Impl(const File& directory, const std::optional<File>& executable, TaskScope callbacks)
       : profile(fs::absolute(NativePath(directory))),
         worker_executable(executable ? std::optional(fs::absolute(NativePath(*executable))) : std::nullopt),
-        callbacks(std::move(callbacks)) {
+         callbacks(std::move(callbacks)), events(std::make_shared<PluginEvents>(this->callbacks)) {
     fs::create_directories(profile);
     profile = fs::canonical(profile);
     ownership = LockProfile(profile);
@@ -464,12 +469,13 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   void StorePackage(const Package& package);
   Package VerifyPackage(const Installed& installed) const;
   PluginStartup Startup(const Installed& installed) const;
-  std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed, PluginStartup startup);
+  std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed, PluginStartup startup,
+                                        std::shared_ptr<PluginRun> run = {});
   std::shared_ptr<Worker> MakeWorker(const Package& package, std::vector<RegisteredService> granted,
-                                     PluginStartup startup);
+                                     PluginStartup startup, std::shared_ptr<PluginRun> run);
   std::vector<std::shared_ptr<Worker>> ActiveAndRetiredWorkers(std::string_view id) const;
-  std::shared_ptr<Worker> StartWorker(const std::string& id, const std::stop_token& admission,
-                                     Deadline deadline, std::stop_token stop);
+  WorkerStart StartWorker(const std::string& id, const std::stop_token& admission,
+                          Deadline deadline, std::stop_token stop);
   Task<void> ChangeLocalEnabled(const std::string& id, bool enabled);
   void ChangeWorkerEnabled(const std::string& id, bool enabled, std::stop_token stop);
   Task<void> SetEnabled(std::string id, bool enabled);
@@ -477,7 +483,8 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   Task<UpgradeStatus> ApplyUpgrade(std::string id, std::optional<Package> source, UpgradeApproval approval = {});
   Task<UninstallStatus> Uninstall(std::string id, std::string expected_digest, PluginDataPolicy data);
   Task<std::vector<PendingChangeResult>> ApplyPending();
-  Task<void> RetirePlugin(const std::string& id);
+  Task<void> RetirePlugin(const std::string& id, PluginStopReason reason);
+  PluginInfo DescribePlugin(const Installed& installed) const;
   void CleanupFiles();
   bool IsPluginBusy(std::string_view id, const Installed& installed) const;
   void CleanupFilesAfterCommit() noexcept;
@@ -510,6 +517,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
     Impl& manager;
     const std::string& id;
     bool exclusive;
+    bool released = false;
 
     // The caller holds the manager mutex until admission has been reserved.
     Change(Impl& manager, const std::string& id, bool exclusive = true)
@@ -522,9 +530,14 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
       else ++manager.changes[id];
     }
     ~Change() {
+      if (released) return;
       std::lock_guard lock(manager.mutex);
+      ReleaseLocked();
+    }
+    void ReleaseLocked() noexcept {
       const auto current = manager.changes.find(id);
       if (exclusive || --current->second == 0) manager.changes.erase(current);
+      released = true;
     }
     Change(const Change&) = delete;
     Change& operator=(const Change&) = delete;
@@ -556,6 +569,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   fs::path profile;
   const std::optional<fs::path> worker_executable;
   TaskScope callbacks;
+  const std::shared_ptr<PluginEvents> events;
   Handle ownership;
   mutable std::mutex mutex;
   Profile profile_state;
@@ -681,6 +695,7 @@ PluginManager::~PluginManager() {
     impl_->closed = true;
     for (auto& [id, admission] : impl_->admissions) admission.request_stop();
   }
+  impl_->events->Close();
   for (const auto& [id, local] : impl_->local_plugins) BeginLocalShutdown(local);
   impl_->ShutdownWorkers();
 }
@@ -696,6 +711,7 @@ Task<void> PluginManager::ShutdownManager(std::shared_ptr<Impl> impl) {
     impl->closed = true;
     for (auto& [id, admission] : impl->admissions) admission.request_stop();
   }
+  impl->events->Close();
   for (const auto& [id, local] : impl->local_plugins) BeginLocalShutdown(local);
   for (;;) {
     {
@@ -778,6 +794,7 @@ void PluginManager::InstallPackage(const File& directory, std::string_view appro
 
   impl_->StorePackage(package);
   if (current == installed.end()) {
+    const auto identity = Identity(package.info);
     auto candidate = impl_->profile_state;
     const auto id = package.info.id;
     auto retained = candidate.retained_data.extract(id);
@@ -789,6 +806,7 @@ void PluginManager::InstallPackage(const File& directory, std::string_view appro
     candidate.plugins.emplace(id, Installed{std::move(package.info), std::move(package.manifest), true,
                                            std::move(options), std::move(data)});
     impl_->Commit(std::move(candidate));
+    impl_->events->CatalogChanged(identity, PluginCatalogChange::Installed);
     impl_->CleanupFilesAfterCommit();
   }
 }
@@ -879,10 +897,10 @@ std::vector<std::shared_ptr<Worker>> PluginManager::Impl::ActiveAndRetiredWorker
   return result;
 }
 
-Task<void> PluginManager::Impl::RetirePlugin(const std::string& id) {
+Task<void> PluginManager::Impl::RetirePlugin(const std::string& id, PluginStopReason reason) {
   if (const auto running = local_plugins.find(id); running != local_plugins.end()) {
     const auto local = running->second;
-    BeginLocalShutdown(local);
+    BeginLocalShutdown(local, reason);
     co_await FinishLocalShutdown(local);
     local_plugins.erase(id);
   }
@@ -895,7 +913,7 @@ Task<void> PluginManager::Impl::RetirePlugin(const std::string& id) {
       admissions.erase(admission);
     }
     retiring = ActiveAndRetiredWorkers(id);
-    for (const auto& worker : retiring) worker->BeginShutdown();
+    for (const auto& worker : retiring) worker->BeginShutdown(reason);
   }
   if (retiring.empty()) co_return;
   co_await RunTransport([retiring = std::move(retiring)](std::stop_token) {
@@ -928,9 +946,11 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
                                                       UpgradeApproval approval) {
   std::optional<Change> change;
   std::optional<Installed> replacement;
+  std::optional<PluginIdentity> identity;
+  auto stage = PluginFailureStage::VerifyPackage;
   std::string current_data;
   std::string candidate_data;
-  {
+  try {
     std::lock_guard lock(mutex);
     const auto& current = RequireInstalled(id);
     change.emplace(*this, id);
@@ -952,6 +972,8 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
       if (retired_workers.contains(source->info.digest)) {
         throw Error(ErrorCode::Busy, "A previous candidate worker is still retiring");
       }
+      identity = Identity(source->info);
+      stage = PluginFailureStage::StagePackage;
       source->module_file.reset();
       StorePackage(*source);
       replacement.emplace(Installed{std::move(source->info), std::move(source->manifest), current.enabled,
@@ -962,6 +984,7 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
         throw Error(ErrorCode::Busy, "This pending upgrade is not ready to apply");
       }
       replacement.emplace(found->second.target);
+      identity = Identity(replacement->info);
     }
 
     current_data = current.data;
@@ -969,21 +992,33 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     candidate_data = replacement->data;
     replacement->enabled = current.enabled;
     auto next = profile_state;
+    stage = PluginFailureStage::Commit;
     if (source && current.approval.mode == ExecutionMode::InProcess) {
       next.upgrades.emplace(id, PendingUpgrade{std::move(*replacement), current.info.digest, HostProcessToken(), false});
       Commit(std::move(next));
+      change->ReleaseLocked();
+      events->CatalogChanged(*identity, PluginCatalogChange::UpgradePending);
       co_return UpgradeStatus::RestartRequired;
     }
 
     // Publish the validation record before starting the candidate so a fresh host can recover the old snapshot.
     next.upgrades.insert_or_assign(id, PendingUpgrade{*replacement, current.info.digest, HostProcessToken(), true});
     Commit(std::move(next));
+  } catch (...) {
+    if (identity) {
+      std::lock_guard lock(mutex);
+      change->ReleaseLocked();
+      events->UpgradeFailed(*identity, stage, std::current_exception());
+    }
+    throw;
   }
 
   std::shared_ptr<Worker> worker;
   std::shared_ptr<LocalPlugin> local;
+  std::shared_ptr<PluginRun> run;
   std::exception_ptr failure;
   try {
+    stage = PluginFailureStage::VerifyPackage;
     std::vector<RegisteredService> granted;
     PluginStartup startup;
     {
@@ -992,7 +1027,9 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
       if (replacement->enabled) startup = Startup(*replacement);
       if (replacement->approval.mode == ExecutionMode::WorkerProcess) granted = ApprovedServices(*replacement);
     }
-    co_await RetirePlugin(id);
+    stage = PluginFailureStage::RetirePrevious;
+    co_await RetirePlugin(id, PluginStopReason::Upgrading);
+    stage = PluginFailureStage::PrepareData;
     const auto prepare = [self = shared_from_this(), target = *replacement, source_data = DataDirectory(current_data),
                           target_data = DataDirectory(candidate_data)](std::stop_token) {
       auto package = self->VerifyPackage(target);
@@ -1003,13 +1040,20 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     };
     auto package = co_await RunTransport(prepare);
     if (replacement->enabled && replacement->approval.mode == ExecutionMode::WorkerProcess) {
-      worker = MakeWorker(package, std::move(granted), std::move(startup));
+      stage = PluginFailureStage::StartWorker;
+      run = events->Start(*identity, true);
+      worker = MakeWorker(package, std::move(granted), std::move(startup), run);
+      stage = PluginFailureStage::ValidateFactories;
       co_await RunTransport([worker](std::stop_token stop) { worker->ValidateFactories(stop); });
+      if (!worker->Pid()) throw Error(ErrorCode::WorkerExited, "The candidate worker exited during validation");
     } else if (replacement->enabled) {
-      local = MakeLocal(*replacement, std::move(startup));
+      stage = PluginFailureStage::ValidateFactories;
+      run = events->Start(*identity, true);
+      local = MakeLocal(*replacement, std::move(startup), run);
       ValidateLocalPlugin(local);
     }
 
+    stage = PluginFailureStage::Commit;
     std::lock_guard lock(mutex);
     (void)RequireInstalled(id);
     auto next = profile_state;
@@ -1020,6 +1064,9 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     if (local) local_plugins.emplace(id, local);
     Commit(std::move(next));
     CleanupFilesAfterCommit();
+    // Queries exclude the package while an exclusive change is in progress.
+    change->ReleaseLocked();
+    events->CatalogChanged(*identity, PluginCatalogChange::Upgraded, run);
   } catch (const fs::filesystem_error& error) {
     failure = std::make_exception_ptr(Error(ErrorCode::Io, error.what()));
   } catch (...) {
@@ -1041,7 +1088,7 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     }
   }
   if (local) {
-    BeginLocalShutdown(local);
+    BeginLocalShutdown(local, PluginStopReason::Upgrading);
     co_await FinishLocalShutdown(local);
     local_plugins.erase(id);
   }
@@ -1055,8 +1102,16 @@ Task<UpgradeStatus> PluginManager::Impl::ApplyUpgrade(std::string id, std::optio
     auto next = profile_state;
     next.upgrades.erase(id);
     next.discarded_data.insert(candidate_data);
-    Commit(std::move(next));
+    try {
+      Commit(std::move(next));
+    } catch (...) {
+      change->ReleaseLocked();
+      events->UpgradeFailed(*identity, PluginFailureStage::Commit, std::current_exception(), run);
+      throw;
+    }
     CleanupFilesAfterCommit();
+    change->ReleaseLocked();
+    events->UpgradeFailed(*identity, stage, failure, run);
   }
   std::rethrow_exception(failure);
 }
@@ -1081,11 +1136,12 @@ Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string
     if (current.info.digest != expected_digest) throw Error(ErrorCode::ApprovalMismatch, "The installed digest changed");
     change.emplace(*this, id);
   }
-  co_await RetirePlugin(id);
+  co_await RetirePlugin(id, PluginStopReason::Uninstalled);
   std::lock_guard lock(mutex);
   (void)RequireInstalled(id);
   auto next = profile_state;
   const auto current = next.plugins.extract(id);
+  const auto identity = Identity(current.mapped().info);
   const auto pending = next.upgrades.extract(id);
   const auto package_path = PackageDirectory(current.mapped().info.digest);
   const auto data_path = DataDirectory(current.mapped().data);
@@ -1099,6 +1155,8 @@ Task<UninstallStatus> PluginManager::Impl::Uninstall(std::string id, std::string
   if (data == PluginDataPolicy::Keep) next.retained_data.emplace(id, current.mapped().data);
   else next.discarded_data.insert(current.mapped().data);
   Commit(std::move(next));
+  change->ReleaseLocked();
+  events->CatalogChanged(identity, PluginCatalogChange::Uninstalled);
   CleanupFilesAfterCommit();
   std::error_code error;
   const auto remains = [&](const fs::path& path) {
@@ -1179,12 +1237,16 @@ Task<void> PluginManager::Impl::ChangeLocalEnabled(const std::string& id, bool e
       std::lock_guard lock(mutex);
       const auto& installed = RequireInstalled(id);
       if (!enabled || installed.enabled || !local) {
-        if (installed.enabled != enabled) CommitEnabled(id, enabled);
+        if (installed.enabled != enabled) {
+          const auto package = Identity(installed.info);
+          CommitEnabled(id, enabled);
+          events->CatalogChanged(package, enabled ? PluginCatalogChange::Enabled : PluginCatalogChange::Disabled);
+        }
         if (enabled || !local) co_return;
       }
     }
     // Commit the disabled state and close admission on the application thread before yielding to another caller.
-    if (!enabled) BeginLocalShutdown(local);
+    if (!enabled) BeginLocalShutdown(local, PluginStopReason::Disabled);
     co_await FinishLocalShutdown(local);
     if (const auto current = local_plugins.find(id); current != local_plugins.end() && current->second == local) {
       local_plugins.erase(current);
@@ -1199,16 +1261,21 @@ void PluginManager::Impl::ChangeWorkerEnabled(const std::string& id, bool enable
   {
     std::lock_guard lock(mutex);
     if (stop.stop_requested()) return;
-    if (RequireInstalled(id).enabled != enabled) CommitEnabled(id, enabled);
-    if (enabled) return;
-    if (const auto admission = admissions.find(id); admission != admissions.end()) {
-      admission->second.request_stop();
-      admissions.erase(admission);
+    const auto& installed = RequireInstalled(id);
+    std::optional<PluginIdentity> package;
+    if (installed.enabled != enabled) {
+      package = Identity(installed.info);
+      CommitEnabled(id, enabled);
     }
-    if (const auto running = workers.find(id); running != workers.end()) {
-      worker = running->second;
-      worker->BeginShutdown();
+    if (!enabled) {
+      if (const auto admission = admissions.find(id); admission != admissions.end()) {
+        admission->second.request_stop();
+        admissions.erase(admission);
+      }
+      if (const auto running = workers.find(id); running != workers.end()) worker = running->second;
     }
+    if (package) events->CatalogChanged(*package, enabled ? PluginCatalogChange::Enabled : PluginCatalogChange::Disabled);
+    if (worker) worker->BeginShutdown(PluginStopReason::Disabled);
   }
   if (!worker) return;
   worker->Shutdown();
@@ -1222,15 +1289,31 @@ std::vector<PluginInfo> PluginManager::ListPlugins() const {
   // Read the snapshot without entering the worker's request queue, including during a host callback.
   std::lock_guard lock(impl_->mutex);
   std::vector<PluginInfo> result;
-  for (const auto& [id, plugin] : impl_->profile_state.plugins) {
-    const auto worker = impl_->workers.find(id);
-    const auto upgrade = impl_->profile_state.upgrades.find(id);
-    result.push_back({plugin.info, plugin.enabled, plugin.approval.mode,
-                      worker == impl_->workers.end() ? std::nullopt : worker->second->Pid(),
-                      upgrade == impl_->profile_state.upgrades.end()
-                          ? std::nullopt : std::optional(upgrade->second.target.info)});
-  }
+  for (const auto& [id, plugin] : impl_->profile_state.plugins) result.push_back(impl_->DescribePlugin(plugin));
   return result;
+}
+
+PluginEventSubscription PluginManager::SubscribeEvents(std::function<void(const PluginEvent&)> callback) {
+  return PluginEventSubscription(impl_->events->Subscribe(std::move(callback)));
+}
+
+std::optional<PluginDiagnostics> PluginManager::Diagnostics(std::string_view plugin_id) const {
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->closed) throw Error(ErrorCode::Closed, "The plugin manager is closed");
+  const auto found = impl_->profile_state.plugins.find(plugin_id);
+  if (found == impl_->profile_state.plugins.end()) return std::nullopt;
+  const auto& installed = found->second;
+  const bool restart_required = installed.approval.mode == ExecutionMode::InProcess &&
+      InProcessVersionRequiresRestart(impl_->profile, plugin_id, installed.info.digest);
+  return impl_->events->Snapshot(impl_->DescribePlugin(installed), restart_required);
+}
+
+PluginInfo PluginManager::Impl::DescribePlugin(const Installed& plugin) const {
+  const auto worker = workers.find(plugin.info.id);
+  const auto upgrade = profile_state.upgrades.find(plugin.info.id);
+  return {plugin.info, plugin.enabled, plugin.approval.mode,
+          worker == workers.end() ? std::nullopt : worker->second->Pid(),
+          upgrade == profile_state.upgrades.end() ? std::nullopt : std::optional(upgrade->second.target.info)};
 }
 
 std::vector<ExtensionInfo> PluginManager::List(std::string_view point, ContractInfo contract,
@@ -1297,7 +1380,8 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
   return MakeLocalExtension(std::move(local), std::string(point), selected->ordinal_, timeout);
 }
 
-std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& installed, PluginStartup startup) {
+std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& installed, PluginStartup startup,
+                                                           std::shared_ptr<PluginRun> run) {
   return CreateLocalPlugin(callbacks, [manager = weak_from_this(), installed]() -> const hpk_plugin_v1& {
     const auto impl = manager.lock();
     if (!impl) throw Error(ErrorCode::Closed, "The plugin manager is closed");
@@ -1314,7 +1398,7 @@ std::shared_ptr<LocalPlugin> PluginManager::Impl::MakeLocal(const Installed& ins
       throw Error(ErrorCode::ContractMismatch, "The plugin does not share the host's C++ ABI and HuxerUI Runtime");
     }
     return *binding;
-  }, std::move(startup), ApprovedServices(installed));
+  }, std::move(startup), ApprovedServices(installed), events, std::move(run));
 }
 
 PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
@@ -1333,13 +1417,13 @@ PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
 }
 
 std::shared_ptr<Worker> PluginManager::Impl::MakeWorker(const Package& package, std::vector<RegisteredService> granted,
-                                                        PluginStartup startup) {
+                                                        PluginStartup startup, std::shared_ptr<PluginRun> run) {
   return std::make_shared<Worker>(*worker_executable, PackageDirectory(package.info.digest) / ModuleName,
-      package.module_file, std::move(granted), callbacks, std::move(startup));
+      package.module_file, std::move(granted), callbacks, std::move(startup), std::move(run));
 }
 
-std::shared_ptr<Worker> PluginManager::Impl::StartWorker(const std::string& id, const std::stop_token& admission,
-                                                        Deadline deadline, std::stop_token stop) {
+WorkerStart PluginManager::Impl::StartWorker(const std::string& id, const std::stop_token& admission,
+                                             Deadline deadline, std::stop_token stop) {
   std::unique_lock lock(mutex);
   if (closed || admission.stop_requested()) throw Error(ErrorCode::Closed, "The plugin generation is closed");
   if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "Extension creation was cancelled");
@@ -1349,20 +1433,39 @@ std::shared_ptr<Worker> PluginManager::Impl::StartWorker(const std::string& id, 
   }
 
   if (const auto running = workers.find(id); running != workers.end()) {
-    if (running->second->Available() && running->second->Pid()) return running->second;
+    if (running->second->Available() && running->second->Pid()) return {running->second, false};
     running->second->Stop();
     running->second->WaitForExit();
     workers.erase(running);
   }
 
-  const auto package = VerifyPackage(installed->second);
-  if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "Extension creation was cancelled");
-  if (std::chrono::steady_clock::now() >= deadline) {
-    throw Error(ErrorCode::DeadlineExceeded, "The plugin call exceeded its deadline before starting the worker");
+  auto run = events->Start(Identity(installed->second.info));
+  auto stage = PluginFailureStage::VerifyPackage;
+  std::shared_ptr<Worker> worker;
+  const auto check_start = [&] {
+    if (stop.stop_requested()) {
+      run->BeginStop(PluginStopReason::Cancelled);
+      if (!worker) run->Stopped();
+      throw Error(ErrorCode::Cancelled, "Extension creation was cancelled");
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      throw Error(ErrorCode::DeadlineExceeded, "The plugin call exceeded its deadline while starting the worker");
+    }
+  };
+  try {
+    const auto package = VerifyPackage(installed->second);
+    check_start();
+    stage = PluginFailureStage::StartWorker;
+    worker = MakeWorker(package, ApprovedServices(installed->second), Startup(installed->second), run);
+    // The new process belongs to this call until it is published for other handles.
+    check_start();
+    workers.emplace(id, worker);
+    return {std::move(worker), true};
+  } catch (...) {
+    run->ActivationFailed(stage, std::current_exception());
+    if (worker) worker->Stop();
+    throw;
   }
-  auto worker = MakeWorker(package, ApprovedServices(installed->second), Startup(installed->second));
-  workers.emplace(id, worker);
-  return worker;
 }
 
 } // namespace huxerui::pluginkit

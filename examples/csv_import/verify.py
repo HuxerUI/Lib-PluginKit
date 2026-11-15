@@ -298,6 +298,7 @@ def verify_streams(host, package, worker_csv, faults, scratch):
         plugin_id = info["id"]
         assert run(host, profile, "install", csv_package, info["digest"], mode, "status")["ok"]
         assert run(host, profile, "install", faults, fault["digest"], mode)["ok"]
+        assert run(host, profile, "check-catalog-events", plugin_id) == {"ok": True, "catalog_events": True}
         check_error(run(host, profile, "import", over_limit, plugin_id), "payload_too_large")
         imported = run(host, profile, "import", at_limit, plugin_id, "15000")
         assert imported["ok"] and imported["issues"][0]["code"] == "csv.column_count", imported
@@ -318,9 +319,12 @@ def verify_streams(host, package, worker_csv, faults, scratch):
                 assert result == {"ok": True, "read": True, "write": True, "close": True}, result
 
         if mode == "worker_process":
-            for callback in ("read", "receiver"):
-                result = run(host, profile, "check-worker-exit-during-callback", plugin_id, callback)
-                assert result == {"ok": True, "callback_cancelled": True, "grants_released": True}, result
+            for operation in ("read", "receiver", "idle"):
+                result = run(host, profile, "check-worker-events", plugin_id, operation, fault["id"])
+                assert result == {"ok": True, "recovered": True}, result
+            assert run(host, profile, "check-clean-diagnostics", plugin_id) == {
+                "ok": True, "installed": True, "clean": True,
+            }
 
         destination = scratch / f"retained {mode}.csv"
         destination.write_bytes(b"retained")
@@ -584,9 +588,11 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
         failed = data / failure
         failed.touch()
         broken, unchanged, context = run(host, profile, commands=[
-            ("upgrade", replacement, old, new), ("list",), ("check-plugin-context", plugin_id),
+            ("check-upgrade-failure-events", replacement, old, new), ("list",), ("check-plugin-context", plugin_id),
         ])
-        check_error(broken, "plugin_failed")
+        assert broken == {"ok": True, "installed": old, "candidate": new, "restart_required": False,
+                          "failed_at_activation": failure == "fail-upgrade",
+                          "failed_at_factory": failure == "fail-exporter"}, broken
         assert plugin(unchanged, plugin_id)["digest"] == old and context["first"][-1] == "200000", (unchanged, context)
         assert (data / "data-format").read_text() == "1" and set((profile / "data").iterdir()) == {data}
         assert not (profile / "packages" / new).exists()
@@ -632,9 +638,10 @@ def verify_upgrade(host, package, faults, replacement, scratch, valid):
     (data / "data-format").write_text("1", encoding="utf-8")
     (data / "fail-exporter").touch()
     assert run(host, rejected, "upgrade", replacement, old, new)["result"] == "restart_required"
-    listed, blocked = run(host, rejected, commands=[("list",), ("import", valid, plugin_id)])
-    assert plugin(listed, plugin_id)["digest"] == old and not listed["importers"] and not listed["exporters"], listed
-    check_error(blocked, "not_found")
+    assert run(host, rejected, "check-pending-upgrade-events", plugin_id) == {
+        "ok": True, "installed": old, "candidate": new, "restart_required": True,
+        "failed_at_activation": False, "failed_at_factory": True,
+    }
     assert (data / "data-format").read_text() == "1"
     recovered = run(host, rejected, "check-plugin-context", plugin_id)
     assert recovered["first"][1:3] == ["0.1.0", old], recovered

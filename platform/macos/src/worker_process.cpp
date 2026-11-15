@@ -65,8 +65,10 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, const std::file
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup startup)
-    : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(startup)) {
+               std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup startup,
+               std::shared_ptr<PluginRun> run)
+    : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(startup)),
+      run_(std::move(run)) {
   int sockets[2];
   if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) {
     PosixError(ErrorCode::Io, "Cannot create worker socket");

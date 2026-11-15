@@ -55,8 +55,10 @@ private:
 } // namespace
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
-               std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup plugin)
-    : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(plugin)) {
+               std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup plugin,
+               std::shared_ptr<PluginRun> run)
+    : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(plugin)),
+      run_(std::move(run)) {
   auto request = CreateWorkerPipe(true);
   auto response = CreateWorkerPipe(false);
   std::array handles{request.read.get(), response.write.get()};
@@ -94,13 +96,14 @@ Worker::Worker(const std::filesystem::path& executable, const std::filesystem::p
   if (ResumeThread(thread.get()) == DWORD(-1)) WindowsError(ErrorCode::Io, "Cannot resume hpk-worker");
 
   pid_ = created.dwProcessId;
+  run_->SetPid(pid_);
   job_ = std::move(job);
   process_ = std::move(process);
   to_worker_ = std::move(request.write);
   from_worker_ = std::move(response.read);
   // A worker can exit while the host is servicing a callback and has no pipe read pending.
-  exit_watch_ = std::jthread([process = process_.get(), exited = exited_stop_]() mutable {
-    if (WaitForSingleObject(process, INFINITE) == WAIT_OBJECT_0) exited.request_stop();
+  exit_watch_ = std::jthread([this] {
+    if (WaitForSingleObject(process_.get(), INFINITE) == WAIT_OBJECT_0) ObserveProcessExit();
   });
 }
 
@@ -129,6 +132,15 @@ void Worker::WaitForExit(std::chrono::milliseconds timeout) {
   const auto result = WaitForSingleObject(process_.get(), static_cast<DWORD>(timeout.count()));
   if (result == WAIT_TIMEOUT) throw Error(ErrorCode::DeadlineExceeded, "The retired plugin worker has not exited");
   if (result != WAIT_OBJECT_0) WindowsError(ErrorCode::Io, "Cannot wait for the retired plugin worker");
+  ObserveProcessExit();
+}
+
+void Worker::ObserveProcessExit() noexcept {
+  DWORD code;
+  std::optional<std::uint32_t> exit_code;
+  if (GetExitCodeProcess(process_.get(), &code)) exit_code = static_cast<std::uint32_t>(code);
+  exited_stop_.request_stop();
+  run_->WorkerExited(exit_code);
 }
 
 Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token stop,
@@ -136,7 +148,8 @@ Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token 
   StreamIo stream_io;
   // A separate pipe helper lets the request thread enforce the I/O deadline.
   return ExchangeFrames(request, deadline, stop, receiver, streams, request.synchronous ? &stream_io : nullptr,
-                        [this, deadline](const Frame& outgoing) {
+                        [this, deadline, activate = request.code == static_cast<std::uint32_t>(Command::Activate)]
+                        (const Frame& outgoing) {
     std::packaged_task<Frame()> exchange([this, &outgoing] {
       WriteFrame([this](std::span<const std::byte> bytes) {
         WriteAll(to_worker_.get(), bytes, ErrorCode::WorkerExited, "Cannot write worker frame");
@@ -149,9 +162,11 @@ Frame Worker::Exchange(const Frame& request, Deadline deadline, std::stop_token 
     std::jthread io(std::move(exchange));
     if (result.wait_until(deadline) != std::future_status::ready) {
       // Interrupt blocked pipe I/O so the thread can join before the frame goes out of scope.
+      const Error error(ErrorCode::DeadlineExceeded, "The plugin worker exceeded the request deadline");
+      ObserveRequestFailure(activate, error);
       Stop();
       CancelSynchronousIo(io.native_handle());
-      throw Error(ErrorCode::DeadlineExceeded, "The plugin worker exceeded the request deadline");
+      throw error;
     }
     return result.get();
   });

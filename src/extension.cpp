@@ -1,4 +1,5 @@
 #include "extension.h"
+#include "plugin_events.h"
 #include "plugin_module.h"
 #include "run_transport.h"
 #include "worker_process.h"
@@ -45,7 +46,7 @@ struct RemoteInstance {
 
 class WorkerExtension final : public ExtensionTarget, public std::enable_shared_from_this<WorkerExtension> {
 public:
-  WorkerExtension(std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start,
+  WorkerExtension(WorkerStarter start,
                   std::chrono::milliseconds timeout, std::stop_token admission, Bytes factory)
       : start_(std::move(start)), timeout_(timeout), admission_(admission), factory_(std::move(factory)) {}
 
@@ -89,7 +90,7 @@ private:
     try {
       Retire(*instance);
     } catch (...) {
-      instance->worker->Stop();
+      instance->worker->Abort(Error(ErrorCode::Io, "Cannot schedule worker instance cleanup"));
     }
   }
 
@@ -100,9 +101,9 @@ private:
           instance.worker->Request({static_cast<std::uint32_t>(Command::Close), instance.id, 0, {}}, DefaultTimeout);
         }
       } catch (const Error& error) {
-        if (error.Code() != ErrorCode::Closed) instance.worker->Stop();
+        if (error.Code() != ErrorCode::Closed) instance.worker->Abort(error);
       } catch (...) {
-        instance.worker->Stop();
+        instance.worker->Abort(Error(ErrorCode::Io, "Cannot release the worker instance"));
       }
     }).detach();
   }
@@ -126,9 +127,8 @@ private:
       ready_.notify_all();
     };
     try {
-      auto worker = start_(deadline, stop);
-      worker->Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, Remaining(deadline), nullptr,
-                      stop, !synchronous);
+      auto [worker, started] = start_(deadline, stop);
+      worker->Activate(deadline, stop, started, !synchronous);
       const auto reply = worker->Request({static_cast<std::uint32_t>(Command::Create), 0, 0, factory_}, Remaining(deadline),
                                          nullptr, stop, !synchronous);
       RemoteInstance created{std::move(worker), reply.instance};
@@ -139,7 +139,7 @@ private:
           try {
             Retire(created);
           } catch (...) {
-            created.worker->Stop();
+            created.worker->Abort(Error(ErrorCode::Io, "Cannot schedule worker instance cleanup"));
           }
         }
         throw Closed();
@@ -183,7 +183,7 @@ private:
                                     !synchronous, streams).payload;
   }
 
-  const std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start_;
+  const WorkerStarter start_;
   const std::chrono::milliseconds timeout_;
   const std::stop_token admission_;
   const Bytes factory_;
@@ -229,8 +229,10 @@ struct LocalCall : LocalInvocation {
 class LocalPlugin : public std::enable_shared_from_this<LocalPlugin> {
 public:
   LocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load, PluginStartup startup,
-              std::vector<RegisteredService> services)
-      : tasks(std::move(tasks)), load_(std::move(load)), startup_(std::move(startup)), services_(std::move(services)) {}
+              std::vector<RegisteredService> services, std::weak_ptr<PluginEvents> events,
+              std::shared_ptr<PluginRun> run)
+      : tasks(std::move(tasks)), load_(std::move(load)), startup_(std::move(startup)), services_(std::move(services)),
+        events_(std::move(events)), run_(std::move(run)) {}
 
   ~LocalPlugin() {
     if (!activation_) return;
@@ -245,11 +247,7 @@ public:
   void* Ensure(LocalInstance& instance) {
     Check(instance);
     if (instance.object) return instance.object;
-    if (!activation_) {
-      const auto& binding = load_();
-      activation_ = ActivatePlugin(binding, startup_, HPK_IN_PROCESS);
-      binding_ = &binding;
-    }
+    if (!activation_) Activate();
     instance.factory = FindExtension(*binding_, instance.point, instance.ordinal);
     if (!instance.factory) throw Error(ErrorCode::NotFound, "The plugin has no such factory at this extension point");
     const auto status = instance.factory->create(activation_, &instance.object);
@@ -363,8 +361,9 @@ public:
     Sweep();
   }
 
-  void BeginShutdown() {
+  void BeginShutdown(PluginStopReason reason) {
     if (std::exchange(closing, true)) return;
+    if (run_) run_->BeginStop(reason);
     while (!queued_.empty()) {
       auto call = queued_.front();
       Interrupt(call, ErrorCode::Closed);
@@ -487,9 +486,27 @@ private:
     });
     if (closing && !active_ && instances.empty() && !finished_) {
       if (activation_) binding_->deactivate(std::exchange(activation_, nullptr));
+      if (run_) run_->Stopped();
       finished_ = true;
       for (const auto& waiter : shutdown_waiters_) waiter.Complete();
       shutdown_waiters_.clear();
+    }
+  }
+
+  void Activate() {
+    if (!run_) {
+      if (const auto events = events_.lock()) run_ = events->Start(startup_.identity);
+    }
+    try {
+      const auto& binding = load_();
+      activation_ = ActivatePlugin(binding, startup_, HPK_IN_PROCESS);
+      binding_ = &binding;
+      if (run_) run_->Activated();
+    } catch (...) {
+      if (const auto run = std::exchange(run_, {})) {
+        run->ActivationFailed(PluginFailureStage::Activate, std::current_exception());
+      }
+      throw;
     }
   }
 
@@ -498,6 +515,8 @@ private:
   std::function<const hpk_plugin_v1&()> load_;
   PluginStartup startup_;
   std::vector<RegisteredService> services_;
+  std::weak_ptr<PluginEvents> events_;
+  std::shared_ptr<PluginRun> run_;
   std::deque<std::shared_ptr<LocalCall>> queued_;
   std::shared_ptr<LocalCall> active_;
   std::vector<CallbackCompletion<void>> shutdown_waiters_;
@@ -551,11 +570,15 @@ private:
 };
 
 std::shared_ptr<LocalPlugin> CreateLocalPlugin(TaskScope tasks, std::function<const hpk_plugin_v1&()> load,
-                                               PluginStartup startup, std::vector<RegisteredService> services) {
-  return std::make_shared<LocalPlugin>(std::move(tasks), std::move(load), std::move(startup), std::move(services));
+                                               PluginStartup startup, std::vector<RegisteredService> services,
+                                               std::weak_ptr<PluginEvents> events, std::shared_ptr<PluginRun> run) {
+  return std::make_shared<LocalPlugin>(std::move(tasks), std::move(load), std::move(startup), std::move(services),
+                                       std::move(events), std::move(run));
 }
 
-void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin) { plugin->BeginShutdown(); }
+void BeginLocalShutdown(const std::shared_ptr<LocalPlugin>& plugin, PluginStopReason reason) {
+  plugin->BeginShutdown(reason);
+}
 
 Task<void> FinishLocalShutdown(std::shared_ptr<LocalPlugin> plugin) { co_await plugin->FinishShutdown(); }
 
@@ -568,9 +591,8 @@ std::shared_ptr<ExtensionTarget> MakeLocalExtension(std::shared_ptr<LocalPlugin>
   return std::make_shared<LocalExtension>(std::move(plugin), std::move(point), ordinal, timeout);
 }
 
-std::shared_ptr<ExtensionTarget> MakeWorkerExtension(
-    std::function<std::shared_ptr<Worker>(Deadline, std::stop_token)> start, std::chrono::milliseconds timeout,
-    std::stop_token admission, Bytes factory) {
+std::shared_ptr<ExtensionTarget> MakeWorkerExtension(WorkerStarter start, std::chrono::milliseconds timeout,
+                                                     std::stop_token admission, Bytes factory) {
   return std::make_shared<WorkerExtension>(std::move(start), timeout, admission, std::move(factory));
 }
 

@@ -224,12 +224,40 @@ Frame Worker::DispatchStream(Frame frame, Deadline deadline, std::stop_token sto
       }, deadline, stop, streams.get());
 }
 
+void Worker::ObserveRequestFailure(bool activate, const Error& error) noexcept {
+  if (error.Code() == ErrorCode::WorkerExited) {
+    run_->Disconnected();
+  } else if (!shutting_down_) {
+    if (activate) {
+      run_->ActivationFailed(PluginFailureStage::Activate, std::make_exception_ptr(error));
+    } else {
+      const auto reason = error.Code() == ErrorCode::DeadlineExceeded
+          ? PluginStopReason::DeadlineExceeded : PluginStopReason::TransportError;
+      run_->BeginStop(reason, error.Code(), error.what());
+    }
+  }
+}
+
+void Worker::Abort(const Error& error) noexcept {
+  ObserveRequestFailure(false, error);
+  Stop();
+}
+
+void Worker::Activate(Deadline deadline, std::stop_token stop, bool started, bool wait_for_slot) {
+  Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, deadline, nullptr, stop, wait_for_slot, {}, started);
+}
+
 Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const ReceiverRegistration* receiver,
                        std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams) {
   if (timeout <= std::chrono::milliseconds::zero() || timeout > std::chrono::hours(24)) {
     throw Error(ErrorCode::InvalidArgument, "Worker timeout must be between 1 ms and 24 hours");
   }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  return Request(std::move(request), std::chrono::steady_clock::now() + timeout, receiver, stop,
+                 wait_for_slot, std::move(streams));
+}
+
+Frame Worker::Request(Frame request, Deadline deadline, const ReceiverRegistration* receiver,
+                       std::stop_token stop, bool wait_for_slot, std::shared_ptr<CallStreams> streams, bool started) {
   const bool shutdown = request.code == static_cast<std::uint32_t>(Command::Shutdown);
   const bool activate = request.code == static_cast<std::uint32_t>(Command::Activate);
   {
@@ -241,9 +269,15 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     request_ready_.wait_until(lock, stop, deadline, [&] {
       return !request_active_ || !active_ || (shutting_down_ && !shutdown);
     });
-    // A queued cancellation releases only this call; the active exchange keeps its worker.
-    if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
-    if (std::chrono::steady_clock::now() >= deadline) throw Error(ErrorCode::DeadlineExceeded, "The request expired in the worker queue");
+    // The caller that started an idle worker can retire it if its first activation expires.
+    // An expired call sharing an existing worker leaves it available to the other callers.
+    const bool initial_activation = activate && started && !request_active_ && !activated_ && active_ && !shutting_down_;
+    if (!initial_activation) {
+      if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
+      if (std::chrono::steady_clock::now() >= deadline) {
+        throw Error(ErrorCode::DeadlineExceeded, "The request expired in the worker queue");
+      }
+    }
     if (!active_ || (shutting_down_ && !shutdown)) throw Error(ErrorCode::Closed, "The plugin generation is closed");
     request_active_ = true;
     request_maintenance_ = request.code == static_cast<std::uint32_t>(Command::Close) || shutdown;
@@ -256,6 +290,7 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
   if (streams) streams->SetDeadline(deadline);
   if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
   if (!Pid()) {
+    run_->Disconnected();
     Stop();
     throw Error(ErrorCode::WorkerExited, "The plugin worker exited");
   }
@@ -268,9 +303,13 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
     std::stop_callback interrupt(stop, [this] {
       try {
         PostTransportCancellation([worker = weak_from_this()] {
-          if (const auto active = worker.lock()) active->Stop();
+          if (const auto active = worker.lock()) {
+            active->run_->BeginStop(PluginStopReason::Cancelled);
+            active->Stop();
+          }
         });
       } catch (...) {
+        run_->BeginStop(PluginStopReason::Cancelled);
         Stop();
       }
     });
@@ -288,17 +327,26 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
   } catch (const Error& error) {
     // Retire a failed exchange so a late reply cannot be read as the next request's response.
     const bool closed = !active_;
+    if (stop.stop_requested()) run_->BeginStop(PluginStopReason::Cancelled);
+    else ObserveRequestFailure(activate, error);
     Stop();
     if (stop.stop_requested()) throw Error(ErrorCode::Cancelled, "The call was cancelled");
     if (closed && error.Code() != ErrorCode::DeadlineExceeded) {
+      // Opening a new generation from the exit event may have retired this worker already.
+      if (!shutting_down_ && run_->ExitedUnexpectedly()) {
+        throw Error(ErrorCode::WorkerExited, "The plugin worker exited");
+      }
       throw Error(ErrorCode::Closed, "The plugin generation is closed");
     }
     throw;
   } catch (...) {
+    if (activate) run_->ActivationFailed(PluginFailureStage::Activate, std::current_exception());
+    else run_->BeginStop(PluginStopReason::TransportError, ErrorCode::PluginFailed, "The worker exchange failed");
     Stop();
     throw;
   }
   if (stop.stop_requested()) {
+    run_->BeginStop(PluginStopReason::Cancelled);
     Stop();
     throw Error(ErrorCode::Cancelled, "The call was cancelled");
   }
@@ -314,22 +362,31 @@ Frame Worker::Request(Frame request, std::chrono::milliseconds timeout, const Re
           ? reply.instance == 0 && reply.payload.empty()
           : reply.instance != 0 && (request.instance == 0 || request.instance == reply.instance);
       if (valid) {
-        if (activate) activated_ = true;
+        if (activate) {
+          activated_ = true;
+          run_->Activated();
+        }
         if (streams) streams->CheckOutput();
         return reply;
       }
     } else if (IsErrorCode(reply.code) && reply.instance == 0 &&
                IsUtf8(AsText(reply.payload))) {
-      if (activate) Stop();
-      throw Error(static_cast<ErrorCode>(reply.code), std::string(AsText(reply.payload)));
+      const Error error(static_cast<ErrorCode>(reply.code), std::string(AsText(reply.payload)));
+      if (activate) {
+        run_->ActivationFailed(PluginFailureStage::Activate, std::make_exception_ptr(error));
+        Stop();
+      }
+      throw error;
     }
   }
+  const Error error(ErrorCode::Protocol, "Invalid worker response");
+  ObserveRequestFailure(activate, error);
   Stop();
-  throw Error(ErrorCode::Protocol, "Invalid worker response");
+  throw error;
 }
 
 void Worker::ValidateFactories(std::stop_token stop) {
-  Request({static_cast<std::uint32_t>(Command::Activate), 0, 0, {}}, DefaultTimeout, nullptr, stop);
+  Activate(std::chrono::steady_clock::now() + DefaultTimeout, stop, true);
   // Exercise each factory on the candidate's activation before the manager commits the package.
   for (const auto& extension : startup_.extensions) {
     auto factory = ExtensionPayload(extension.point, extension.ordinal);
@@ -339,7 +396,8 @@ void Worker::ValidateFactories(std::stop_token stop) {
   }
 }
 
-void Worker::BeginShutdown() noexcept {
+void Worker::BeginShutdown(PluginStopReason reason) noexcept {
+  run_->BeginStop(reason);
   {
     std::lock_guard lock(requests_);
     shutting_down_ = true;
