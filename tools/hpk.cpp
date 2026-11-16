@@ -1,12 +1,16 @@
 #include "digest.h"
+#include "hpk_commands.h"
 
 #include <clang-c/Index.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <exception>
+#include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -55,7 +59,8 @@ fs::path CursorPath(CXFile file) {
 
 std::string QualifiedName(CXCursor cursor) {
   auto name = Name(cursor);
-  for (auto parent = clang_getCursorSemanticParent(cursor); parent.kind == CXCursor_Namespace;
+  for (auto parent = clang_getCursorSemanticParent(cursor);
+       parent.kind == CXCursor_Namespace || parent.kind == CXCursor_ClassDecl || parent.kind == CXCursor_StructDecl;
        parent = clang_getCursorSemanticParent(parent)) {
     name = Name(parent) + "::" + name;
   }
@@ -85,20 +90,6 @@ bool InHeader(CXCursor cursor) { return clang_Location_isFromMainFile(clang_getC
               ": " + std::string(message));
 }
 
-CXCursor FindInterface(CXCursor parent, std::string_view name) {
-  for (const auto cursor : Children(parent)) {
-    if (!InHeader(cursor)) continue;
-    if (cursor.kind == CXCursor_Namespace) {
-      const auto nested = FindInterface(cursor, name);
-      if (!clang_Cursor_isNull(nested)) return nested;
-    } else if ((cursor.kind == CXCursor_ClassDecl || cursor.kind == CXCursor_StructDecl) &&
-               clang_isCursorDefinition(cursor) && QualifiedName(cursor) == name) {
-      return cursor;
-    }
-  }
-  return clang_getNullCursor();
-}
-
 struct Type {
   std::string cpp;
   std::string wire;
@@ -122,7 +113,7 @@ struct Parameter {
   Type type;
   std::string name;
   bool reference = false;
-  std::string receiver_header;
+  fs::path receiver_source;
   std::string receiver_schema;
 };
 
@@ -167,6 +158,48 @@ bool IsRemote(CXCursor cursor) {
   return std::ranges::any_of(Children(cursor), [](CXCursor child) {
     return child.kind == CXCursor_AnnotateAttr && Name(child) == "hpk.remote";
   });
+}
+
+struct HeaderInterfaces {
+  std::vector<CXCursor> definitions;
+  bool uses_marker = false;
+};
+
+void FindInterfaces(CXCursor parent, HeaderInterfaces& interfaces) {
+  for (const auto cursor : Children(parent)) {
+    if (!InHeader(cursor)) continue;
+    if (cursor.kind == CXCursor_MacroExpansion) {
+      const auto name = Name(cursor);
+      if (name == "HPK_REMOTE" || name == "HPK_REMOTE_CONTRACT") interfaces.uses_marker = true;
+    } else if (cursor.kind == CXCursor_Namespace || cursor.kind == CXCursor_LinkageSpec) {
+      FindInterfaces(cursor, interfaces);
+    } else if ((cursor.kind == CXCursor_ClassDecl || cursor.kind == CXCursor_StructDecl) &&
+               clang_isCursorDefinition(cursor)) {
+      if (IsRemote(cursor)) interfaces.definitions.push_back(cursor);
+      FindInterfaces(cursor, interfaces);
+    }
+  }
+}
+
+std::pair<std::string, std::uint32_t> ContractIdentity(CXCursor interface, std::string_view qualified_name) {
+  constexpr std::string_view prefix = "hpk.contract:";
+  for (const auto child : Children(interface)) {
+    if (child.kind != CXCursor_AnnotateAttr) continue;
+    const auto annotation = Name(child);
+    if (!annotation.starts_with(prefix)) continue;
+    const std::string_view identity(annotation.data() + prefix.size(), annotation.size() - prefix.size());
+    const auto separator = identity.find(':');
+    const auto id = identity.substr(0, separator);
+    if (separator == std::string_view::npos || !IsId(id)) Reject(interface, "Invalid explicit contract ID");
+    std::uint32_t version = 0;
+    const auto number = identity.substr(separator + 1);
+    const auto conversion = std::from_chars(number.data(), number.data() + number.size(), version);
+    if (conversion.ec != std::errc{} || conversion.ptr != number.data() + number.size() || !version) {
+      Reject(interface, "The explicit contract version must be a positive 32-bit decimal integer");
+    }
+    return {std::string(id), version};
+  }
+  return {"cpp." + Sha256(AsBytes(qualified_name)), 1};
 }
 
 struct CodecDefinition {
@@ -339,14 +372,10 @@ private:
           clang_isConstQualifiedType(callback) || clang_isVolatileQualifiedType(callback)) {
         Reject(argument, "Use a by-value shared_ptr to an HPK_REMOTE callback from a separate header on a Task operation");
       }
-      auto binding = CursorPath(file).lexically_relative(CursorPath(interface_file).parent_path());
-      if (binding.empty()) Reject(argument, "Could not locate the callback contract relative to this header");
-      binding.replace_extension(".bindings.h");
-      const auto relative = binding.generic_u8string();
       const Schema reflected(declaration, definitions_, true);
       const auto shape = reflected.Describe(reflected.interface_name, 1).dump();
       return {ParameterKind::Receiver, {"::" + reflected.interface_name, reflected.interface_name}, Name(argument), false,
-              std::string(relative.begin(), relative.end()), Sha256(AsBytes(shape))};
+              CursorPath(file), Sha256(AsBytes(shape))};
     }
 
     const auto reference = canonical.kind == CXType_LValueReference;
@@ -723,20 +752,8 @@ void EmitValueCodec(std::ostream& out, const ValueCodec& codec, std::string_view
   out << "};\n  }\n};\n\n";
 }
 
-std::string EmitBindings(const Schema& schema, std::string_view header, std::string_view id, std::uint32_t version,
-                         std::string_view fingerprint) {
-  std::ostringstream out;
-  out << "#pragma once\n\n"
-      << "/// @file\n/// @brief Generated bindings shared by the host and the plugin.\n"
-      << "///\n/// Include this header in plugin code that implements or calls the published interface.\n\n"
-      << "#include \"" << header << "\"\n#include <huxerui/pluginkit/detail/extension.h>\n";
-  std::set<std::string> receiver_headers;
-  for (const auto& operation : schema.operations) {
-    for (const auto& parameter : operation.parameters) {
-      if (!parameter.receiver_header.empty()) receiver_headers.insert(parameter.receiver_header);
-    }
-  }
-  for (const auto& receiver : receiver_headers) out << "#include \"" << receiver << "\"\n";
+void EmitBinding(std::ostream& out, const Schema& schema, std::string_view id, std::uint32_t version,
+                 std::string_view fingerprint) {
   const auto type = "::" + schema.interface_name;
   if (!schema.value_codecs.empty()) {
     out << "\nnamespace huxerui::pluginkit::detail {\n\n";
@@ -824,7 +841,6 @@ std::string EmitBindings(const Schema& schema, std::string_view header, std::str
     out << "};\n\n";
   }
   out << "} // namespace huxerui::pluginkit\n";
-  return out.str();
 }
 
 std::string EmitHost(std::string_view bindings) {
@@ -836,84 +852,192 @@ std::string EmitHost(std::string_view bindings) {
   return out.str();
 }
 
-void Generate(const fs::path& header, std::string_view interface_name, std::string_view id, std::uint32_t version,
-              const fs::path& output, std::vector<std::string> options) {
-  if (!IsId(id) || !version) throw Error(ErrorCode::InvalidArgument, "Invalid contract ID or version");
-  const auto path = PathText(fs::absolute(header));
-  const auto source = ReadFileBytes(header, 1024 * 1024);
-  const auto text = AsText(source);
-  // Parse the exact header bytes that will be copied into the SDK.
-  CXUnsavedFile input{path.c_str(), text.data(), static_cast<unsigned long>(text.size())};
+std::vector<std::string> CompilerArguments(const fs::path& base, std::span<const fs::path> options) {
   std::vector<std::string> arguments{
       HPK_CLANG_EXECUTABLE, "-x", "c++", "-std=c++20", "--target=" HPK_CLANG_TARGET,
-      "-resource-dir=" HPK_CLANG_RESOURCE_DIR, "-DHPK_GENERATOR=1"};
+      "-resource-dir=" HPK_CLANG_RESOURCE_DIR, "-DHPK_GENERATOR=1", "-I" + PathText(base)};
 #if defined(HPK_CLANG_SYSROOT)
   arguments.insert(arguments.end(), {"-isysroot", HPK_CLANG_SYSROOT});
 #endif
-  arguments.insert(arguments.end(), options.begin(), options.end());
-  std::vector<const char*> argv;
-  for (const auto& argument : arguments) argv.push_back(argument.c_str());
-  std::unique_ptr<void, decltype(&clang_disposeIndex)> index(clang_createIndex(0, 0), clang_disposeIndex);
-  CXTranslationUnit raw = nullptr;
-  const auto status = clang_parseTranslationUnit2FullArgv(index.get(), path.c_str(), argv.data(),
-      static_cast<int>(argv.size()), &input, 1, CXTranslationUnit_SkipFunctionBodies, &raw);
-  std::unique_ptr<std::remove_pointer_t<CXTranslationUnit>, decltype(&clang_disposeTranslationUnit)> unit(
-      raw, clang_disposeTranslationUnit);
-  if (status != CXError_Success) throw Error(ErrorCode::InvalidArgument, "Clang could not open the contract header");
+  for (const auto& option : options) arguments.push_back(PathText(option));
+  return arguments;
+}
+
+void CheckDiagnostics(CXTranslationUnit unit, const std::string& path) {
   bool failed = false;
-  for (unsigned i = 0; i < clang_getNumDiagnostics(unit.get()); ++i) {
-    const auto diagnostic = clang_getDiagnostic(unit.get(), i);
+  for (unsigned i = 0; i < clang_getNumDiagnostics(unit); ++i) {
+    const auto diagnostic = clang_getDiagnostic(unit, i);
     if (clang_getDiagnosticSeverity(diagnostic) >= CXDiagnostic_Error) {
       std::cerr << Text(clang_formatDiagnostic(diagnostic, clang_defaultDiagnosticDisplayOptions())) << '\n';
       failed = true;
     }
     clang_disposeDiagnostic(diagnostic);
   }
-  if (failed) throw Error(ErrorCode::InvalidArgument, "Clang rejected the contract header");
-  const auto interface = FindInterface(clang_getTranslationUnitCursor(unit.get()), interface_name);
-  if (clang_Cursor_isNull(interface)) throw Error(ErrorCode::InvalidArgument, "Interface definition was not found in the contract header");
-  WireDefinitions definitions;
-  FindWireDefinitions(clang_getTranslationUnitCursor(unit.get()), definitions);
-  const Schema schema(interface, definitions);
-  auto manifest = schema.Describe(id, version);
-  // Hash the compact schema before adding its fingerprint to the published manifest.
-  const auto fingerprint = Sha256(AsBytes(manifest.dump()));
-  manifest["fingerprint"] = fingerprint;
-
-  auto bindings = header.stem();
-  bindings += ".bindings.h";
-  auto host = header.stem();
-  host += ".host.h";
-  fs::create_directories(output);
-  WriteAtomicFile(output / header.filename(), source);
-  WriteAtomicFile(output / bindings, AsBytes(EmitBindings(schema, PathText(header.filename()), id, version, fingerprint)));
-  WriteAtomicFile(output / host, AsBytes(EmitHost(PathText(bindings))));
-  WriteAtomicFile(output / "contract.json", AsBytes(manifest.dump(2)));
+  if (failed) throw Error(ErrorCode::InvalidArgument, "Clang rejected " + path);
 }
 
-int Run(std::span<const fs::path> args) {
-  if (args.size() < 7 || args[1] != "gen" || (args.size() > 7 && args[7] != "--")) {
-    std::cerr << "Usage: hpk gen <header> <qualified-interface> <contract-id> <version> <sdk-dir> [-- <clang-options>]\n";
-    return 1;
+using SdkHeaders = std::map<fs::path, fs::path>;
+
+SdkHeaders ReadSdkHeaders(const fs::path& base, const fs::path& list) {
+  std::ifstream input(list);
+  if (!input) throw Error(ErrorCode::Io, "Cannot read SDK header list " + PathText(list));
+  SdkHeaders headers;
+  for (std::string name; std::getline(input, name);) {
+    if (name.ends_with('\r')) name.pop_back();
+    if (name.empty()) continue;
+    const fs::path path(std::u8string(name.begin(), name.end()));
+    const auto source = fs::canonical(base / path);
+    auto published = source.lexically_relative(base);
+    if (published.empty() || *published.begin() == ".." || published == ".") {
+      throw Error(ErrorCode::InvalidArgument, "SDK header " + PathText(source) + " is outside " + PathText(base));
+    }
+    headers.try_emplace(source, std::move(published));
   }
-  try {
-    std::vector<std::string> options;
-    for (std::size_t i = 8; i < args.size(); ++i) options.push_back(PathText(args[i]));
-    Generate(args[2], PathText(args[3]), PathText(args[4]),
-             ParseInteger<std::uint32_t>(PathText(args[5]), "contract version"), args[6], std::move(options));
-  } catch (const std::exception& error) {
-    std::cerr << "hpk: " << error.what() << '\n';
-    return 1;
+  if (input.bad()) throw Error(ErrorCode::Io, "Cannot read SDK header list " + PathText(list));
+  return headers;
+}
+
+struct SdkFile {
+  fs::path source;
+  std::string contents;
+};
+
+struct SdkPathLess {
+  bool operator()(const fs::path& left, const fs::path& right) const noexcept {
+#if defined(_WIN32)
+    return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+#else
+    return left < right;
+#endif
   }
-  return 0;
+};
+
+using SdkFiles = std::map<fs::path, SdkFile, SdkPathLess>;
+
+[[noreturn]] void RejectSdkPath(const fs::path& path, const fs::path& first, const fs::path& second) {
+  throw Error(ErrorCode::InvalidArgument,
+              "SDK path " + PathText(path) + " conflicts between " + PathText(first) + " and " + PathText(second));
+}
+
+void AddSdkFile(SdkFiles& files, const fs::path& path, const fs::path& source, std::string contents) {
+  const auto [existing, inserted] = files.try_emplace(path, source, std::move(contents));
+  if (!inserted) RejectSdkPath(path, existing->second.source, source);
+}
+
+void GenerateHeader(CXIndex index, const fs::path& header, const fs::path& relative, const SdkHeaders& headers,
+                    std::span<const char* const> arguments, SdkFiles& files) {
+  const auto path = PathText(header);
+  const auto source = ReadFileBytes(header, 1024 * 1024);
+  const auto text = AsText(source);
+  AddSdkFile(files, relative, header, std::string(text));
+  if (text.empty()) return;
+
+  // Each header gets its own translation unit so WireCodec uses that header's include graph.
+  CXUnsavedFile input{path.c_str(), text.data(), static_cast<unsigned long>(text.size())};
+  CXTranslationUnit raw = nullptr;
+  constexpr auto flags = CXTranslationUnit_SkipFunctionBodies | CXTranslationUnit_KeepGoing |
+      CXTranslationUnit_DetailedPreprocessingRecord;
+  const auto status = clang_parseTranslationUnit2FullArgv(index, path.c_str(), arguments.data(),
+      static_cast<int>(arguments.size()), &input, 1, flags, &raw);
+  std::unique_ptr<std::remove_pointer_t<CXTranslationUnit>, decltype(&clang_disposeTranslationUnit)> unit(
+      raw, clang_disposeTranslationUnit);
+  if (status != CXError_Success) throw Error(ErrorCode::InvalidArgument, "Clang could not open " + path);
+  const auto cursor = clang_getTranslationUnitCursor(unit.get());
+  HeaderInterfaces interfaces;
+  FindInterfaces(cursor, interfaces);
+  // Auxiliary headers can include bindings that this scan will generate.
+  if (!interfaces.definitions.empty() || interfaces.uses_marker) CheckDiagnostics(unit.get(), path);
+  if (interfaces.definitions.empty()) return;
+
+  WireDefinitions definitions;
+  FindWireDefinitions(cursor, definitions);
+  std::set<std::string> receivers;
+  std::ostringstream body;
+  auto contracts = Json::array();
+  for (const auto interface : interfaces.definitions) {
+    const Schema schema(interface, definitions);
+    const auto [id, version] = ContractIdentity(interface, schema.interface_name);
+    auto manifest = schema.Describe(id, version);
+    // Hash the wire schema before adding its publication metadata.
+    const auto fingerprint = Sha256(AsBytes(manifest.dump()));
+    manifest["fingerprint"] = fingerprint;
+    manifest["interface"] = schema.interface_name;
+    for (const auto& operation : schema.operations) {
+      for (const auto& parameter : operation.parameters) {
+        if (parameter.receiver_source.empty()) continue;
+        const auto receiver = headers.find(fs::canonical(parameter.receiver_source));
+        if (receiver == headers.end()) {
+          Reject(interface, "Add callback contract header " + PathText(parameter.receiver_source) + " to HEADERS");
+        }
+        // Resolve the include between the two published headers.
+        auto binding = receiver->second;
+        binding.replace_extension(".bindings.h");
+        const auto include = binding.lexically_relative(relative.parent_path()).generic_u8string();
+        receivers.emplace(include.begin(), include.end());
+      }
+    }
+    EmitBinding(body, schema, id, version, fingerprint);
+    contracts.push_back(std::move(manifest));
+  }
+
+  std::ostringstream bindings;
+  bindings << "#pragma once\n\n"
+           << "/// @file\n/// @brief Generated bindings shared by the host and the plugin.\n"
+           << "///\n/// Include this header in plugin code that implements or calls the published interfaces.\n\n"
+           << "#include \"" << PathText(relative.filename()) << "\"\n#include <huxerui/pluginkit/detail/extension.h>\n";
+  for (const auto& receiver : receivers) bindings << "#include \"" << receiver << "\"\n";
+  bindings << body.view();
+
+  auto artifact = relative;
+  artifact.replace_extension(".bindings.h");
+  const auto bindings_name = PathText(artifact.filename());
+  AddSdkFile(files, artifact, header, std::move(bindings).str());
+  artifact = relative;
+  AddSdkFile(files, artifact.replace_extension(".host.h"), header, EmitHost(bindings_name));
+  artifact = relative;
+  AddSdkFile(files, artifact.replace_extension(".contract.json"), header, contracts.dump(2));
+}
+
+void Generate(const fs::path& base, const fs::path& output, const fs::path& list, std::span<const fs::path> options) {
+  if (base == output) throw Error(ErrorCode::InvalidArgument, "The SDK output directory must differ from the header base");
+  const auto headers = ReadSdkHeaders(base, list);
+  const auto arguments = CompilerArguments(base, options);
+  std::vector<const char*> argv;
+  for (const auto& argument : arguments) argv.push_back(argument.c_str());
+  std::unique_ptr<void, decltype(&clang_disposeIndex)> index(clang_createIndex(0, 0), clang_disposeIndex);
+
+  SdkFiles files;
+  for (const auto& [source, relative] : headers) {
+    GenerateHeader(index.get(), source, relative, headers, argv, files);
+  }
+  for (const auto& [relative, file] : files) {
+    for (auto parent = relative.parent_path(); !parent.empty(); parent = parent.parent_path()) {
+      const auto existing = files.find(parent);
+      if (existing != files.end()) RejectSdkPath(parent, existing->second.source, file.source);
+    }
+  }
+  fs::create_directories(output);
+  std::string inventory;
+  for (const auto& [relative, file] : files) {
+    const auto path = output / relative;
+    fs::create_directories(path.parent_path());
+    WriteAtomicFile(path, AsBytes(file.contents));
+    const auto name = relative.generic_u8string();
+    inventory.append(name.begin(), name.end());
+    inventory.push_back('\n');
+  }
+  // Publish the file list only after all headers and bindings are ready.
+  WriteAtomicFile(output / ".hpk-sdk-files", AsBytes(inventory));
 }
 
 } // namespace
 
-#if defined(_WIN32)
-int wmain(int argc, wchar_t** argv) {
-#else
-int main(int argc, char** argv) {
-#endif
-  return Run(std::vector<fs::path>(argv, argv + argc));
+void huxerui::pluginkit::detail::GenerateSdk(std::span<const fs::path> args) {
+  if (args.size() < 3 || (args.size() > 3 && args[3] != "--")) {
+    throw Error(ErrorCode::InvalidArgument,
+                "Usage: hpk gen <base-directory> <output-dir> <header-list> [-- <clang-options>]");
+  }
+  const auto base = fs::canonical(fs::absolute(args[0]));
+  const auto output = fs::weakly_canonical(fs::absolute(args[1]));
+  Generate(base, output, args[2], args.subspan(std::min<std::size_t>(4, args.size())));
 }

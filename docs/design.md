@@ -14,7 +14,7 @@ The developer CLI is `hpk` (HuxerUI Plugin Kit). The target application can ship
 
 ## Contracts and generated SDK
 
-The application declares a stable contract ID and version for a C++ interface in its build configuration. The interface uses ordinary C++ signatures and carries `HPK_REMOTE` when it supports worker execution.
+The application declares its interfaces with ordinary C++ signatures under its public SDK root. `HPK_REMOTE` marks an interface for worker execution. The generator derives the contract ID from the qualified C++ name and defaults to version 1. `HPK_REMOTE_CONTRACT(id, version)` assigns an explicit identity.
 
 ```cpp
 #include <huxerui/pluginkit/contract.h>
@@ -37,7 +37,7 @@ public:
 };
 ```
 
-`hpk gen` parses the marked interface with Clang using its compilation options. It generates the schema, typed forwarding methods, and worker dispatch. The published SDK includes the original declarations and generated files. A plugin author implements the interfaces, binds each factory to a point with `BindExtension`, and exports the table with `HPK_EXPORT_PLUGIN`. Unsupported declarations receive source-located diagnostics. [Clang LibTooling](https://clang.llvm.org/docs/LibTooling.html)
+`hpk_add_sdk()` expands its `HEADERS` file and directory inputs into one list. Files are published relative to `BASE_DIRECTORY`, which defaults to the sole selected directory or the current CMake source directory. `hpk gen` uses Clang to find marked definitions in the selected files and generates the schema, typed forwarding methods, and worker dispatch. Interfaces declared in the same header share its generated files. Generated includes use the published header paths. A plugin author implements the interfaces, binds each factory to a point with `BindExtension`, and exports the table with `HPK_EXPORT_PLUGIN`. Unsupported declarations receive source-located diagnostics. [Clang LibTooling](https://clang.llvm.org/docs/LibTooling.html)
 
 Portable signatures use fixed-width scalars, enums, UTF-8 strings, byte sequences, lists, optional values, records composed of those types, and Kit-managed handles. A const reference parameter is encoded as a value and has call-scoped lifetime in the implementation. The generated binding constructs and destroys C++ objects on their owning side. Host services use the same contract model in the reverse direction. [Windows DLL memory ownership guidance](https://learn.microsoft.com/en-us/cpp/c-runtime-library/potential-errors-passing-crt-objects-across-dll-boundaries?view=msvc-170)
 
@@ -113,7 +113,7 @@ The manifest parser assigns each factory a zero-based ordinal within its point. 
 
 At installation the manager checks that every point is registered and supports the selected mode. Before running `OnActivate`, the loader checks the full table of declared factories against the plugin's exports and compares each exported contract ID, version, and fingerprint with the host point's registered contract. The SDK generates this identity for remote interfaces.
 
-Published content is immutable for a release and target. The manager checks manifest and library sizes before installing content into its managed store. The planned `hpk pack` tool supports target selection and publisher signatures.
+Published content is immutable for a release and target. The manager checks manifest and library sizes before installing content into its managed store. `hpk pack` uses the same package inspection to compute the approval digest. Publisher signatures are a planned distribution feature.
 
 Discovery reads manifests from explicit local sources and configured repositories. Package selection checks the operating system, architecture, artifact ABI, supported contracts, execution policy, and permissions before activation. The loader checks the plugin descriptor against the verified package. A contribution can advertise a command or file type before its implementation runs.
 
@@ -192,11 +192,14 @@ An upgrade takes the latest saved overrides when it applies, including edits mad
 | --- | --- |
 | `hpk gen` and `hpk check` | Generate the contract SDK and check ABI lock and version changes. |
 | `hpk new` | Scaffold a plugin project from a published application SDK. |
-| `hpk pack` and `hpk verify` | Stage and verify target artifacts and their HuxerUI resources for distribution. |
+| `hpk pack` | Build and inspect a selected installable package directory and report its digest. |
+| `hpk verify` | Verify distribution artifacts and publisher signatures. |
 | `hpk index` | Produce repository metadata for publishing packages. |
 | `hpk test` and `hpk doctor` | Exercise contract and lifecycle behavior. Explain compatibility, dependency, permission, and activation failures. |
 
 CMake, mcpp, and xmake integrate through the same host tool and artifact specifications. Build integrations pass compilation options to `hpk` and use the executable supplied by the SDK. Generated SDKs are build artifacts published with the contract metadata. The target runtime consumes the generated bindings and ships the matching `hpk-worker` where required.
+
+`hpk_add_plugin()` attaches the SDK and package target to an existing CMake library. It takes the SDK directory from its module location by default and stages an installable directory at `packages/<target>/<configuration>` under the CMake build root. Its package target is part of the default build. `hpk pack` runs `huxerui build` and scans the fixed SDK, platform, ABI, and build configuration layout under `.huxerui/build`. Completed package targets briefly record the current invocation beside their staged directories so stale artifacts cannot enter the selection. Use the CMake target name to select one package when several are built. The tool runs `InspectPackage()` on the selected directory and reports its approval digest. A standalone CMake build supplies the same package layout.
 
 An optional HuxerUI adapter provides `PluginCenter(manager)`, schema-driven settings, and contribution mounting points for menus and commands. The UI uses the same plan and apply operations as other integrations. The application can pass the manager directly or register it as an application service through its existing hooks. Plugin contributions describe UI data, and the application builds the corresponding HuxerUI views.
 

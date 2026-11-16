@@ -49,7 +49,7 @@ struct ImportResult {
   std::vector<Issue> issues;
 };
 
-/// @brief CSV import contract published to independently built plugins.
+/// @brief Import contract published by the CSV host.
 class HPK_REMOTE TableImporter {
 public:
   virtual ~TableImporter() = default;

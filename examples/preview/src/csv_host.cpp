@@ -1,9 +1,8 @@
 #include "csv_host.h"
 #include "windowless_runtime.h"
 
-#include "record/codec_record.bindings.h"
-#include "reordered/codec_record.bindings.h"
-#include "mapped/codec_mapped.bindings.h"
+#include "codec_record.bindings.h"
+#include "codec_mapped.bindings.h"
 #include "csv_contract.host.h"
 #include "exporters/export_contract.host.h"
 #include "services/import_status.bindings.h"

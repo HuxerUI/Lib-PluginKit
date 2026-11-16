@@ -3,7 +3,7 @@
 /// @file
 /// @brief Published contract for the CSV exporter example.
 
-#include "receivers/import_progress.h"
+#include "../receivers/import_progress.h"
 
 #include <huxerui/pluginkit/contract.h>
 #include <huxerui/stream.h>

@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <memory>
+#include <random>
 
 namespace huxerui::pluginkit::detail {
 
@@ -92,6 +93,13 @@ inline std::string Sha256(std::span<const std::byte> bytes) {
 inline std::string Sha256File(const std::filesystem::path& path) {
   const auto file = OpenRegularFile(path);
   return ComputeSha256([&](const auto& update) { ReadFileChunks(file, update); });
+}
+
+inline std::string NewToken() {
+  std::random_device random;
+  std::array<std::uint32_t, 8> values;
+  for (auto& value : values) value = random();
+  return Sha256(std::as_bytes(std::span(values)));
 }
 
 inline bool IsDigest(std::string_view text) {

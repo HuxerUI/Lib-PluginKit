@@ -1,9 +1,9 @@
 #pragma once
 
 /// @file
-/// @brief Convenience functions published by the CSV host.
+/// @brief Convenience functions provided by the CSV host SDK.
 ///
-/// Include this header in plugin code to update import status from a managed import Task.
+/// Include this header in plugin code to call the HPK_REMOTE import status service from a managed Task.
 
 #include "services/import_status.bindings.h"
 

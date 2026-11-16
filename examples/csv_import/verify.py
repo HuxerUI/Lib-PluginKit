@@ -42,6 +42,116 @@ def check_error(reply, code):
     assert not reply["ok"] and reply["error"] == code, reply
 
 
+def verify_sdk(sdk):
+    expected = {
+        "csv_contract": "csv_import::TableImporter",
+        "exporters/export_contract": "csv_import::TableExporter",
+        "receivers/import_progress": "csv_import::ImportProgress",
+        "services/import_status": "csv_import::ImportStatus",
+    }
+    assert {file.relative_to(sdk).as_posix() for file in sdk.rglob("*.contract.json")} == {
+        f"{name}.contract.json" for name in expected
+    }
+    for name, interface in expected.items():
+        [contract] = json.loads((sdk / f"{name}.contract.json").read_text(encoding="utf-8"))
+        identity = ("cpp." + hashlib.sha256(interface.encode()).hexdigest(), 1)
+        if interface == "csv_import::ImportStatus":
+            identity = ("example.import-status", 2)
+        assert contract["interface"] == interface and (contract["id"], contract["version"]) == identity, contract
+        assert (sdk / f"{name}.bindings.h").is_file() and (sdk / f"{name}.host.h").is_file()
+    assert (sdk / "csv_sdk.h").is_file()
+
+
+def verify_sdk_republish(sdk, scratch):
+    staged = scratch / "staged sdk"
+    published = scratch / "published sdk"
+    staged.mkdir()
+    published.mkdir()
+    filename = "import_progress.h"
+    shutil.copyfile(sdk / "receivers" / filename, staged / filename)
+    shutil.copyfile(staged / filename, published / "Import_Progress.h")
+    files = staged / ".hpk-sdk-files"
+    files.write_text(filename + "\n", encoding="utf-8")
+    (published / files.name).write_text("Import_Progress.h\n", encoding="utf-8")
+    subprocess.run(
+        ["cmake", f"-D_HPK_SDK_DIRECTORY={published}", f"-D_HPK_SDK_SOURCE={staged}",
+         f"-D_HPK_SDK_FILES={files}", "-P", str(sdk / "PluginKit.cmake")],
+        check=True, timeout=30,
+    )
+    assert {path.name for path in published.iterdir()} == {filename, files.name}
+    assert (published / filename).read_bytes() == (staged / filename).read_bytes()
+
+
+def verify_pack(host, hpk, scratch):
+    example = Path(__file__).resolve().parent
+    project = scratch / "pack project"
+    fixture = project / "fixture"
+    platform = {"win32": "windows", "linux": "linux", "darwin": "macos"}[sys.platform]
+    shutil.copytree(example / "plugin", fixture)
+    shutil.copytree(example.parent / "preview" / "platform" / platform, project / "platform" / platform)
+    sdk = (host.parents[3] if platform == "macos" else host.parent) / "sdk"
+    verify_sdk(sdk)
+    verify_sdk_republish(sdk, scratch)
+    cmake = project / "CMakeLists.txt"
+
+    def configure(fixtures):
+        cmake.write_text(
+            "cmake_minimum_required(VERSION 3.24)\n"
+            "project(CsvPackCheck LANGUAGES CXX)\n"
+            f'set(CSV_IMPORT_SDK "{sdk.as_posix()}" CACHE PATH "" FORCE)\n'
+            f'set(CSV_IMPORT_TEST_FIXTURES {fixtures} CACHE BOOL "" FORCE)\n'
+            "add_subdirectory(fixture)\n"
+            'set_target_properties(csv-importer PROPERTIES OUTPUT_NAME csv-existing-target)\n'
+            'file(GENERATE OUTPUT "csv-target-path.txt" CONTENT "$<TARGET_FILE:csv-importer>")\n',
+            encoding="utf-8",
+        )
+
+    def pack(*options, error=None):
+        abi = ["--abi", "x86_64"] if platform == "windows" else []
+        process = subprocess.run(
+            [str(hpk), "pack", platform, *abi, *options],
+            cwd=fixture, capture_output=True, encoding="utf-8", errors="replace", timeout=180,
+        )
+        if error:
+            assert process.returncode != 0 and error in process.stderr, process
+            return process.stderr
+        assert process.returncode == 0, process
+        return json.loads(process.stdout.splitlines()[-1])
+
+    configure("ON")
+    ambiguity = pack(error="Select one with --target")
+    assert all(name in ambiguity for name in ("csv-importer", "csv-importer-worker", "csv-faults")), ambiguity
+    worker = pack("--target", "csv-importer-worker", "--config", "release")
+    assert worker["target"] == "csv-importer-worker" and worker["id"] == "example.csv-worker", worker
+
+    configure("OFF")
+    package = pack()
+    directory = Path(package["path"])
+    sdk_key, variant, build_config, packages, target, config = directory.relative_to(project / ".huxerui" / "build").parts
+    assert sdk_key.startswith("home-") and variant.startswith(platform) and build_config == "release", directory
+    assert (packages, target, config) == ("packages", "csv-importer", "Release"), directory
+    assert (directory / "resources" / "huxerui" / "resources.bin").is_file(), directory
+    library = Path((directory.parents[2] / "csv-target-path.txt").read_text(encoding="utf-8"))
+    module = {"windows": "plugin.dll", "linux": "plugin.so", "macos": "plugin.dylib"}[platform]
+    assert "csv-existing-target" in library.name and library.read_bytes() == (directory / module).read_bytes(), library
+    assert Path(worker["path"]).is_dir(), worker
+    assert not list(directory.parent.glob("*.hpk-*")), directory
+    pack("--target", "csv-importer-worker", error="This build produced no plugin package for target")
+
+    profile = scratch / "pack profile"
+    inspected = run(host, profile, "inspect", directory)
+    assert inspected["ok"] and all(package[key] == inspected[key] for key in ("id", "version", "digest")), inspected
+    assert run(host, profile, "install", directory, package["digest"], "worker_process", "status")["ok"]
+
+    manifest = fixture / "plugin.json.in"
+    source = manifest.read_text(encoding="utf-8")
+    manifest.write_text(source.replace("strings/settings_max_rows", "strings/missing_pack_label"), encoding="utf-8")
+    pack(error="Cannot resolve string resource")
+
+    cmake.write_text(cmake.read_text(encoding="utf-8") + 'message(FATAL_ERROR "CSV build failed")\n', encoding="utf-8")
+    pack(error="huxerui build failed with exit code")
+
+
 def plugin(listing, plugin_id):
     return next(item for item in listing["plugins"] if item["id"] == plugin_id)
 
@@ -1155,8 +1265,13 @@ if __name__ == "__main__":
     parser.add_argument("faults", type=Path)
     parser.add_argument("worker_csv", type=Path)
     parser.add_argument("replacement", type=Path)
+    parser.add_argument("--hpk", type=Path, help="Also verify hpk pack with the preview's published SDK")
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix="pluginkit csv ") as directory:
-        verify(args.host.resolve(), args.package.resolve(), args.faults.resolve(),
-               args.worker_csv.resolve(), args.replacement.resolve(), Path(directory))
+        host = args.host.resolve()
+        scratch = Path(directory)
+        if args.hpk:
+            verify_pack(host, args.hpk.resolve(), scratch)
+        verify(host, args.package.resolve(), args.faults.resolve(),
+               args.worker_csv.resolve(), args.replacement.resolve(), scratch)
     print("CSV example passed")

@@ -11,7 +11,7 @@
 #include <string_view>
 #include <variant>
 
-/// @brief Marks an interface for hpk gen to publish in both execution modes.
+/// @brief Marks an interface for SDK generation in both execution modes.
 ///
 /// Place it on the class definition, as in `class HPK_REMOTE Importer`. Declare a public virtual
 /// destructor and public pure virtual operations with unique names. Operations may return a synchronous
@@ -23,12 +23,22 @@
 /// Each stream or callback is granted for the invocation that receives it. Await callbacks from that
 /// invocation or an awaited child Task. Access expires at completion or cancellation. Successfully
 /// close every supplied output before returning.
-/// Leave operations able to throw so the binding can report failures. The macro expands to an annotation
-/// only when hpk gen parses the header.
+/// Leave operations able to throw so the binding can report failures. The generated identity uses
+/// the qualified C++ name and version 1. The macro expands to an annotation only during SDK generation.
 #if defined(HPK_GENERATOR)
 #define HPK_REMOTE [[clang::annotate("hpk.remote")]]
 #else
 #define HPK_REMOTE
+#endif
+
+/// @brief Marks a remote interface with an explicit contract identity.
+/// @param id String literal containing a stable contract ID in manifest identifier syntax.
+/// @param version Positive decimal integer literal for this contract's version.
+/// @see HPK_REMOTE
+#if defined(HPK_GENERATOR)
+#define HPK_REMOTE_CONTRACT(id, version) HPK_REMOTE [[clang::annotate("hpk.contract:" id ":" #version)]]
+#else
+#define HPK_REMOTE_CONTRACT(id, version)
 #endif
 
 namespace huxerui::pluginkit {
@@ -55,7 +65,7 @@ using SettingValues = std::map<std::string, SettingValue, std::less<>>;
 struct ContractInfo {
   /// Stable contract identifier.
   std::string_view id;
-  /// Positive version supplied to hpk gen.
+  /// Positive contract version. A generated contract defaults to version 1.
   std::uint32_t version;
   /// Lowercase SHA-256 of the generated contract schema.
   std::string_view fingerprint;

@@ -17,7 +17,7 @@ struct SetImportedRowsRequest {
 };
 
 /// @brief Host-owned import status exposed to approved CSV plugins.
-class HPK_REMOTE ImportStatus {
+class HPK_REMOTE_CONTRACT("example.import-status", 2) ImportStatus {
 public:
   virtual ~ImportStatus() = default;
 

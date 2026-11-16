@@ -12,7 +12,6 @@
 
 #include <algorithm>
 #include <map>
-#include <random>
 #include <set>
 
 namespace huxerui::pluginkit {
@@ -367,13 +366,6 @@ void SaveProfile(const fs::path& file, const Profile& profile) {
                          {"retained_data", std::move(retained)}, {"discarded_data", profile.discarded_data}}.dump(2);
   if (text.size() > MaxProfile) throw Error(ErrorCode::PayloadTooLarge, "The plugin profile exceeds the byte limit");
   WriteAtomicFile(file, AsBytes(text));
-}
-
-std::string NewToken() {
-  std::random_device random;
-  std::array<std::uint32_t, 8> values;
-  for (auto& value : values) value = random();
-  return Sha256(std::as_bytes(std::span(values)));
 }
 
 const std::string& HostProcessToken() {
