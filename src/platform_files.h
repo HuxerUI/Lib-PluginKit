@@ -14,10 +14,18 @@ namespace huxerui::pluginkit::detail {
 inline constexpr char PackageTarget[] = "windows-x86_64-msvc";
 inline constexpr char ModuleName[] = "plugin.dll";
 #elif defined(__APPLE__)
+#if defined(__x86_64__)
+inline constexpr char PackageTarget[] = "macos-x86_64";
+#else
 inline constexpr char PackageTarget[] = "macos-arm64";
+#endif
 inline constexpr char ModuleName[] = "plugin.dylib";
 #else
+#if defined(__aarch64__)
+inline constexpr char PackageTarget[] = "linux-aarch64-gnu";
+#else
 inline constexpr char PackageTarget[] = "linux-x86_64-gnu";
+#endif
 inline constexpr char ModuleName[] = "plugin.so";
 #endif
 

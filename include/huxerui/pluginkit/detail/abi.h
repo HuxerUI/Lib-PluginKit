@@ -15,12 +15,12 @@
 /// @brief Calling convention used by the exported query and all ABI callbacks.
 #if defined(_WIN32) && defined(_M_X64)
 #define HPK_CALL __cdecl
-#elif defined(__linux__) && defined(__x86_64__) && !defined(__ILP32__)
+#elif defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)) && !defined(__ILP32__)
 #define HPK_CALL
-#elif defined(__APPLE__) && TARGET_OS_OSX && defined(__aarch64__)
+#elif defined(__APPLE__) && TARGET_OS_OSX && (defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__))
 #define HPK_CALL
 #else
-#error PluginKit ABI v1 requires Windows x64, Linux x86_64, or macOS arm64.
+#error PluginKit ABI v1 requires Windows x64, Linux x86_64/aarch64, or macOS x86_64/arm64.
 #endif
 
 /// @brief Descriptor version expected by the host and worker loaders.

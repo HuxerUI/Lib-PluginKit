@@ -12,15 +12,15 @@ Worker execution provides process fault isolation for trusted plugins. Workers r
 | --- | --- | --- | --- |
 | Windows | `x86_64` | `windows-x86_64-msvc` | `plugin.dll` |
 | macOS | `arm64` | `macos-arm64` | `plugin.dylib` |
-| macOS | `x86_64` | Port pending | `plugin.dylib` |
+| macOS | `x86_64` | `macos-x86_64` | `plugin.dylib` |
 | Linux | `x86_64` | `linux-x86_64-gnu` | `plugin.so` |
-| Linux | `aarch64` | Port pending | `plugin.so` |
+| Linux | `aarch64` | `linux-aarch64-gnu` | `plugin.so` |
 
 HuxerUI can select both macOS slices for a universal app build from a source SDK and universal dependencies. Each PluginKit v1 package targets one ABI.
 
 Build with CMake 3.24 or newer and a C++20 toolchain. Use a shared HuxerUI SDK that provides `Resources::OpenPackage()` and the callback-backed synchronous and asynchronous stream factories. Use a HuxerUI CLI with `--config` support for the CLI build and packaging commands. Build the host, worker, and plugins against the matching SDK and build configuration. Set `HUXERUI_HOME` to the installed SDK prefix or expose it through CMake's package search. In-process plugins also share the host's C++ ABI and active HuxerUI application. PluginKit's ABI and worker protocol are v1.
 
-The `hpk` SDK generator needs Clang, libclang, and the `clang-c` headers. Set `HPK_LLVM_ROOT` to the LLVM prefix if CMake cannot find Clang on `PATH`. On Windows use the x64 Visual Studio developer shell for standalone CMake builds. If Ninja has trouble tracking headers with localized MSVC output, run `chcp 65001` and configure a fresh build directory. On Linux install the OpenSSL development files and, for SDK generation, `clang` and `libclang-dev`. On macOS use an Apple Silicon toolchain with C++20 `<stop_token>` support and an LLVM installation for SDK generation.
+The `hpk` SDK generator needs Clang, libclang, and the `clang-c` headers. Set `HPK_LLVM_ROOT` to the LLVM prefix if CMake cannot find Clang on `PATH`. On Windows use the x64 Visual Studio developer shell for standalone CMake builds. If Ninja has trouble tracking headers with localized MSVC output, run `chcp 65001` and configure a fresh build directory. On Linux install the OpenSSL development files and, for SDK generation, `clang` and `libclang-dev`. On macOS use a toolchain with C++20 `<stop_token>` support and an LLVM installation for SDK generation.
 
 | Where | Include |
 | --- | --- |
@@ -404,7 +404,7 @@ Run the applicable HuxerUI CLI command from the repository root and use the buil
 | Linux | `huxerui build linux --config release` |
 | macOS | `huxerui build macos --config release` |
 
-The preview publishes the SDK in the build directory's `sdk/` subdirectory. Build the plugin separately with Ninja. Set `CSV_IMPORT_SDK` to that absolute path. For macOS, build for arm64 and use the preview's deployment target, which defaults to macOS 12.0. For example, add `-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0` on Apple Silicon.
+The preview publishes the SDK in the build directory's `sdk/` subdirectory. Build the plugin separately with Ninja. Set `CSV_IMPORT_SDK` to that absolute path. Build the preview, worker, and plugin for the same ABI. On macOS, select `--abi arm64` or `--abi x86_64` for the CLI build and use the matching `-DCMAKE_OSX_ARCHITECTURES=arm64` or `-DCMAKE_OSX_ARCHITECTURES=x86_64` for the standalone plugin. Match the preview's deployment target, which defaults to macOS 12.0. On Linux, select `--abi x86_64` or `--abi aarch64` and use the corresponding compiler and HuxerUI SDK for the plugin build.
 
 ```sh
 cmake -S examples/csv_import/plugin -B build/csv-plugin -G Ninja -DCMAKE_BUILD_TYPE=Release "-DCSV_IMPORT_SDK=<absolute path to preview build>/sdk" -DCSV_IMPORT_TEST_FIXTURES=ON

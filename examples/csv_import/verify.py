@@ -516,6 +516,16 @@ def verify_factory_table(host, package, scratch, valid):
     assert all(set(extension) <= {"point", "metadata"} for extension in manifest["extensions"]), manifest
     exporter = manifest["extensions"][-1]
     profile = scratch / "manifest checks"
+    target = manifest["target"]
+    targets = ("windows-x86_64-msvc", "linux-x86_64-gnu", "linux-aarch64-gnu", "macos-arm64", "macos-x86_64")
+    assert target in targets, target
+    for other_target in targets:
+        if other_target == target:
+            continue
+        manifest["target"] = other_target
+        path.write_text(json.dumps(manifest), encoding="utf-8")
+        check_error(run(host, profile, "inspect", source), "invalid_package")
+    manifest["target"] = target
     for record, field, value in ((manifest, "provides", []), (exporter, "contract", "example.table-exporter"),
                                  (exporter, "id", "export")):
         record[field] = value
