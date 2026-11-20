@@ -1,2 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest />
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <service android:name="org.huxerui.lib.pluginkit.WorkerService$Slot0" android:process=":hpk_worker_0" android:exported="false" />
+        <service android:name="org.huxerui.lib.pluginkit.WorkerService$Slot1" android:process=":hpk_worker_1" android:exported="false" />
+        <service android:name="org.huxerui.lib.pluginkit.WorkerService$Slot2" android:process=":hpk_worker_2" android:exported="false" />
+        <service android:name="org.huxerui.lib.pluginkit.WorkerService$Slot3" android:process=":hpk_worker_3" android:exported="false" />
+    </application>
+</manifest>

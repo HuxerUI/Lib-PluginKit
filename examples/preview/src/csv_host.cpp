@@ -18,6 +18,7 @@
 #include <cstring>
 #include <random>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <mutex>
@@ -1348,9 +1349,98 @@ Task<Json> CheckSettingsActivation(PluginManager& manager, const std::string& pl
   co_return DescribeSettings(activated);
 }
 
+Task<Json> CheckSharedWorker(PluginManager& manager, const std::vector<std::string>& args) {
+  auto first = manager.CreateExtensions(Importers, args[1]);
+  auto second = manager.CreateExtensions(Importers, args[2]);
+  if (first.size() != 2 || second.size() != 2) throw Error(ErrorCode::PluginFailed, "Expected both CSV importer factories");
+  const auto pid = first.front()->ProcessId();
+  if (pid == ProcessId() || second.front()->ProcessId() != pid) {
+    throw Error(ErrorCode::PluginFailed, "Expected both CSV packages to share an Android worker process");
+  }
+  struct Outcome { std::size_t complete = 0; std::size_t readers = 0; std::exception_ptr error; };
+  auto outcome = std::make_shared<Outcome>();
+  std::array<huxerui::TaskHandle, 2> calls;
+  for (std::size_t i = 0; i < calls.size(); ++i) {
+    const auto id = args[i + 1];
+    calls[i] = UseApplicationTaskScope().Launch([&manager, id, outcome, rows = i + 1]() -> Task<void> {
+      try {
+        auto handles = manager.CreateExtensions(Importers, id);
+        auto source = std::make_shared<AsyncInputStream>(StringInput(rows == 1 ? "name,city\nAlice,Paris\n" : "name,city\nAlice,Paris\nBob,Rome\n"));
+        auto first_read = std::make_shared<bool>(true);
+        auto input = AsyncInputStream::FromReader([source, first_read, outcome](std::stop_token, std::size_t count) -> Task<IoResult<huxerui::Bytes>> {
+          if (std::exchange(*first_read, false)) {
+            ++outcome->readers;
+            co_await WaitFor([outcome] { return outcome->readers == 2; });
+          }
+          co_return co_await source->ReadAsync(count);
+        });
+        const auto result = co_await handles.front()->Import(std::move(input), nullptr);
+        if (!result.table || result.table->rows.size() != rows) throw Error(ErrorCode::PluginFailed, "Shared CSV import failed");
+      } catch (...) { outcome->error = std::current_exception(); }
+      ++outcome->complete;
+    });
+  }
+  try { co_await WaitFor([&] { return outcome->complete == calls.size(); }); }
+  catch (...) { for (const auto& call : calls) call.Cancel(); throw; }
+  if (outcome->error) std::rethrow_exception(outcome->error);
+  (void)co_await CheckStreamInterruption(manager, args[1], false, false);
+  co_await WaitFor([&] {
+    try { return first.front()->ProcessId() == pid; }
+    catch (const Error& error) { if (error.Code() == ErrorCode::Busy) return false; throw; }
+  });
+  if (second.front()->ProcessId() != pid) throw Error(ErrorCode::PluginFailed, "Cancellation terminated a neighboring package");
+  co_await manager.SetEnabled(args[1], false);
+  if (second.front()->ProcessId() != pid || second.front()->Delimiter() != ",") {
+    throw Error(ErrorCode::PluginFailed, "Disabling one package terminated its neighbor");
+  }
+  co_await manager.SetEnabled(args[1], true);
+  auto reopened = manager.CreateExtensions(Importers, args[1]);
+  if (reopened.front()->ProcessId() != pid) throw Error(ErrorCode::PluginFailed, "Reactivation did not reuse the shared process");
+  co_return Json{{"shared_pid", pid}, {"isolated_contexts", true}, {"neighbor_survived", true}};
+}
+
+Task<Json> CheckSharedUpgrade(PluginManager& manager, const std::vector<std::string>& args) {
+  auto neighbor = manager.CreateExtensions(Importers, args[1]);
+  const auto pid = neighbor.front()->ProcessId();
+  std::vector<std::string> upgrade{"check-worker-upgrade", args[2], args[3], args[4]};
+  if (args.size() == 6) upgrade.push_back(args[5]);
+  auto result = co_await CheckWorkerUpgrade(manager, upgrade);
+  if (result.at("old_pid") != pid || result.at("new_pid") != pid) {
+    throw Error(ErrorCode::PluginFailed, "Expected both plugin versions to share the neighboring package's worker process");
+  }
+  if (neighbor.front()->ProcessId() != pid) throw Error(ErrorCode::PluginFailed, "Upgrade terminated a neighboring package");
+  result["neighbor_survived"] = true;
+  co_return result;
+}
+
+Task<Json> CheckSharedFailure(PluginManager& manager, const std::vector<std::string>& args) {
+  auto healthy = manager.CreateExtensions(Importers, args[1]);
+  auto fault = manager.CreateExtension(Importers, args[2]);
+  const auto old_pid = healthy.front()->ProcessId();
+  if (fault->ProcessId() != old_pid) throw Error(ErrorCode::PluginFailed, "Expected one shared Service process");
+  try {
+    (void)co_await fault->Import(StringInput("exit"), nullptr);
+    throw Error(ErrorCode::PluginFailed, "The crash fixture returned normally");
+  } catch (const Error& error) { if (error.Code() != ErrorCode::WorkerExited) throw; }
+  co_await WaitFor([&] {
+    const auto first = manager.Diagnostics(args[1]);
+    const auto second = manager.Diagnostics(args[2]);
+    return first && second && first->state == PluginRuntimeState::Faulted && second->state == PluginRuntimeState::Faulted;
+  });
+  auto recovered = manager.CreateExtensions(Importers, args[1]);
+  const auto new_pid = recovered.front()->ProcessId();
+  if (new_pid == old_pid || new_pid == ProcessId()) throw Error(ErrorCode::PluginFailed, "Expected a replacement worker");
+  const auto result = co_await recovered.front()->Import(StringInput("name,city\nAlice,Paris\n"), nullptr);
+  if (!result.table) throw Error(ErrorCode::PluginFailed, "Recovery could not import CSV");
+  co_return Json{{"old_pid", old_pid}, {"new_pid", new_pid}, {"host_survived", true}};
+}
+
 Task<Json> Command(PluginManager& manager, const std::shared_ptr<PreviewImportStatus>& status,
              const std::vector<std::string>& args) {
   const auto& name = args.front();
+  if (name == "check-shared-upgrade" && (args.size() == 5 || args.size() == 6)) co_return co_await CheckSharedUpgrade(manager, args);
+  if (name == "check-shared-failure" && args.size() == 3) co_return co_await CheckSharedFailure(manager, args);
+  if (name == "check-shared-worker" && args.size() == 3) co_return co_await CheckSharedWorker(manager, args);
   if (name == "pid" && args.size() == 1) co_return Json{{"pid", ProcessId()}};
   if (name == "reset-status" && args.size() == 1) {
     status->rows.reset();
@@ -1474,14 +1564,14 @@ std::vector<std::string> Split(const std::string& line) {
   return args;
 }
 
-Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtime, int& exit_code) {
+Task<void> RunCommands(std::span<const fs::path> args, std::function<void()> stop, int& exit_code) {
   try {
     const auto profile = args.empty() ? csv_import::preview::DefaultProfile() : args.front();
     if (args.size() == 3 && args[1] == "check-disable-during-create") {
       auto response = co_await CheckDisableDuringCreate(File(profile.u8string()), File(args[2].u8string()));
       response["ok"] = true;
       Print(response);
-      runtime.RequestShutdown();
+      stop();
       co_return;
     }
     if (args.size() == 5 && args[1] == "check-in-process-upgrade") {
@@ -1489,11 +1579,15 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
       auto response = co_await CheckInProcessUpgrade(File(profile.u8string()), command);
       response["ok"] = true;
       Print(response);
-      runtime.RequestShutdown();
+      stop();
       co_return;
     }
-    PluginManager manager(File(profile.u8string()), File(csv_import::preview::WorkerPath().u8string()),
-                          UseApplicationTaskScope());
+#if defined(__ANDROID__)
+    const auto runtime = RuntimeDesc::Android();
+#else
+    const auto runtime = RuntimeDesc::Executable(File(csv_import::preview::WorkerPath().u8string()));
+#endif
+    PluginManager manager(File(profile.u8string()), runtime, UseApplicationTaskScope());
     if (args.size() == 3 && args[1] == "check-factory-contract") {
       manager.RegisterExtensionPoint(Importers);
       // Simulate a host SDK that binds the exporter point to another contract after a restart.
@@ -1503,7 +1597,7 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
       const auto delimiter = importers.front()->Delimiter();
       co_await manager.Shutdown();
       Print({{"ok", true}, {"delimiter", delimiter}});
-      runtime.RequestShutdown();
+      stop();
       co_return;
     }
     auto status = std::make_shared<PreviewImportStatus>(manager);
@@ -1514,7 +1608,7 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
       result["ok"] = true;
       Print(result);
       co_await manager.Shutdown();
-      runtime.RequestShutdown();
+      stop();
       co_return;
     }
     for (const auto& change : co_await manager.ApplyPendingChanges()) {
@@ -1556,15 +1650,51 @@ Task<void> RunCommands(std::span<const fs::path> args, WindowlessRuntime& runtim
     PrintError(error);
     exit_code = 1;
   }
-  runtime.RequestShutdown();
+  stop();
 }
 
 } // namespace
 
+#if defined(__ANDROID__)
+#include <jni.h>
+#include <huxerui/android/jni.h>
+
+namespace csv_import::preview {
+namespace {
+fs::path android_profile;
+Task<void> AndroidCommands(std::string file) {
+  android_profile = fs::path(file).parent_path() / "profile";
+  int exit_code = 0;
+  if (!std::freopen(file.c_str(), "r", stdin) || !std::freopen((file + ".result").c_str(), "w", stdout)) co_return;
+  std::cin.clear();
+  std::cout.clear();
+  std::vector<fs::path> args{android_profile};
+  co_await RunCommands(args, [] {}, exit_code);
+  std::cout.flush();
+  std::ofstream(file + ".done") << exit_code;
+}
+}
+fs::path DefaultProfile() { return android_profile; }
+fs::path WorkerPath() { return {}; }
+}
+
+static const huxerui::Application application(WindowlessRoot);
+extern "C" JNIEXPORT void JNICALL
+Java_org_huxerui_lib_pluginkit_preview_MainActivity_nativeRun(JNIEnv* environment, jclass, jstring file) {
+  try {
+    auto path = huxerui::android::JavaStringToUtf8(environment, file);
+    (void)UseApplicationTaskScope().Launch(csv_import::preview::AndroidCommands(std::move(path)));
+  } catch (const std::exception& error) {
+    const auto type = environment->FindClass("java/lang/IllegalStateException");
+    if (type) environment->ThrowNew(type, error.what());
+  }
+}
+#else
 int csv_import::preview::Run(std::span<const fs::path> args) {
   const huxerui::Application application(WindowlessRoot);
   WindowlessRuntime runtime;
   int exit_code = 0;
-  runtime.Run(application, RunCommands(args, runtime, exit_code));
+  runtime.Run(application, RunCommands(args, [&runtime] { runtime.RequestShutdown(); }, exit_code));
   return exit_code;
 }
+#endif

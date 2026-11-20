@@ -1,0 +1,2 @@
+-keep class org.huxerui.lib.pluginkit.PluginKit { *; }
+-keep class org.huxerui.lib.pluginkit.WorkerService* { *; }

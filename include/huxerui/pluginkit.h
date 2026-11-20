@@ -4,7 +4,7 @@
 /// @brief Host API for plugin profiles, package approval, and typed extension instances.
 ///
 /// Link HuxerUI::PluginKit and include the generated host header for each HPK_REMOTE interface.
-/// Supply the platform's hpk-worker executable to enable worker packages. In-process packages
+/// Supply a RuntimeDesc to enable the platform worker backend. In-process packages
 /// use the same C++ SDK and active HuxerUI application as the host.
 
 #include <huxerui/pluginkit/detail/extension.h>
@@ -20,6 +20,25 @@
 #include <string>
 
 namespace huxerui::pluginkit {
+
+/// @brief Describes the runtime for packages approved for worker execution.
+///
+/// PluginManager starts workers on demand. A package's execution mode is selected at installation.
+class RuntimeDesc {
+public:
+  /// @brief Uses the four private Android Service processes registered in the host APK.
+  /// Several packages can share a process. A process failure closes all its package activations.
+  static RuntimeDesc Android();
+
+  /// @brief Uses the deployed hpk-worker executable on Windows, macOS, or Linux.
+  /// @param executable Worker path. PluginManager resolves relative paths when constructed.
+  static RuntimeDesc Executable(const File& executable);
+
+private:
+  explicit RuntimeDesc(std::optional<File> executable);
+  std::optional<File> executable_;
+  friend class PluginManager;
+};
 
 /// @brief Default time budget for a managed extension call, including time spent queued.
 inline constexpr auto DefaultTimeout = std::chrono::milliseconds(5000);
@@ -220,7 +239,7 @@ struct PackageInfo {
   std::vector<ExtensionInfo> extensions;
   /// Execution modes advertised by the package for this target. InstallPackage() approves one of them.
   std::vector<ExecutionMode> execution_modes;
-  /// Shared SDK and C++ build identity checked for in-process execution. Ignored for worker execution.
+  /// Shared SDK and C++ build identity checked in-process, and in both Android execution modes.
   std::string cpp_abi;
   /// Setting declarations in manifest order, retaining their literal labels or package string resource identities.
   std::vector<SettingDefinition> settings_schema;
@@ -235,6 +254,7 @@ struct PluginInfo {
   /// Execution mode selected at installation.
   ExecutionMode mode;
   /// Process ID of the active worker. Empty for an in-process package or while no worker is running.
+  /// Several Android packages can share this PID; activation identity is package and generation scoped.
   std::optional<std::uint32_t> worker_pid;
   /// Approved replacement waiting for a new host process, if any.
   std::optional<PackageInfo> pending_upgrade;
@@ -472,13 +492,14 @@ public:
   /// @brief Creates or opens the profile and takes its exclusive lock.
   /// Reopening the profile restores installed packages, approvals, enablement, and saved settings.
   /// @param profile_directory Directory for the catalog and approved package snapshots.
-  /// @param worker_executable Path to the platform's hpk-worker executable, started on demand. Pass
+  /// @param runtime Platform worker runtime, started on demand. Pass
   /// std::nullopt to allow only in-process packages.
   /// @param callbacks Owning HuxerUI application task scope used for managed in-process calls and for host
   /// service and receiver callbacks. Keep it running until Shutdown() completes.
   /// @throws Error With ProfileBusy if another manager holds the lock, or Io if the profile cannot be read.
+  /// InvalidArgument reports a runtime descriptor for a different platform.
   /// @throws std::filesystem::filesystem_error If path resolution or profile directory creation fails.
-  PluginManager(const File& profile_directory, const std::optional<File>& worker_executable, TaskScope callbacks);
+  PluginManager(const File& profile_directory, const std::optional<RuntimeDesc>& runtime, TaskScope callbacks);
 
   /// @brief Each profile lock belongs to one manager.
   PluginManager(const PluginManager&) = delete;

@@ -4,6 +4,8 @@
 
 #if defined(_WIN32)
 #include <bcrypt.h>
+#elif defined(__ANDROID__)
+#include "android_bridge.h"
 #elif defined(__APPLE__)
 #include <CommonCrypto/CommonDigest.h>
 #else
@@ -42,6 +44,10 @@ std::string ComputeSha256(Feed feed) {
   if (BCryptFinishHash(hash.get(), digest.data(), static_cast<ULONG>(digest.size()), 0) < 0) {
     throw Error(ErrorCode::Io, "Cannot compute SHA-256 digest");
   }
+#elif defined(__ANDROID__)
+  AndroidDigest context;
+  feed([&](std::span<const std::byte> bytes) { context.Update(bytes); });
+  context.Finish(digest);
 #elif defined(__APPLE__)
   CC_SHA256_CTX context;
   if (CC_SHA256_Init(&context) != 1) throw Error(ErrorCode::Io, "Cannot create SHA-256 hash");

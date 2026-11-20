@@ -19,7 +19,7 @@ class Worker : public std::enable_shared_from_this<Worker> {
 public:
   Worker(const std::filesystem::path& executable, const std::filesystem::path& module_path,
          const Handle& verified_module, std::vector<RegisteredService> services, TaskScope callbacks,
-         PluginStartup startup, std::shared_ptr<PluginRun> run);
+         PluginStartup startup, std::shared_ptr<PluginRun> run, Deadline start_deadline);
   ~Worker();
 
   std::optional<std::uint32_t> Pid() const noexcept;
@@ -28,7 +28,7 @@ public:
                 bool wait_for_slot = true, std::shared_ptr<CallGrants> grants = {});
   void ValidateFactories(std::stop_token stop);
   void Shutdown(std::chrono::milliseconds timeout = DefaultTimeout) noexcept;
-  /// Waits for the process to exit after shutdown, including when handles still reference this Worker.
+  /// Waits for retirement after shutdown. Android closes this package's channel while neighbors can keep the process.
   void WaitForExit(std::chrono::milliseconds timeout = DefaultTimeout);
   void BeginShutdown(PluginStopReason reason = PluginStopReason::Shutdown) noexcept;
   void Stop() noexcept;
@@ -64,7 +64,11 @@ private:
         throw Error(ErrorCode::Protocol, "Invalid worker callback request");
       }
       if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
-      if (frame.kind == FrameKind::StreamCall && (!grants || !grants->Has(frame.slot))) {
+      bool closing = false;
+#if defined(__ANDROID__)
+      closing = invocation_cancel_.stop_requested() || callback_stop_.stop_requested();
+#endif
+      if (frame.kind == FrameKind::StreamCall && !closing && (!grants || !grants->Has(frame.slot))) {
         throw Error(ErrorCode::Protocol, "The invocation did not authorize this stream");
       }
       const auto reply = DispatchCallback(std::move(frame), deadline, stop, grants, sync_io);
@@ -96,7 +100,15 @@ private:
   std::stop_source callback_stop_;
   std::stop_source exited_stop_;
 
-#if defined(_WIN32)
+#if defined(__ANDROID__)
+  Handle socket_;
+  std::atomic<pid_t> pid_{0};
+  std::condition_variable exited_;
+  std::thread reaper_;
+  std::int64_t session_ = 0;
+  std::atomic_bool graceful_shutdown_{false};
+  std::stop_source invocation_cancel_;
+#elif defined(_WIN32)
   void ObserveProcessExit() noexcept;
 
   Handle process_;

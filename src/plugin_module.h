@@ -10,6 +10,9 @@
 
 #if !defined(_WIN32)
 #include <dlfcn.h>
+#if defined(__ANDROID__)
+#include <android/dlext.h>
+#endif
 #endif
 
 namespace huxerui::pluginkit::detail {
@@ -69,7 +72,7 @@ inline void ValidatePluginDescriptor(const hpk_plugin_v1& binding, std::span<con
   }
 }
 
-inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path) {
+inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path, [[maybe_unused]] int verified_fd = -1) {
   // Keep modules mapped for SDK operations and C++ objects that can outlive a particular activation.
 #if defined(_WIN32)
   const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_APPLICATION_DIR);
@@ -80,7 +83,14 @@ inline const hpk_plugin_v1& LoadPluginModule(const std::filesystem::path& path) 
 #if defined(__APPLE__)
   flags |= RTLD_FIRST;
 #endif
+#if defined(__ANDROID__)
+  android_dlextinfo info{};
+  info.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+  info.library_fd = verified_fd;
+  const auto module = verified_fd < 0 ? ::dlopen(path.c_str(), flags) : ::android_dlopen_ext(path.c_str(), flags, &info);
+#else
   const auto module = ::dlopen(path.c_str(), flags);
+#endif
   if (!module) {
     auto message = std::string("Cannot load ") + ModuleName;
     if (const auto* error = ::dlerror(); error && IsUtf8(error)) message += ": " + std::string(error);
@@ -160,12 +170,16 @@ inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& pat
     }
     entry = cached;
   }
-#if defined(__linux__)
+#if defined(__linux__) && !defined(__ANDROID__)
   const auto load_path = std::filesystem::path("/proc/self/fd") / std::to_string(entry->file.get());
-#else
+#elif !defined(__ANDROID__)
   const auto& load_path = path;
 #endif
+#if defined(__ANDROID__)
+  const auto& binding = LoadPluginModule(path, entry->file.get());
+#else
   const auto& binding = LoadPluginModule(load_path);
+#endif
   {
     std::lock_guard lock(state.mutex);
     entry->binding = &binding;
@@ -174,6 +188,12 @@ inline const hpk_plugin_v1& LoadInProcessModule(const std::filesystem::path& pat
 }
 
 inline void* ActivatePlugin(const hpk_plugin_v1& binding, const PluginStartup& startup, std::uint32_t mode) {
+#if defined(__ANDROID__)
+  if (!binding.cpp_abi || std::string_view(binding.cpp_abi) != CppAbi || !binding.runtime_identity ||
+      binding.runtime_identity() != RuntimeIdentity()) {
+    throw Error(ErrorCode::ContractMismatch, "Android plugin must use the APK's shared runtime");
+  }
+#endif
   ValidatePluginDescriptor(binding, startup.extensions, mode);
   const auto& data = startup.data_directory;
   const auto path = std::filesystem::path(std::u8string(data.begin(), data.end()));

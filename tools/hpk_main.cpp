@@ -29,6 +29,10 @@ int Run(std::span<const fs::path> args) {
       return 0;
     }
 #if defined(HPK_HAS_GENERATOR)
+    if (args.size() >= 2 && args[1] == "abi") {
+      GenerateAbi(args.subspan(2));
+      return 0;
+    }
     if (args.size() >= 2 && args[1] == "gen") {
       GenerateSdk(args.subspan(2));
       return 0;

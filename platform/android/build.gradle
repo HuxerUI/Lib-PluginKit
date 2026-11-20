@@ -16,3 +16,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_1_8
     }
 }
+
+dependencies {
+    if (rootProject.gradle.ext.has("huxeruiUsesSource") && rootProject.gradle.ext.huxeruiUsesSource) {
+        compileOnly project(":HuxerUI")
+    } else {
+        compileOnly files(new File(System.getenv("HUXERUI_HOME"), "share/huxerui/platform/android/HuxerUI.aar"))
+    }
+}

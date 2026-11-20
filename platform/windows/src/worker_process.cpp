@@ -56,7 +56,7 @@ private:
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
                std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup plugin,
-               std::shared_ptr<PluginRun> run)
+               std::shared_ptr<PluginRun> run, [[maybe_unused]] Deadline start_deadline)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(plugin)),
       run_(std::move(run)) {
   auto request = CreateWorkerPipe(true);

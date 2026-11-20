@@ -20,7 +20,7 @@
 #elif defined(__APPLE__) && TARGET_OS_OSX && (defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__))
 #define HPK_CALL
 #else
-#error PluginKit ABI v1 requires Windows x64, Linux x86_64/aarch64, or macOS x86_64/arm64.
+#error PluginKit ABI v1 requires Windows x64, Linux x86_64/aarch64, macOS x86_64/arm64, or Android arm64-v8a/x86_64.
 #endif
 
 /// @brief Descriptor version expected by the host and worker loaders.
@@ -196,7 +196,7 @@ typedef struct hpk_plugin_v1 {
   uint32_t abi_version;
   /// Bitmask of supported execution modes. See HPK_IN_PROCESS and HPK_WORKER_PROCESS.
   uint32_t execution_modes;
-  /// Null-terminated identity of the shared HuxerUI SDK and C++ build configuration for in-process calls.
+  /// Shared HuxerUI and C++ build identity, checked in-process and in both Android execution modes.
   const char* cpp_abi;
   /// Number of entries in extensions, from one through HPK_MAX_EXTENSIONS.
   uint32_t extension_count;

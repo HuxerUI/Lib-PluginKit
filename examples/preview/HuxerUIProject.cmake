@@ -26,6 +26,12 @@ if (NOT HUXERUI_LIBRARY_GRAPH_ONLY)
     endif ()
 endif ()
 
+if (ANDROID)
+    set(hpk_framework_component static)
+else()
+    set(hpk_framework_component shared)
+endif()
+
 if (NOT TARGET HuxerUI::huxerui AND NOT TARGET HuxerUI::huxerui_static)
     set(HUXERUI_HOME "$ENV{HUXERUI_HOME}" CACHE PATH "HuxerUI framework directory")
     if (HUXERUI_HOME AND EXISTS "${HUXERUI_HOME}/CMakeLists.txt"
@@ -36,13 +42,13 @@ if (NOT TARGET HuxerUI::huxerui AND NOT TARGET HuxerUI::huxerui_static)
         set(HUXERUI_BUILD_STATIC OFF)
         add_subdirectory("${HUXERUI_HOME}" "${CMAKE_BINARY_DIR}/huxerui-sdk" EXCLUDE_FROM_ALL)
     elseif (HUXERUI_HOME)
-        find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared
+        find_package(HuxerUI CONFIG REQUIRED COMPONENTS ${hpk_framework_component}
                 PATHS "${HUXERUI_HOME}"
                 NO_DEFAULT_PATH
                 NO_CMAKE_FIND_ROOT_PATH
         )
     else ()
-        find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared)
+        find_package(HuxerUI CONFIG REQUIRED COMPONENTS ${hpk_framework_component})
     endif ()
 endif ()
 

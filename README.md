@@ -15,10 +15,12 @@ Worker execution provides process fault isolation for trusted plugins. Workers r
 | macOS | `x86_64` | `macos-x86_64` | `plugin.dylib` |
 | Linux | `x86_64` | `linux-x86_64-gnu` | `plugin.so` |
 | Linux | `aarch64` | `linux-aarch64-gnu` | `plugin.so` |
+| Android | `arm64-v8a` | `android-arm64-v8a` | `plugin.so` |
+| Android | `x86_64` | `android-x86_64` | `plugin.so` |
 
 HuxerUI can select both macOS slices for a universal app build from a source SDK and universal dependencies. Each PluginKit v1 package targets one ABI.
 
-Build with CMake 3.24 or newer and a C++20 toolchain. Use a shared HuxerUI SDK that provides `Resources::OpenPackage()` and the callback-backed synchronous and asynchronous stream factories. Use a HuxerUI CLI with `--config` support for the CLI build and packaging commands. Build the host, worker, and plugins against the matching SDK and build configuration. Set `HUXERUI_HOME` to the installed SDK prefix or expose it through CMake's package search. In-process plugins also share the host's C++ ABI and active HuxerUI application. PluginKit's ABI and worker protocol are v1.
+Build with CMake 3.24 or newer and a C++20 toolchain. On desktop, use a shared HuxerUI SDK that provides `Resources::OpenPackage()` and the callback-backed synchronous and asynchronous stream factories. Use a HuxerUI CLI with `--config` support for the CLI build and packaging commands. Build the host, worker, and plugins against the matching SDK and build configuration. Set `HUXERUI_HOME` to the installed SDK prefix or expose it through CMake's package search. In-process plugins also share the host's C++ ABI and active HuxerUI application. PluginKit's ABI and worker protocol are v1.
 
 The `hpk` SDK generator needs Clang, libclang, and the `clang-c` headers. Set `HPK_LLVM_ROOT` to the LLVM prefix if CMake cannot find Clang on `PATH`. On Windows use the x64 Visual Studio developer shell for standalone CMake builds. If Ninja has trouble tracking headers with localized MSVC output, run `chcp 65001` and configure a fresh build directory. On Linux install the OpenSSL development files and, for SDK generation, `clang` and `libclang-dev`. On macOS use a toolchain with C++20 `<stop_token>` support and an LLVM installation for SDK generation.
 
@@ -201,13 +203,43 @@ cmake --build build --target ascii_formatter-package
 
 The standalone build stages `build/packages/ascii_formatter/Release`. The host accepts that directory or the directory reported by `hpk pack`. It contains `plugin.json`, the library named for the target, and `resources/` when declared. Archive creation and extraction are separate steps.
 
-Use `HPK_EXPORT_PLUGIN(OnActivate, OnDeactivate, ...)` with hooks of signature `void(const PluginContext&)` when the package needs activation or teardown work. Use `nullptr` for an omitted hook. An activation calls `OnActivate` once, then shares one context across its factories, instances, and `OnDeactivate`. The worker mode uses one worker per active package. On orderly teardown, PluginKit destroys the instances before calling `OnDeactivate`.
+Use `HPK_EXPORT_PLUGIN(OnActivate, OnDeactivate, ...)` with hooks of signature `void(const PluginContext&)` when the package needs activation or teardown work. Use `nullptr` for an omitted hook. An activation calls `OnActivate` once, then shares one context across its factories, instances, and `OnDeactivate`. Desktop worker mode uses one process per active package. Android assigns packages to its Service process pool. On orderly teardown, PluginKit destroys the instances before calling `OnDeactivate`.
 
 The [standalone CSV plugin](examples/csv_import/plugin/CMakeLists.txt) publishes several factories and packages compiled HuxerUI resources.
 
+## Android integration
+
+Android uses an installed static HuxerUI SDK without modifying its files. PluginKit builds `libhpk_runtime.so` from the SDK archive and redirects the participating CMake targets to that shared owner. The app and its worker processes each have their own HuxerUI Runtime; plugin libraries in a process use that process's Runtime. The APK supplies the common runtime, `libhpk_android.so`, and `libc++_shared.so`.
+
+Set `huxeruiStl=c++_shared` in the app's `platform/android/gradle.properties`. `hpk_use_worker(app)` includes the runtime integration. An in-process-only host can call `hpk_use_runtime(app)` instead. Keep other native libraries on the same C++ runtime. The published plugin SDK includes its ABI-specific runtime under `runtime/<abi>/` for linking independently built plugins. `hpk_add_plugin()` uses that library; installable plugin packages exclude the common runtime and STL. Both Android execution modes check the published runtime build identity.
+
+Call the Java bootstrap from `Application.attachBaseContext` before loading the host application library. Replace the template's unconditional static native-library initializer with this branch:
+
+```java
+@Override
+protected void attachBaseContext(Context base) {
+    super.attachBaseContext(base);
+    if (!PluginKit.initializeProcess(this)) {
+        System.loadLibrary(BuildConfig.HUXERUI_APP_LIBRARY);
+    }
+}
+```
+
+Import `org.huxerui.lib.pluginkit.PluginKit`. If the Application also overrides `onCreate`, skip host-only work when `PluginKit.isWorkerProcess()` returns true. The worker branch declares its own empty application and uses the SDK's existing windowless Android initialization. The host application library is not loaded into workers.
+
+Construct `PluginManager` with `RuntimeDesc::Android()` to enable the Android backend, or `std::nullopt` to disable it. The same synchronous `CreateExtension`, `CreateExtensions`, and `GetService` APIs apply. Binder bootstrap callbacks run independently of the main-thread ServiceConnection callback, so cold synchronous creation does not wait for that callback. Business calls, streams, and callbacks use independent package socket channels and the existing v1 protocol. Task dispatch can interleave across packages without mixing invocation identities or grants.
+
+The library declares four private Services with separate process names. Processes start on demand. Each package is assigned to the least-loaded slot and stays there for the activation. Several packages can share a process, with independent PluginContexts, resources, settings, grants, and data directories. The slot count limits worker processes only. Normal package shutdown closes its channel; the process exits when the last channel retires. Process crashes, protocol failures, and unresponsive calls terminate every activation sharing that process. All affected packages report `WorkerExited`; the host remains alive. Binder death does not provide a portable exit code or signal, so those diagnostic fields can be absent on Android.
+
+Cancellation revokes the call's grants and drains the reply within the remaining deadline, bounded by a five-second cancellation budget. A process is terminated if the exchange cannot finish safely. A package upgrade drains that package and loads its new version from a separate installed path; other packages can retain the worker. In-process upgrades still require a host process restart. Uninstall retains data unless the host explicitly requests deletion.
+
+The app owns source selection, copying, and archive extraction. Import into an app-private local staging directory, inspect the package, obtain digest and service-grant approval, then call `InstallPackage`. The installed host APK does not need to contain plugin code. HuxerUI resource directories and settings use the same APIs as desktop packages.
+
+Android SDK generation runs a native `hpk` built automatically in PluginKit's build cache with the existing SDK CLI. Target Clang options come from the NDK, and `hpk abi` evaluates the target ABI without executing Android binaries. Publishing Android headers still needs this ABI tool when `HPK_BUILD_GENERATOR=OFF`. Set `HPK_HOST_TOOL` to an existing native `hpk` executable when a build environment supplies one. Android builds require API 23 or later and a matching NDK/SDK ABI.
+
 ## Install and call from the host
 
-Create one `PluginManager` per writable profile on the owning HuxerUI application thread. Supply the deployed worker executable as a `File`, or `std::nullopt` for in-process-only use. Register the extension points and host services on each startup, then await `ApplyPendingChanges()` before using installed plugins. Each result reports any error applying a staged upgrade.
+Create one `PluginManager` per writable profile on the owning HuxerUI application thread. Supply `RuntimeDesc::Executable(worker_executable)` on desktop, `RuntimeDesc::Android()` on Android, or `std::nullopt` for in-process-only use. Register the extension points and host services on each startup, then await `ApplyPendingChanges()` before using installed plugins. Each result reports any error applying a staged upgrade.
 
 ```cpp
 #include "text_formatter.host.h"
@@ -236,7 +268,7 @@ Task<std::string> FormatText(hpk::PluginManager& plugins, std::string text) {
 In a running HuxerUI application, construct the manager with the application task scope.
 
 ```cpp
-hpk::PluginManager plugins(profile_directory, worker_executable, UseApplicationTaskScope());
+hpk::PluginManager plugins(profile_directory, hpk::RuntimeDesc::Executable(worker_executable), UseApplicationTaskScope());
 co_await InitializePlugins(plugins);
 ```
 
@@ -479,6 +511,28 @@ In PowerShell, use `python` and `$CsvHost`, with backticks for line continuation
 Append `--hpk <path-to-hpk>` to also build the CSV sources through `hpk pack`. Keep the same HuxerUI CLI and SDK available to the verification process. This checks target selection, stale build directories, resource validation, and installation with the reported digest.
 
 Use `huxerui package windows --abi x86_64 --config release` to build the Windows installer with the worker beside the preview executable. Use `huxerui package macos --config release` to package the macOS application with its helper.
+
+### Android CSV verification
+
+Build the existing preview with `huxerui build android --abi x86_64 --config debug` from `examples/preview`. The native build publishes the CSV SDK at `platform/android/app/.cxx/Debug/<configuration-hash>/x86_64/sdk` relative to that example. Use the matching `arm64-v8a` directory for an ARM device.
+
+Build the standalone CSV sources with the same NDK and configuration:
+
+```sh
+cmake -S examples/csv_import/plugin -B build/csv-android -G Ninja \
+    -DCMAKE_TOOLCHAIN_FILE="<NDK>/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI=x86_64 -DANDROID_PLATFORM=android-23 -DANDROID_STL=c++_shared \
+    -DCMAKE_BUILD_TYPE=Debug -DHUXERUI_HOME="<HuxerUI SDK>" \
+    -DCSV_IMPORT_SDK="<Android CSV SDK directory>" -DCSV_IMPORT_TEST_FIXTURES=ON
+cmake --build build/csv-android
+python3 examples/csv_import/verify_android.py \
+    examples/preview/platform/android/app/build/outputs/apk/debug/app-debug.apk \
+    build/csv-android/packages --serial <adb-device-id>
+```
+
+The runner installs the debuggable APK, then imports separately built packages into its private verification directory. It fills all four slots before activating another package to verify shared-process dispatch, cancellation, package-local disable, crash recovery, and a neighbor surviving upgrade. It also checks upgrade failure, saved-profile reuse, localized settings, and sync/async stream input and output above 8 MiB in both execution modes. Native module globals can persist across activations in a shared worker. Initialize and release activation state in the package hooks. The runner removes its own temporary files after verification. Production builds do not accept the example's command-file Intent.
+
+On Android, `hpk pack` first runs the normal CLI build, then completes the registered CMake package targets for the ABIs present in that build. It scans their staged package directories and uses the same package inspection and digest implementation with the Android target. This does not add files to the plugin package or require SDK CLI changes.
 
 ## License
 

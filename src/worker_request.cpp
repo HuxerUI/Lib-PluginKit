@@ -148,6 +148,9 @@ Frame Worker::DispatchCallback(Frame frame, Deadline deadline, std::stop_token s
   std::stop_callback stop_exchange(stop, [&] { callback.request_stop(); });
   std::stop_callback stop_callback(callback_stop_.get_token(), [&] { callback.request_stop(); });
   std::stop_callback worker_exited(exited_stop_.get_token(), [&] { callback.request_stop(); });
+#if defined(__ANDROID__)
+  std::stop_callback cancelled(invocation_cancel_.get_token(), [&] { callback.request_stop(); });
+#endif
   const auto token = callback.get_token();
   try {
     CheckExchange(deadline, token);
@@ -158,6 +161,22 @@ Frame Worker::DispatchCallback(Frame frame, Deadline deadline, std::stop_token s
     return reply;
   } catch (...) {
     if (grants) grants->Revoke();
+#if defined(__ANDROID__)
+    if (!exited_stop_.stop_requested() && (invocation_cancel_.stop_requested() || callback_stop_.stop_requested())) {
+      // Drain the callback protocol after revocation. Other packages retain their process and channels.
+      auto reply = ErrorReply(Error(ErrorCode::Cancelled, "The invocation is closing"));
+      reply.kind = frame.kind == FrameKind::StreamCall ? FrameKind::StreamReply : FrameKind::ServiceReply;
+      reply.call = frame.call;
+      reply.callback = frame.callback;
+      reply.instance = frame.instance;
+      reply.slot = frame.slot;
+      if (frame.kind == FrameKind::StreamCall) {
+        reply.operation = frame.operation;
+        reply.code = 1u + static_cast<std::uint32_t>(IoErrorCode::Io);
+      }
+      return reply;
+    }
+#endif
     if (callback_stop_.stop_requested()) throw Error(ErrorCode::Closed, "The plugin generation is closing");
     if (exited_stop_.stop_requested() && !stop.stop_requested()) {
       throw Error(ErrorCode::WorkerExited, "The plugin worker exited during a host callback");
@@ -290,6 +309,9 @@ Frame Worker::Request(Frame request, Deadline deadline, std::stop_token stop, bo
     request_ready_.notify_all();
   }};
   if (grants) grants->SetDeadline(deadline);
+#if defined(__ANDROID__)
+  invocation_cancel_ = std::stop_source{};
+#endif
   if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
   if (!Pid()) {
     run_->Disconnected();
@@ -301,7 +323,13 @@ Frame Worker::Request(Frame request, Deadline deadline, std::stop_token stop, bo
   if (activate && activated_) return {};
   Frame reply{};
   try {
-    // A caller cancellation retires an active exchange. External worker shutdown also wakes any callback wait.
+    // Android drains cancelled exchanges; desktop workers can retire the whole process.
+#if defined(__ANDROID__)
+    std::stop_callback interrupt(stop, [this, grants] {
+      invocation_cancel_.request_stop();
+      if (grants) grants->Revoke();
+    });
+#else
     std::stop_callback interrupt(stop, [this] {
       try {
         PostTransportCancellation([worker = weak_from_this()] {
@@ -315,6 +343,7 @@ Frame Worker::Request(Frame request, Deadline deadline, std::stop_token stop, bo
         Stop();
       }
     });
+#endif
     CheckExchange(deadline, stop);
     CheckExchange(deadline, generation_stop_.get_token());
     if (next_call_ == (std::numeric_limits<std::uint32_t>::max)()) {
@@ -346,8 +375,10 @@ Frame Worker::Request(Frame request, Deadline deadline, std::stop_token stop, bo
     throw;
   }
   if (stop.stop_requested()) {
+#if !defined(__ANDROID__)
     run_->BeginStop(PluginStopReason::Cancelled);
     Stop();
+#endif
     throw Error(ErrorCode::Cancelled, "The call was cancelled");
   }
   if (!active_) throw Error(ErrorCode::Closed, "The plugin generation is closed");
@@ -374,6 +405,16 @@ Frame Worker::Request(Frame request, Deadline deadline, std::stop_token stop, bo
       const Error error(static_cast<ErrorCode>(reply.code), std::string(AsText(reply.payload)));
       if (activate) {
         run_->ActivationFailed(PluginFailureStage::Activate, std::make_exception_ptr(error));
+#if defined(__ANDROID__)
+        try {
+          Frame shutdown{static_cast<std::uint32_t>(Command::Shutdown), 0, 0, {}};
+          shutdown.call = ++next_call_;
+          const auto closed = Exchange(shutdown, deadline, generation_stop_.get_token(), {});
+          graceful_shutdown_ = closed.kind == FrameKind::Reply && closed.call == shutdown.call && !closed.code;
+        } catch (...) {
+          // An unresponsive activation can require retiring every package sharing this process.
+        }
+#endif
         Stop();
       }
       throw error;
@@ -413,6 +454,9 @@ void Worker::Shutdown(std::chrono::milliseconds timeout) noexcept {
     // Give the active exchange and the teardown hook one bounded shutdown budget.
     try {
       Request({static_cast<std::uint32_t>(Command::Shutdown), 0, 0, {}}, timeout);
+#if defined(__ANDROID__)
+      graceful_shutdown_ = true;
+#endif
     } catch (...) {
       // Teardown is best effort. A stuck or disconnected worker still has to be retired.
     }

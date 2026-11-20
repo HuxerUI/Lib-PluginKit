@@ -66,7 +66,7 @@ pid_t Spawn(const std::filesystem::path& executable, int socket, const std::file
 
 Worker::Worker(const std::filesystem::path& executable, const std::filesystem::path& module, const Handle&,
                std::vector<RegisteredService> services, TaskScope callbacks, PluginStartup startup,
-               std::shared_ptr<PluginRun> run)
+               std::shared_ptr<PluginRun> run, [[maybe_unused]] Deadline start_deadline)
     : services_(std::move(services)), callbacks_(std::move(callbacks)), startup_(std::move(startup)),
       run_(std::move(run)) {
   int sockets[2];

@@ -2,7 +2,12 @@ cmake_minimum_required(VERSION 3.24)
 project(CsvImportPlugin LANGUAGES CXX)
 
 set(HUXERUI_HOME "$ENV{HUXERUI_HOME}" CACHE PATH "HuxerUI SDK directory")
-find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared HINTS "${HUXERUI_HOME}")
+if (ANDROID)
+    find_package(HuxerUI CONFIG REQUIRED COMPONENTS static PATHS "${HUXERUI_HOME}"
+        NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)
+else()
+    find_package(HuxerUI CONFIG REQUIRED COMPONENTS shared HINTS "${HUXERUI_HOME}")
+endif()
 
 set(CSV_IMPORT_SDK "" CACHE PATH "Published CSV example SDK directory")
 if (NOT EXISTS "${CSV_IMPORT_SDK}/PluginKit.cmake" OR NOT EXISTS "${CSV_IMPORT_SDK}/csv_contract.bindings.h")

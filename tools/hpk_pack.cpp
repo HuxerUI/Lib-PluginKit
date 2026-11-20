@@ -1,5 +1,6 @@
 #include "digest.h"
 #include "hpk_commands.h"
+#include "package_inspection.h"
 
 #include <huxerui/pluginkit.h>
 #include <nlohmann/json.hpp>
@@ -43,11 +44,11 @@ std::wstring QuoteArgument(std::wstring_view value) {
   return quoted;
 }
 
-unsigned long Build(std::span<const fs::path> arguments, const std::string& invocation) {
+unsigned long Build(std::span<const fs::path> arguments, const std::string& invocation, bool native = false) {
   if (!SetEnvironmentVariableW(L"HPK_PACK_INVOCATION", fs::path(invocation).c_str())) {
     WindowsError(ErrorCode::Io, "Cannot mark the hpk build invocation");
   }
-  std::wstring command_line = L"huxerui.exe build";
+  std::wstring command_line = native ? L"cmake.exe" : L"huxerui.exe build";
   for (const auto& argument : arguments) {
     command_line.push_back(L' ');
     command_line += QuoteArgument(argument.native());
@@ -68,11 +69,11 @@ unsigned long Build(std::span<const fs::path> arguments, const std::string& invo
   return status;
 }
 #else
-int Build(std::span<const fs::path> arguments, const std::string& invocation) {
+int Build(std::span<const fs::path> arguments, const std::string& invocation, bool native = false) {
   if (::setenv("HPK_PACK_INVOCATION", invocation.c_str(), 1) != 0) {
     PosixError(ErrorCode::Io, "Cannot mark the hpk build invocation");
   }
-  std::vector<std::string> command{"huxerui", "build"};
+  std::vector<std::string> command = native ? std::vector<std::string>{"cmake"} : std::vector<std::string>{"huxerui", "build"};
   for (const auto& argument : arguments) command.push_back(argument.native());
   std::vector<char*> argv;
   for (auto& argument : command) argv.push_back(argument.data());
@@ -128,10 +129,70 @@ std::vector<fs::path> ScanPackages(const fs::path& build_root, const std::string
 std::vector<fs::path> FindPackages(const std::string& invocation) {
   const auto marker_suffix = ".hpk-" + invocation;
   for (auto directory = fs::current_path();; directory = directory.parent_path()) {
+    const auto android = directory / "platform/android/app/.cxx";
+    if (fs::is_directory(android)) {
+      std::vector<fs::path> packages;
+      for (fs::recursive_directory_iterator item(android), end; item != end; ++item) {
+        if (item->is_directory() && item->path().filename() == "packages") {
+          for (const auto& target : fs::directory_iterator(item->path())) {
+            if (!target.is_directory()) continue;
+            for (const auto config : {"Debug", "Release"}) {
+              const auto marker = target.path() / (std::string(config) + marker_suffix);
+              if (fs::is_regular_file(marker)) {
+                packages.push_back(target.path() / config);
+                fs::remove(marker);
+              }
+            }
+          }
+          item.disable_recursion_pending();
+        } else if (item.depth() >= 3) item.disable_recursion_pending();
+      }
+      if (!packages.empty()) { std::sort(packages.begin(), packages.end()); return packages; }
+    }
     auto packages = ScanPackages(directory / ".huxerui" / "build", marker_suffix);
     if (!packages.empty()) return packages;
     packages = ScanPackages(directory / "examples" / "preview" / ".huxerui" / "build", marker_suffix);
     if (!packages.empty() || directory == directory.root_path()) return packages;
+  }
+}
+
+void BuildAndroidPackages(const std::vector<fs::path>& arguments, const std::optional<fs::path>& selected,
+                          const std::string& invocation) {
+  std::string config = "release";
+  for (std::size_t i = 0; i + 1 < arguments.size(); ++i) {
+    if (arguments[i] == "--config") config = PathText(arguments[i + 1]);
+  }
+  const auto capitalized = config == "debug" ? "Debug" : "Release";
+  for (auto directory = fs::current_path();; directory = directory.parent_path()) {
+    const auto app = directory / "platform/android/app/build";
+    const auto integration = app / "generated/huxerui/integration" / config;
+    if (fs::is_directory(integration)) {
+      // The merged ABI directories belong to the APK just built, excluding stale CMake configurations.
+      const auto merged = app / "intermediates/merged_native_libs" / config /
+          (std::string("merge") + capitalized + "NativeLibs/out/lib");
+      if (fs::is_directory(merged)) for (const auto& abi : fs::directory_iterator(merged)) {
+        const auto path = integration / abi.path().filename() / "pluginkit.json";
+        const auto app_plan = integration / abi.path().filename() / "app.json";
+        if (!fs::is_regular_file(path) || !fs::is_regular_file(app_plan)) continue;
+        const auto plan = nlohmann::json::parse(AsText(ReadFileBytes(path, 64 * 1024)));
+        const auto application = nlohmann::json::parse(AsText(ReadFileBytes(app_plan, 64 * 1024)));
+        if (plan.at("schema") != 1) throw Error(ErrorCode::InvalidArgument, "Invalid Android package build plan");
+        const fs::path artifact(application.at("artifact").get<std::string>());
+        const fs::path build_directory(plan.at("build_directory").get<std::string>());
+        if (!fs::is_regular_file(abi.path() / artifact.filename()) ||
+            build_directory.parent_path().filename() != artifact.parent_path().parent_path().parent_path().filename()) continue;
+        std::vector<fs::path> command{"--build", plan.at("build_directory").get<std::string>(), "--config", capitalized, "--target"};
+        for (const auto& value : plan.at("targets")) {
+          const auto target = value.get<std::string>();
+          if (!selected || target == PathText(*selected) + "-package") command.emplace_back(target);
+        }
+        if (command.size() > 5 && Build(command, invocation, true) != 0) {
+          throw Error(ErrorCode::Io, "Android plugin package target failed");
+        }
+      }
+      return;
+    }
+    if (directory == directory.root_path()) return;
   }
 }
 
@@ -158,6 +219,9 @@ void PackPlugin(std::span<const fs::path> arguments) {
 
   const auto invocation = NewToken();
   const auto status = Build(build_arguments, invocation);
+  if (status == 0 && std::ranges::find(build_arguments, fs::path("android")) != build_arguments.end()) {
+    BuildAndroidPackages(build_arguments, target, invocation);
+  }
   auto packages = FindPackages(invocation);
   if (status != 0) throw Error(ErrorCode::Io, "huxerui build failed with exit code " + std::to_string(status));
 
@@ -175,7 +239,13 @@ void PackPlugin(std::span<const fs::path> arguments) {
 
   const auto& directory = packages.front();
   const auto path = PathText(directory);
-  const auto package = PluginManager::InspectPackage(File(path));
+  PackageInfo package;
+  if (std::ranges::find(build_arguments, fs::path("android")) != build_arguments.end()) {
+    const auto manifest = nlohmann::json::parse(AsText(ReadFileBytes(directory / "plugin.json", 64 * 1024)));
+    const auto target_name = manifest.at("target").get<std::string>();
+    if (!target_name.starts_with("android-")) throw Error(ErrorCode::InvalidPackage, "Expected an Android package");
+    package = InspectPackageForTarget(File(path), target_name);
+  } else package = PluginManager::InspectPackage(File(path));
   const nlohmann::json result{{"path", path}, {"target", PathText(directory.parent_path().filename())},
       {"id", package.id}, {"version", package.version}, {"digest", package.digest}};
   std::cout << result.dump() << '\n';

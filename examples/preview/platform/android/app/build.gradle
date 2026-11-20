@@ -89,6 +89,7 @@ android {
     externalNativeBuild {
         cmake {
             path = file("../../../CMakeLists.txt")
+            version = providers.gradleProperty("huxeruiCmakeVersion").orElse("3.31.8").get()
         }
     }
 

@@ -5,6 +5,7 @@
 #include "plugin_settings.h"
 #include "run_transport.h"
 #include "worker_process.h"
+#include "package_inspection.h"
 
 #include <huxerui/pluginkit/plugin.h>
 
@@ -61,13 +62,13 @@ ExecutionMode ParseMode(std::string_view mode, ErrorCode error) {
 namespace detail {
 
 struct ManifestParser {
-  static PackageInfo Parse(const Json& manifest, std::string digest);
+  static PackageInfo Parse(const Json& manifest, std::string digest, std::string_view target = PackageTarget);
 };
 
-PackageInfo ManifestParser::Parse(const Json& manifest, std::string digest) {
+PackageInfo ManifestParser::Parse(const Json& manifest, std::string digest, std::string_view target) {
   try {
     if (!manifest.at("schema_version").is_number_integer() || manifest.at("schema_version") != 1 ||
-        manifest.at("target") != PackageTarget) {
+        manifest.at("target").get_ref<const std::string&>() != target) {
       throw Error(ErrorCode::InvalidPackage, "The package schema or target is unsupported");
     }
     PackageInfo info{
@@ -170,15 +171,17 @@ struct Package {
   std::vector<fs::path> resources;
 };
 
-Package ReadPackage(const fs::path& directory) try {
+Package ReadPackage(const fs::path& directory, std::string_view target = PackageTarget) try {
+  const auto module_name = target == "windows-x86_64-msvc" ? "plugin.dll" :
+      target == "macos-arm64" || target == "macos-x86_64" ? "plugin.dylib" : "plugin.so";
   auto manifest_bytes = ReadFileBytes(directory / "plugin.json", MaxManifest);
-  auto module_file = OpenRegularFile(directory / ModuleName);
+  auto module_file = OpenRegularFile(directory / module_name);
   auto module_bytes = ReadFileBytes(module_file.get(), MaxModule);
-  if (module_bytes.empty()) throw Error(ErrorCode::InvalidPackage, std::string(ModuleName) + " is empty");
+  if (module_bytes.empty()) throw Error(ErrorCode::InvalidPackage, std::string(module_name) + " is empty");
   auto resources = ResourceFiles(directory);
   std::map<std::string, std::string> hashes;
   hashes.emplace("plugin.json", Sha256(manifest_bytes));
-  hashes.emplace(ModuleName, Sha256(module_bytes));
+  hashes.emplace(module_name, Sha256(module_bytes));
   for (const auto& relative : resources) {
     const auto name = relative.generic_u8string();
     const std::string path(name.begin(), name.end());
@@ -198,7 +201,7 @@ Package ReadPackage(const fs::path& directory) try {
     }
   });
   auto manifest = ParseJson(manifest_bytes, MaxManifestDepth, ErrorCode::InvalidPackage);
-  auto info = ManifestParser::Parse(manifest, digest);
+  auto info = ManifestParser::Parse(manifest, digest, target);
   return {std::move(manifest_bytes), std::move(module_bytes), std::move(module_file), std::move(manifest),
           std::move(info), directory, std::move(resources)};
 } catch (const Json::exception& error) {
@@ -207,8 +210,8 @@ Package ReadPackage(const fs::path& directory) try {
   throw Error(ErrorCode::Io, "Cannot read plugin package: " + std::string(error.what()));
 }
 
-Package ReadPackageForApproval(const fs::path& directory) {
-  auto package = ReadPackage(directory);
+Package ReadPackageForApproval(const fs::path& directory, std::string_view target = PackageTarget) {
+  auto package = ReadPackage(directory, target);
   ValidateSettingsResources(package.info.settings_schema, File(PathText(directory / "resources")));
   return package;
 }
@@ -440,10 +443,18 @@ struct RegisteredContract {
 } // namespace
 
 struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
-  Impl(const File& directory, const std::optional<File>& executable, TaskScope callbacks)
+  Impl(const File& directory, const std::optional<RuntimeDesc>& runtime, TaskScope callbacks)
       : profile(fs::absolute(NativePath(directory))),
-        worker_executable(executable ? std::optional(fs::absolute(NativePath(*executable))) : std::nullopt),
-         callbacks(std::move(callbacks)), events(std::make_shared<PluginEvents>(this->callbacks)) {
+        runtime(runtime),
+        callbacks(std::move(callbacks)), events(std::make_shared<PluginEvents>(this->callbacks)) {
+#if defined(__ANDROID__)
+    if (runtime && runtime->executable_) throw Error(ErrorCode::InvalidArgument, "Android workers use RuntimeDesc::Android()");
+#else
+    if (runtime) {
+      if (!runtime->executable_) throw Error(ErrorCode::InvalidArgument, "Desktop workers use RuntimeDesc::Executable()");
+      this->runtime->executable_.emplace(PathText(fs::absolute(NativePath(*runtime->executable_))));
+    }
+#endif
     fs::create_directories(profile);
     profile = fs::canonical(profile);
     ownership = LockProfile(profile);
@@ -495,7 +506,8 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   std::shared_ptr<LocalPlugin> MakeLocal(const Installed& installed, PluginStartup startup,
                                         std::shared_ptr<PluginRun> run = {});
   std::shared_ptr<Worker> MakeWorker(const Package& package, std::vector<RegisteredService> granted,
-                                     PluginStartup startup, std::shared_ptr<PluginRun> run);
+                                     PluginStartup startup, std::shared_ptr<PluginRun> run,
+                                     Deadline deadline = std::chrono::steady_clock::now() + DefaultTimeout);
   std::vector<std::shared_ptr<Worker>> ActiveAndRetiredWorkers(std::string_view id) const;
   WorkerStart StartWorker(const std::string& id, const std::stop_token& admission,
                           Deadline deadline, std::stop_token stop);
@@ -592,7 +604,7 @@ struct PluginManager::Impl : std::enable_shared_from_this<PluginManager::Impl> {
   }
 
   fs::path profile;
-  const std::optional<fs::path> worker_executable;
+  std::optional<RuntimeDesc> runtime;
   TaskScope callbacks;
   const std::shared_ptr<PluginEvents> events;
   Handle ownership;
@@ -717,8 +729,14 @@ std::string_view ErrorName(ErrorCode code) noexcept {
   return "unknown";
 }
 
-PluginManager::PluginManager(const File& profile, const std::optional<File>& executable, TaskScope callbacks)
-    : impl_(std::make_shared<Impl>(profile, executable, std::move(callbacks))) {}
+RuntimeDesc RuntimeDesc::Android() { return RuntimeDesc(std::nullopt); }
+
+RuntimeDesc RuntimeDesc::Executable(const File& executable) { return RuntimeDesc(executable); }
+
+RuntimeDesc::RuntimeDesc(std::optional<File> executable) : executable_(std::move(executable)) {}
+
+PluginManager::PluginManager(const File& profile, const std::optional<RuntimeDesc>& runtime, TaskScope callbacks)
+    : impl_(std::make_shared<Impl>(profile, runtime, std::move(callbacks))) {}
 
 PluginManager::~PluginManager() {
   {
@@ -789,6 +807,13 @@ PackageInfo PluginManager::InspectPackage(const File& directory) {
   return ReadPackageForApproval(NativePath(directory)).info;
 }
 
+PackageInfo detail::InspectPackageForTarget(const File& directory, std::string_view target) {
+  constexpr std::array targets{"windows-x86_64-msvc", "macos-arm64", "macos-x86_64",
+      "linux-x86_64-gnu", "linux-aarch64-gnu", "android-arm64-v8a", "android-x86_64"};
+  if (std::ranges::find(targets, target) == targets.end()) throw Error(ErrorCode::InvalidPackage, "Unsupported package target");
+  return ReadPackageForApproval(NativePath(directory), target).info;
+}
+
 void PluginManager::InstallPackage(const File& directory, std::string_view approved_digest, InstallOptions options) {
   RejectServiceReentry();
   auto package = ReadPackageForApproval(NativePath(directory));
@@ -846,13 +871,17 @@ void PluginManager::InstallPackage(const File& directory, std::string_view appro
 
 void PluginManager::Impl::ValidatePackage(const PackageInfo& info, InstallOptions& options) const {
   if (std::ranges::find(info.execution_modes, options.mode) == info.execution_modes.end() ||
-      (options.mode == ExecutionMode::WorkerProcess && !worker_executable)) {
+      (options.mode == ExecutionMode::WorkerProcess && !runtime)) {
     throw Error(ErrorCode::UnsupportedMode, "The package or host cannot use the selected execution mode");
   }
   for (const auto& extension : info.extensions) {
     (void)RequirePackagePoint(extension.Point(), options.mode);
   }
-  if (options.mode == ExecutionMode::InProcess && info.cpp_abi != CppAbi) {
+  if ((options.mode == ExecutionMode::InProcess
+#if defined(__ANDROID__)
+       || options.mode == ExecutionMode::WorkerProcess
+#endif
+      ) && info.cpp_abi != CppAbi) {
     throw Error(ErrorCode::ContractMismatch, "The package requires a different in-process SDK or C++ ABI");
   }
   std::ranges::sort(options.services);
@@ -1446,7 +1475,7 @@ std::shared_ptr<ExtensionTarget> PluginManager::Create(std::string_view point, C
   if (!selected) throw Error(ErrorCode::NotFound, "The plugin has no such factory at this extension point");
 
   if (installed.approval.mode == ExecutionMode::WorkerProcess) {
-    if (!registered.remote || !impl_->worker_executable) {
+    if (!registered.remote || !impl_->runtime) {
       throw Error(ErrorCode::UnsupportedMode, "The extension cannot use a worker");
     }
     const auto admission = impl_->admissions.try_emplace(plugin->first).first->second.get_token();
@@ -1516,9 +1545,10 @@ PluginStartup PluginManager::Impl::Startup(const Installed& installed) const {
 }
 
 std::shared_ptr<Worker> PluginManager::Impl::MakeWorker(const Package& package, std::vector<RegisteredService> granted,
-                                                        PluginStartup startup, std::shared_ptr<PluginRun> run) {
-  return std::make_shared<Worker>(*worker_executable, PackageDirectory(package.info.digest) / ModuleName,
-      package.module_file, std::move(granted), callbacks, std::move(startup), std::move(run));
+                                                        PluginStartup startup, std::shared_ptr<PluginRun> run, Deadline deadline) {
+  const auto executable = runtime->executable_ ? NativePath(*runtime->executable_) : fs::path{};
+  return std::make_shared<Worker>(executable, PackageDirectory(package.info.digest) / ModuleName,
+      package.module_file, std::move(granted), callbacks, std::move(startup), std::move(run), deadline);
 }
 
 WorkerStart PluginManager::Impl::StartWorker(const std::string& id, const std::stop_token& admission,
@@ -1557,7 +1587,7 @@ WorkerStart PluginManager::Impl::StartWorker(const std::string& id, const std::s
     stage = PluginFailureStage::StartWorker;
     auto startup = Startup(installed->second);
     startup.settings = EncodeEffectiveSettings(installed->second);
-    worker = MakeWorker(package, ApprovedServices(installed->second), std::move(startup), run);
+    worker = MakeWorker(package, ApprovedServices(installed->second), std::move(startup), run, deadline);
     // The new process belongs to this call until it is published for other handles.
     check_start();
     workers.emplace(id, worker);

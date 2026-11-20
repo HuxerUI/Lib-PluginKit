@@ -24,6 +24,7 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
 endif ()
 huxerui_add_app(example_lib_plugin_kit
     SOURCES "${host_source}" ${host_entry}
+    ${HUXERUI_APP_RESOURCE_OUTPUT_ARGUMENTS}
     BUNDLE_NAME "Lib-PluginKit Preview"
     BUNDLE_IDENTIFIER "org.huxerui.lib.pluginkit.preview"
 )
@@ -42,6 +43,7 @@ if (NOT HPK_BUILD_GENERATOR)
     message(FATAL_ERROR "The CSV preview requires HPK_BUILD_GENERATOR=ON")
 endif ()
 set(csv_framework_includes "$<TARGET_PROPERTY:HuxerUI::huxerui,INTERFACE_INCLUDE_DIRECTORIES>")
+get_property(csv_clang_options TARGET example_lib_plugin_kit PROPERTY HPK_CLANG_OPTIONS)
 set(codec_check_src "${CMAKE_CURRENT_SOURCE_DIR}/src/codec_check")
 set(codec_check_dir "${CMAKE_CURRENT_BINARY_DIR}/codec-check")
 set(codec_check_files "${codec_check_dir}/.hpk-sdk-files")
@@ -56,7 +58,7 @@ add_custom_command(OUTPUT "${codec_check_files}"
         "${codec_check_dir}/codec_mapped.h" "${codec_check_dir}/codec_mapped.bindings.h"
         "${codec_check_dir}/codec_mappings.h"
     COMMAND "$<TARGET_FILE:hpk>" gen "${codec_check_src}" "${codec_check_dir}" "${codec_check_header_list}" --
-        "-I${kit_root}/include" "-I$<JOIN:${csv_framework_includes},;-I>" -isystem "${codec_check_src}"
+        "-I${kit_root}/include" "-I$<JOIN:${csv_framework_includes},;-I>" -isystem "${codec_check_src}" ${csv_clang_options}
     DEPENDS hpk "${codec_check_header_list}" ${codec_check_inputs}
     COMMAND_EXPAND_LISTS VERBATIM
 )

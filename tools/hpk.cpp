@@ -1032,6 +1032,37 @@ void Generate(const fs::path& base, const fs::path& output, const fs::path& list
 
 } // namespace
 
+void huxerui::pluginkit::detail::GenerateAbi(std::span<const fs::path> options) {
+  if (options.size() < 2 || options[1] != "--") throw Error(ErrorCode::InvalidArgument, "Use hpk abi <output> -- <target compiler options>");
+  const auto arguments = CompilerArguments(fs::current_path(), options.subspan(2));
+  std::vector<const char*> argv;
+  for (const auto& value : arguments) argv.push_back(value.c_str());
+  const char source[] = "#include <huxerui/pluginkit/plugin.h>\n";
+  CXUnsavedFile input{"hpk-target-abi.cpp", source, sizeof(source) - 1};
+  auto index = clang_createIndex(0, 0);
+  CXTranslationUnit unit = nullptr;
+  const auto status = clang_parseTranslationUnit2FullArgv(index, input.Filename, argv.data(),
+      static_cast<int>(argv.size()), &input, 1, CXTranslationUnit_SkipFunctionBodies, &unit);
+  const auto dispose = [&] { if (unit) clang_disposeTranslationUnit(unit); clang_disposeIndex(index); };
+  try {
+    if (status != CXError_Success) throw Error(ErrorCode::InvalidArgument, "Cannot parse target ABI");
+    CheckDiagnostics(unit, input.Filename);
+    std::string abi;
+    clang_visitChildren(clang_getTranslationUnitCursor(unit), [](CXCursor cursor, CXCursor, CXClientData data) {
+      if (clang_getCursorKind(cursor) == CXCursor_VarDecl && Text(clang_getCursorSpelling(cursor)) == "CppAbi") {
+        if (auto value = clang_Cursor_Evaluate(cursor)) {
+          if (clang_EvalResult_getKind(value) == CXEval_StrLiteral) *static_cast<std::string*>(data) = clang_EvalResult_getAsStr(value);
+          clang_EvalResult_dispose(value);
+        }
+      }
+      return CXChildVisit_Recurse;
+    }, &abi);
+    if (abi.empty()) throw Error(ErrorCode::InvalidArgument, "Cannot evaluate target C++ ABI");
+    WriteAtomicFile(options[0], AsBytes(abi));
+  } catch (...) { dispose(); throw; }
+  dispose();
+}
+
 void huxerui::pluginkit::detail::GenerateSdk(std::span<const fs::path> args) {
   if (args.size() < 3 || (args.size() > 3 && args[3] != "--")) {
     throw Error(ErrorCode::InvalidArgument,

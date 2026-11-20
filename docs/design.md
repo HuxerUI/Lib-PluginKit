@@ -205,9 +205,16 @@ An optional HuxerUI adapter provides `PluginCenter(manager)`, schema-driven sett
 
 ## Acceptance scenarios
 
+Android consumes the existing static SDK through a PluginKit-owned shared runtime. Its bound Services
+provide four process slots that start on demand, with independent package channels on each process. Package activation
+identity and call tokens route callbacks independently of Task interleaving. Stopping or upgrading one
+package retires its own session; a failed process interrupts every assigned package. The CSV preview
+provides Android commands and verification that fills all four slots before sharing a Service. Archive extraction
+and source selection remain host responsibilities.
+
 - Publish an editor SDK and install an independently built Markdown importer into an existing editor. The importer appears through manifest metadata, starts on first use, and supplies a typed implementation.
 - Open a large document through a granted stream. Verify bounded buffering, cancellation, and delivery of progress without blocking the application UI.
-- Crash or stall one worker during a call. Verify that unrelated plugins remain available, that the pending call reports a useful error, and that recovery can open a new generation.
+- Crash or stall one worker during a call. Verify that plugins outside that worker remain available, that the pending call reports a useful error, and that recovery can open a new generation.
 - Disable an extension while an application retains its handle and another call is in flight. Verify that new calls are refused and that resources are released after draining.
 - Exercise a compatible contract minor revision, an incompatible contract, a dependency conflict, a denied grant, and a changed package digest. Verify that each diagnostic identifies the failing condition.
 - Interrupt a local upgrade and fail a candidate activation after it writes to its data copy. Verify that startup selects the last committed package, grants, and data and finishes pending file cleanup.
