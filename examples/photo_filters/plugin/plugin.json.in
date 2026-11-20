@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "id": "@plugin_id@",
+  "version": "0.1.0",
+  "target": "@package_target@",
+  "execution_modes": ["in_process", "worker_process"],
+  "cpp_abi": "@cpp_abi@",
+  "extensions": [
+    {
+      "point": "example.photo-filters",
+      "metadata": {"label": "@label@", "description": "@description@"}
+    }
+  ]
+}

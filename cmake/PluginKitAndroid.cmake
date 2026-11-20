@@ -63,6 +63,8 @@ function(_hpk_android_runtime)
     file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/hpk-runtime.cpp"
         CONTENT "// Shared owner of the SDK archive's application and task state.\n")
     add_library(hpk_runtime SHARED "${CMAKE_CURRENT_BINARY_DIR}/hpk-runtime.cpp")
+    # Resolve framework RTTI to the same address in the runtime, host, and dynamically loaded plugins.
+    target_link_options(hpk_runtime PRIVATE "LINKER:-z,global")
     target_link_libraries(hpk_runtime PRIVATE "$<LINK_LIBRARY:WHOLE_ARCHIVE,hpk_android_archive>" android EGL GLESv2 log)
     target_include_directories(hpk_runtime PUBLIC "${includes}")
     # Whole-archive retention lets independently built plugins use SDK functions absent from host code.

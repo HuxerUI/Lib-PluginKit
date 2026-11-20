@@ -14,7 +14,6 @@ if (HUXERUI_PROJECT_PLAN_ONLY)
 endif ()
 
 get_filename_component(kit_root "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(host_source "${CMAKE_CURRENT_SOURCE_DIR}/src/csv_host.cpp")
 if (WIN32)
     set(host_entry platform/windows/main.cpp)
 elseif (CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -23,7 +22,8 @@ elseif (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     set(host_entry platform/macos/main.cpp)
 endif ()
 huxerui_add_app(example_lib_plugin_kit
-    SOURCES "${host_source}" ${host_entry}
+    SOURCES src/csv_host.cpp src/photo_studio.cpp ${host_entry}
+    RESOURCES resources RESOURCE_NAMESPACE photo_studio_assets
     ${HUXERUI_APP_RESOURCE_OUTPUT_ARGUMENTS}
     BUNDLE_NAME "Lib-PluginKit Preview"
     BUNDLE_IDENTIFIER "org.huxerui.lib.pluginkit.preview"
@@ -40,7 +40,7 @@ if (HUXERUI_LIBRARY_GRAPH_ONLY)
     return()
 endif ()
 if (NOT HPK_BUILD_GENERATOR)
-    message(FATAL_ERROR "The CSV preview requires HPK_BUILD_GENERATOR=ON")
+    message(FATAL_ERROR "The PluginKit preview requires HPK_BUILD_GENERATOR=ON")
 endif ()
 set(csv_framework_includes "$<TARGET_PROPERTY:HuxerUI::huxerui,INTERFACE_INCLUDE_DIRECTORIES>")
 get_property(csv_clang_options TARGET example_lib_plugin_kit PROPERTY HPK_CLANG_OPTIONS)

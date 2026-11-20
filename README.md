@@ -422,9 +422,29 @@ Call `ListPlugins()` for the initial catalog and retain the move-only token from
 
 `Diagnostics(plugin_id)` returns the installed status, current runtime state, and latest failure for the manager session. Use `Error::Code()` and `ErrorName()` for error handling. For `ContractMismatch`, check that your manifest points match the exported factories and that the host and plugin were built with the same published SDK and ABI. For `ApprovalMismatch`, inspect the current package files and present their digest for approval again. [Host API reference](include/huxerui/pluginkit.h)
 
+## Run Photo Studio
+
+The default preview is a photo editor with an original and a result pane. It opens with a sample photo. Install an effect package to add a tool, choose a strength, and click **Apply**. The filter reports progress and writes the result pixels to a stream. Its returned palette drives the color swatches under the result.
+
+Build the preview using the platform commands below. Then build the two effect packages against its published SDK with the same toolchain, ABI, and configuration.
+
+```sh
+cmake -S examples/photo_filters/plugin -B build/photo-plugins -G Ninja \
+    -DCMAKE_BUILD_TYPE=Release -DPHOTO_STUDIO_SDK="<absolute path to preview build>/sdk"
+cmake --build build/photo-plugins
+```
+
+Launch the preview executable with no arguments, or open the preview APK on Android. Click **Install effect** and choose `build/photo-plugins/packages/mono/Release` or `build/photo-plugins/packages/warm/Release`. The approval shows the package digest and lets you select **Run in worker** or **Run in app**. Install one effect in each mode to try both in the same session. **Open photo** accepts a JPEG or PNG. Use **Remove effect** and reinstall the package to change its execution mode.
+
+For Android, use the same NDK settings as the [Android CSV build](#android-csv-verification) and pass the matching Android SDK directory as `PHOTO_STUDIO_SDK`. For a debug preview, use `-DCMAKE_BUILD_TYPE=Debug` and select the package's `Debug` folder on the device. On macOS, sign each package library before approving its digest.
+
+The [host UI](examples/preview/src/photo_studio.cpp) discovers effects from package metadata. Both execution modes use the same [filter contract](examples/preview/sdk/photo/image_filter.h) and plugin implementation. The host decodes the source and caps the preview at 2048 pixels on its longest edge. PluginKit carries RGBA8 pixels through native streams and sends the palette back as typed data.
+
+The sample is [Mountain Lake Sunset](https://commons.wikimedia.org/wiki/File:Mountain_Lake_Sunset.jpg) by 420 Photography, dedicated to the public domain under CC0 1.0.
+
 ## Run the CSV example
 
-The preview and standalone CSV plugin show a package with two importers and one exporter. The plugin reports progress, calls a host service to record the row count, and reads a localized `max_rows` setting. The export contract exercises synchronous and asynchronous stream operations. [Preview source](examples/preview/src/csv_host.cpp), [Plugin source](examples/csv_import/plugin/csv_importer.cpp)
+The preview also has a command mode for the standalone CSV plugin and its automated regressions. The package has two importers and one exporter. The plugin reports progress, calls a host service to record the row count, and reads a localized `max_rows` setting. The export contract exercises synchronous and asynchronous stream operations. [Command host](examples/preview/src/csv_host.cpp), [Plugin source](examples/csv_import/plugin/csv_importer.cpp)
 
 ### Build the preview and plugin
 
@@ -453,7 +473,7 @@ cmake --build build/csv-plugin
 
 ### Install and use the CSV plugin
 
-The CLI takes the profile directory before the command and returns one JSON reply per command. Use a new profile for the following commands.
+The CLI takes the profile directory before the command and returns one JSON reply per command. Launch with `--cli` to open an interactive session on the default profile. Use a new profile for the following commands.
 
 ```powershell
 $CsvHost = Join-Path '<preview build directory>' 'example_lib_plugin_kit.exe'

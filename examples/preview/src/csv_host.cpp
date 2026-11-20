@@ -1,4 +1,5 @@
 #include "csv_host.h"
+#include "photo_studio.h"
 #include "windowless_runtime.h"
 
 #include "codec_record.bindings.h"
@@ -1678,7 +1679,7 @@ fs::path DefaultProfile() { return android_profile; }
 fs::path WorkerPath() { return {}; }
 }
 
-static const huxerui::Application application(WindowlessRoot);
+static const huxerui::Application application(photo_studio::StudioRoot, {.show_debug_overlay = false});
 extern "C" JNIEXPORT void JNICALL
 Java_org_huxerui_lib_pluginkit_preview_MainActivity_nativeRun(JNIEnv* environment, jclass, jstring file) {
   try {
@@ -1691,6 +1692,14 @@ Java_org_huxerui_lib_pluginkit_preview_MainActivity_nativeRun(JNIEnv* environmen
 }
 #else
 int csv_import::preview::Run(std::span<const fs::path> args) {
+  if (args.empty()) {
+    const huxerui::Application application(photo_studio::StudioRoot, {
+        .window = {.title = "Photo Studio", .initial_size = {1100.0F, 880.0F}},
+        .show_debug_overlay = false,
+    });
+    return huxerui::RunApplication();
+  }
+  if (args.front() == "--cli") args = args.subspan(1);
   const huxerui::Application application(WindowlessRoot);
   WindowlessRuntime runtime;
   int exit_code = 0;

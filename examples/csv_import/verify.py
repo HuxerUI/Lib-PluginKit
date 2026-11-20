@@ -174,7 +174,7 @@ def verify_default_profile(host, scratch):
         env = dict(os.environ, LOCALAPPDATA=str(local_data))
         profile = local_data / "HuxerUI" / "Lib-PluginKit" / "Preview"
     process = subprocess.run(
-        [str(host)],
+        [str(host), "--cli"],
         input="list\nquit\n",
         capture_output=True,
         encoding="utf-8",
