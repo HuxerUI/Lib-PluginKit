@@ -3,12 +3,12 @@
   "id": "@plugin_id@",
   "version": "0.1.0",
   "target": "@package_target@",
-  "execution_modes": ["in_process", "worker_process"],
+  "execution_modes": [@execution_modes@],
   "cpp_abi": "@cpp_abi@",
   "extensions": [
     {
       "point": "example.photo-filters",
       "metadata": {"label": "@label@", "description": "@description@"}
-    }
+    }@panel_extension@
   ]
 }

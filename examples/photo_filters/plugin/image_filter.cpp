@@ -2,6 +2,12 @@
 
 #include <huxerui/pluginkit/plugin.h>
 
+#if defined(PHOTO_WARM_PANEL)
+#include "photo/effect_panel.h"
+
+#include <huxerui/huxerui.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -98,8 +104,34 @@ public:
   }
 };
 
+constexpr auto FilterFactory = BindExtension<ImageFilter, PhotoFilter>(Effects);
+
+#if defined(PHOTO_WARM_PANEL)
+class WarmPanel final : public EffectPanel {
+public:
+  View BuildView(State<float> strength, bool enabled) override {
+    return Column {
+      Text("Warm Tone controls", TextRole::Title),
+      Text::Format("Warmth {}%", static_cast<unsigned>(static_cast<float>(strength))),
+      Slider(strength).Range(0.0F, 100.0F).Step(1.0F).OnChanged([strength](float value) {
+        strength = value;
+      }).With(Enabled(enabled)),
+      Flow {
+        Button("Soft · 35%").With(Enabled(enabled)).OnClick([strength] { strength = 35.0F; }),
+        Button("Golden · 80%").With(Enabled(enabled)).OnClick([strength] { strength = 80.0F; }),
+      }.With(Spacing(8.0F)),
+    }.With(Spacing(8.0F), CrossAlign(CrossAxisAlignment::Stretch));
+  }
+};
+
+constexpr auto PanelFactory = BindExtension<EffectPanel, WarmPanel>(EffectPanels);
+#endif
+
 } // namespace
 } // namespace photo_studio
 
-HPK_EXPORT_PLUGIN(nullptr, nullptr,
-    huxerui::pluginkit::BindExtension<photo_studio::ImageFilter, photo_studio::PhotoFilter>(photo_studio::Effects))
+#if defined(PHOTO_WARM_PANEL)
+HPK_EXPORT_PLUGIN(nullptr, nullptr, photo_studio::FilterFactory, photo_studio::PanelFactory)
+#else
+HPK_EXPORT_PLUGIN(nullptr, nullptr, photo_studio::FilterFactory)
+#endif

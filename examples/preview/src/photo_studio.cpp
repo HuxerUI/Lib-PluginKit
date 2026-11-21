@@ -1,5 +1,6 @@
 #include "photo_studio.h"
 
+#include "photo/effect_panel.h"
 #include "photo/image_filter.host.h"
 
 #include <huxerui/huxerui.h>
@@ -28,6 +29,7 @@ struct Effect {
   std::string label;
   std::string description;
   ExecutionMode mode;
+  bool has_panel;
 };
 
 struct Result {
@@ -48,6 +50,7 @@ struct StudioState {
   std::string message;
   bool busy = false;
   bool failed = false;
+  bool removing_effect = false;
 };
 
 RuntimeDesc StudioRuntime(const AppDirectories& dirs) {
@@ -66,6 +69,7 @@ RuntimeDesc StudioRuntime(const AppDirectories& dirs) {
 
 std::vector<Effect> DiscoverEffects(const PluginManager& manager) {
   const auto plugins = manager.ListPlugins();
+  const auto panels = manager.ListExtensions(EffectPanels);
   std::vector<Effect> effects;
   for (auto extension : manager.ListExtensions(Effects)) {
     const auto plugin = std::ranges::find_if(plugins, [&](const auto& item) {
@@ -82,7 +86,11 @@ std::vector<Effect> DiscoverEffects(const PluginManager& manager) {
         description = detail->get<std::string>();
       }
     }
-    effects.push_back({std::move(extension), plugin->package.digest, std::move(label), std::move(description), plugin->mode});
+    const bool has_panel = std::ranges::any_of(panels, [&](const auto& panel) {
+      return panel.PluginId() == extension.PluginId();
+    });
+    effects.push_back({std::move(extension), plugin->package.digest, std::move(label), std::move(description),
+                       plugin->mode, has_panel});
   }
   return effects;
 }
@@ -196,12 +204,14 @@ void RunAction(const TaskScope& tasks, State<StudioState> state, std::string sta
       auto message = co_await action();
       state.Update([&](StudioState& value) {
         value.busy = false;
+        value.removing_effect = false;
         value.completed_rows.reset();
         value.message = std::move(message);
       });
     } catch (const std::exception& error) {
       state.Update([&](StudioState& value) {
         value.busy = false;
+        value.removing_effect = false;
         value.failed = true;
         value.completed_rows.reset();
         value.message = error.what();
@@ -267,6 +277,33 @@ View Palette(const ColorScheme& colors, const std::vector<Swatch>& palette) {
   });
 }
 
+struct MountedPanel {
+  std::string plugin_id;
+  ExtensionHandle<EffectPanel> handle;
+};
+
+[[huxerui::composable]]
+View PluginControls(std::shared_ptr<PluginManager> host, std::string plugin_id, State<float> strength, bool enabled) {
+  const auto panel = UseState(std::shared_ptr<MountedPanel>{});
+  const auto error = UseState(std::string{});
+
+  Lifecycle([=] {
+    error = std::string{};
+    try {
+      panel = std::make_shared<MountedPanel>(MountedPanel{plugin_id, host->CreateExtension(EffectPanels, plugin_id)});
+    } catch (const std::exception& failure) {
+      error = std::string(failure.what());
+    }
+    // Keep the borrowed extension alive until the tree containing its callbacks has been retired.
+    return [panel] { panel = std::shared_ptr<MountedPanel>{}; };
+  }, host, plugin_id);
+
+  const std::shared_ptr<MountedPanel>& mounted = panel;
+  if (mounted && mounted->plugin_id == plugin_id) return mounted->handle->BuildView(strength, enabled);
+  const std::string& message = error;
+  return message.empty() ? View{} : Text(message).With(Foreground(UseTheme().colors.error));
+}
+
 [[huxerui::composable]]
 View StudioContent() {
   const auto& colors = UseTheme().colors;
@@ -290,6 +327,7 @@ View StudioContent() {
       });
       auto host = std::make_shared<PluginManager>(dirs.data_directory.Child("photo-studio"), StudioRuntime(dirs), callbacks);
       host->RegisterExtensionPoint(Effects);
+      host->RegisterExtensionPoint(EffectPanels);
       const auto changes = co_await host->ApplyPendingChanges();
       RefreshEffects(*host, state);
       manager = std::move(host);
@@ -380,10 +418,12 @@ View StudioContent() {
             active->mode == ExecutionMode::InProcess ? "In process" : "Worker process")
             .With(Foreground(colors.on_surface_variant)) : View{},
         active && !active->description.empty() ? Text(active->description) : View{},
+        active && active->has_panel && !model->removing_effect
+            ? PluginControls(host, active->extension.PluginId(), strength, ready) : View{},
         active ? Flow {
-          Text::Format("Strength {}%", static_cast<unsigned>(static_cast<float>(strength))),
-          Slider(strength).Range(0.0F, 100.0F).Step(1.0F).OnChanged([strength](float value) { strength = value; })
-              .With(Frame{.width = 170.0F}, Enabled(ready)),
+          active->has_panel ? View{} : Text::Format("Strength {}%", static_cast<unsigned>(static_cast<float>(strength))),
+          active->has_panel ? View{} : Slider(strength).Range(0.0F, 100.0F).Step(1.0F)
+              .OnChanged([strength](float value) { strength = value; }).With(Frame{.width = 170.0F}, Enabled(ready)),
           Button("Apply").With(Enabled(ready && model->original.HasValue())).OnClick([=] {
             const auto effect = state->effects[state->selected];
             const auto percent = static_cast<std::uint32_t>(static_cast<float>(strength));
@@ -397,6 +437,8 @@ View StudioContent() {
           Button("Remove effect").With(Enabled(ready)).OnClick([=] {
             const auto effect = state->effects[state->selected];
             RunAction(tasks, state, "Removing effect…", [=]() -> Task<std::string> {
+              // Uninstall waits for borrowed handles. Omit the panel so its lifecycle releases ours.
+              state.Update([](StudioState& value) { value.removing_effect = true; });
               co_await host->UninstallPackage(effect.extension.PluginId(), effect.digest);
               RefreshEffects(*host, state);
               co_return "Effect removed.";

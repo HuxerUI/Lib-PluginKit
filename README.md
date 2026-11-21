@@ -434,7 +434,9 @@ cmake -S examples/photo_filters/plugin -B build/photo-plugins -G Ninja \
 cmake --build build/photo-plugins
 ```
 
-Launch the preview executable with no arguments, or open the preview APK on Android. Click **Install effect** and choose `build/photo-plugins/packages/mono/Release` or `build/photo-plugins/packages/warm/Release`. The approval shows the package digest and lets you select **Run in worker** or **Run in app**. Install one effect in each mode to try both in the same session. **Open photo** accepts a JPEG or PNG. Use **Remove effect** and reinstall the package to change its execution mode.
+Launch the preview executable with no arguments, or open the preview APK on Android. Click **Install effect** and choose `build/photo-plugins/packages/mono/Release` or `build/photo-plugins/packages/warm/Release`. The approval shows the package digest. Choose **Run in worker** for Black & White and **Run in app** for Warm Tone to try both modes in the same session. **Open photo** accepts a JPEG or PNG.
+
+Warm Tone supplies its own slider and presets through the in-process [panel contract](examples/preview/sdk/photo/effect_panel.h). Select **Soft · 35%** or **Golden · 80%**, then click **Apply**. The studio mounts the returned `View` directly. **Remove effect** removes the panel from the view tree and releases its extension handle through the composition lifecycle so the package can finish uninstalling. Black & White uses the studio's strength slider and can run in either mode.
 
 For Android, use the same NDK settings as the [Android CSV build](#android-csv-verification) and pass the matching Android SDK directory as `PHOTO_STUDIO_SDK`. For a debug preview, use `-DCMAKE_BUILD_TYPE=Debug` and select the package's `Debug` folder on the device. On macOS, sign each package library before approving its digest.
 
